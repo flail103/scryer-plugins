@@ -26,6 +26,7 @@ on:
   pull_request:
     paths:
       - download_clients/aria2/**
+      - download_clients/alldebrid/**
       - download_clients/deluge/**
       - download_clients/downloadstation/**
       - download_clients/flood/**
@@ -60,6 +61,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - plugin: alldebrid
+            manifest: download_clients/alldebrid/Cargo.toml
           # qbittorrent leads deliberately: it is the highest-traffic client
           # here and the one whose suite covers the session contract.
           - plugin: qbittorrent

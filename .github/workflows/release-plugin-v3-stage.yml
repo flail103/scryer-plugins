@@ -232,6 +232,7 @@ jobs:
           shared-key: gha-rust-cache-linux-${{ env.RELEASE_PLUGIN_CACHE_SCOPE }}-plugin-build
           workspaces: |
             xtask -> xtask/target
+            download_clients/alldebrid -> download_clients/alldebrid/target
             download_clients/qbittorrent -> download_clients/qbittorrent/target
             indexers/newznab -> indexers/newznab/target
             indexers/torrent-rss -> indexers/torrent-rss/target
