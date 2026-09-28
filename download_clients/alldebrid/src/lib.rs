@@ -536,10 +536,10 @@ fn collect_links(value: &Value, links: &mut Vec<String>) {
             }
         }
         Value::Object(map) => {
-            if let Some(link) = map.get("l").and_then(Value::as_str) {
-                if !links.iter().any(|existing| existing == link) {
-                    links.push(link.to_string());
-                }
+            if let Some(link) = map.get("l").and_then(Value::as_str)
+                && !links.iter().any(|existing| existing == link)
+            {
+                links.push(link.to_string());
             }
             for value in map.values() {
                 collect_links(value, links);

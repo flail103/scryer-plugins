@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "alldebrid-download-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "scryer-plugin-conformance",
  "scryer-plugin-pdk",

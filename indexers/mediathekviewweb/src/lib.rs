@@ -4,15 +4,14 @@ use scryer_plugin_pdk::component::{self, LogLevel, StartRateGate};
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
-    ConfigFieldDef, ConfigFieldRole, ConfigFieldType,
-    IndexerCapabilities as Capabilities, IndexerFeedMode, IndexerLimitCapabilities,
-    IndexerProtocol, IndexerResponseFeatures, IndexerSearchInput, IndexerSourceKind,
-    PluginDescriptor, PluginSearchRequest as SearchRequest,
-    PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult,
-    ProviderDescriptor, SDK_VERSION,
+    ConfigFieldDef, ConfigFieldRole, ConfigFieldType, IndexerCapabilities as Capabilities,
+    IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
+    IndexerSearchInput, IndexerSourceKind, PluginDescriptor, PluginSearchRequest as SearchRequest,
+    PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult, ProviderDescriptor,
+    SDK_VERSION,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const PROVIDER_ID: &str = "mediathekviewweb";
 const DEFAULT_BASE_URL: &str = "https://mediathekviewweb.de";
@@ -140,10 +139,7 @@ async fn search(request: SearchRequest) -> FnResult<SearchResponse> {
     let response = component::http(PluginHttpRequest {
         url,
         method: Some("POST".to_string()),
-        headers: BTreeMap::from([(
-            "Content-Type".to_string(),
-            "application/json".to_string(),
-        )]),
+        headers: BTreeMap::from([("Content-Type".to_string(), "application/json".to_string())]),
         body: serde_json::to_vec(&body).map_err(|error| Error::msg(error.to_string()))?,
     })
     .await
@@ -159,10 +155,10 @@ async fn search(request: SearchRequest) -> FnResult<SearchResponse> {
     }
     let payload: Value = serde_json::from_slice(&response.body)
         .map_err(|error| Error::msg(format!("invalid MediathekViewWeb response: {error}")))?;
-    if let Some(error) = payload.get("err").filter(|value| !value.is_null()) {
-        if !error.as_str().is_some_and(str::is_empty) {
-            return Err(Error::msg(format!("MediathekViewWeb API error: {error}")));
-        }
+    if let Some(error) = payload.get("err").filter(|value| !value.is_null())
+        && !error.as_str().is_some_and(str::is_empty)
+    {
+        return Err(Error::msg(format!("MediathekViewWeb API error: {error}")));
     }
     let entries = payload
         .pointer("/result/results")
@@ -206,9 +202,7 @@ fn api_entry_to_result(entry: ApiEntry) -> Option<SearchResult> {
         .find(|(quality, _)| *quality == "hd")
         .or_else(|| variants.first())
         .map(|(_, url)| url.clone());
-    let subtitle = entry
-        .url_subtitle
-        .filter(|value| is_http_url(value));
+    let subtitle = entry.url_subtitle.filter(|value| is_http_url(value));
     let channel = entry.channel.unwrap_or_default();
     let topic = entry.topic.unwrap_or_default();
     let mut provider_extra = HashMap::new();
@@ -274,7 +268,10 @@ fn api_entry_to_result(entry: ApiEntry) -> Option<SearchResult> {
         info_url,
         source_kind: Some(IndexerSourceKind::Generic),
         protocol: Some(IndexerProtocol::Unknown),
-        categories: (!channel.is_empty()).then_some(channel).into_iter().collect(),
+        categories: (!channel.is_empty())
+            .then_some(channel)
+            .into_iter()
+            .collect(),
         ..Default::default()
     })
 }
@@ -308,9 +305,7 @@ fn civil_from_days(days_since_epoch: i64) -> Option<(i64, i64, i64)> {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = mp + if mp < 10 { 3 } else { -9 };
     let year = year + i64::from(month <= 2);
-    (1..=9999)
-        .contains(&year)
-        .then_some((year, month, day))
+    (1..=9999).contains(&year).then_some((year, month, day))
 }
 
 scryer_plugin_pdk::scryer_indexer_component_main!(descriptor = build_descriptor, search = search,);
