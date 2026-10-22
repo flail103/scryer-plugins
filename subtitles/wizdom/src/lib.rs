@@ -18,7 +18,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use scryer_plugin_pdk::host::{HostCallError, archive_extract};
 use scryer_plugin_pdk::sdk::command::{PluginSubtitleCommand, PluginSubtitleCommandResult};
-use scryer_plugin_pdk::{HttpRequest, HttpResponse, config, http};
+use scryer_plugin_pdk::{HttpRequest, HttpResponse, codes, config, http, plugin_error};
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::host::{PluginArchiveExtractRequest, PluginArchiveExtractedFile};
 use scryer_plugin_sdk::{
@@ -84,6 +84,8 @@ struct Failure {
     kind: FailureKind,
     message: String,
     retry_after_seconds: Option<i64>,
+    /// A PDK code more specific than the kind's own.
+    code: Option<PluginErrorCode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -146,13 +148,7 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
 }
 
 fn unsupported(message: &str) -> PluginError {
-    PluginError {
-        code: PluginErrorCode::Unsupported,
-        public_message: message.to_string(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+    plugin_error(PluginErrorCode::Unsupported, message).build()
 }
 
 fn validate_config() -> SubtitlePluginValidateConfigResponse {
@@ -189,21 +185,50 @@ fn to_plugin_result<T>(result: Result<T, Failure>) -> PluginResult<T> {
         Ok(value) => return PluginResult::Ok(value),
         Err(failure) => failure,
     };
-    let code = match failure.kind {
-        FailureKind::InvalidConfig => PluginErrorCode::InvalidConfig,
-        FailureKind::AuthFailed => PluginErrorCode::AuthFailed,
-        FailureKind::RateLimited => PluginErrorCode::RateLimited,
-        FailureKind::Unreachable => PluginErrorCode::UpstreamUnavailable,
-        FailureKind::Unsupported => PluginErrorCode::Temporary,
-        FailureKind::MissingCapability => PluginErrorCode::Unsupported,
-    };
-    PluginResult::Err(PluginError {
-        code,
-        public_message: failure.message,
-        debug_message: None,
-        retry_after_seconds: failure.retry_after_seconds,
-        details: None,
-    })
+    PluginResult::Err(failure.into_plugin_error())
+}
+
+impl Failure {
+    /// The kind's code, refined by a specific one where it was recorded. The
+    /// message can carry Wizdom's own response text or the host's, so it goes
+    /// to the debug detail; configuration messages stay public.
+    fn into_plugin_error(self) -> PluginError {
+        let code = self.code.clone().unwrap_or(match self.kind {
+            FailureKind::InvalidConfig => PluginErrorCode::InvalidConfig,
+            FailureKind::AuthFailed => PluginErrorCode::AuthFailed,
+            FailureKind::RateLimited => PluginErrorCode::RateLimited,
+            FailureKind::Unreachable => PluginErrorCode::UpstreamUnavailable,
+            FailureKind::Unsupported => PluginErrorCode::Temporary,
+            FailureKind::MissingCapability => PluginErrorCode::Unsupported,
+        });
+        if self.kind == FailureKind::InvalidConfig {
+            return plugin_error(code, self.message).build();
+        }
+        let public = public_message(&code, self.kind);
+        let mut builder = plugin_error(code, public).debug(self.message);
+        if let Some(seconds) = self.retry_after_seconds {
+            builder = builder.retry_after_seconds(seconds);
+        }
+        builder.build()
+    }
+}
+
+fn public_message(code: &PluginErrorCode, kind: FailureKind) -> &'static str {
+    if *code == PluginErrorCode::from(codes::INVALID_RESPONSE) {
+        return "Wizdom returned a response Scryer could not read.";
+    }
+    if *code == PluginErrorCode::from(codes::TLS_ERROR) {
+        return "A secure connection to Wizdom could not be established.";
+    }
+    match kind {
+        FailureKind::AuthFailed => "Wizdom refused the request.",
+        FailureKind::RateLimited => "Wizdom is rate limiting requests.",
+        FailureKind::Unreachable => "Wizdom could not be reached or answered with a server error.",
+        FailureKind::MissingCapability => "This Scryer cannot extract Wizdom's subtitle archives.",
+        FailureKind::InvalidConfig | FailureKind::Unsupported => {
+            "The Wizdom request could not be completed."
+        }
+    }
 }
 
 fn descriptor() -> PluginDescriptor {
@@ -214,6 +239,7 @@ fn descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Subtitle(SubtitleDescriptor {
             provider_type: "wizdom".to_string(),
             provider_aliases: vec![],
@@ -288,7 +314,13 @@ impl Failure {
             kind,
             message: message.into(),
             retry_after_seconds: None,
+            code: None,
         }
+    }
+
+    fn with_code(mut self, code: impl Into<PluginErrorCode>) -> Self {
+        self.code = Some(code.into());
+        self
     }
 
     fn with_retry_after(mut self, retry_after_seconds: Option<i64>) -> Self {
@@ -452,6 +484,7 @@ fn fetch_releases(
             FailureKind::Unsupported,
             format!("Wizdom JSON parse error: {error}"),
         )
+        .with_code(codes::INVALID_RESPONSE)
     })
 }
 
@@ -741,6 +774,7 @@ fn http_get_json(label: &str, url: &str) -> Result<Value, Failure> {
             FailureKind::Unsupported,
             format!("{label} JSON parse error: {error}"),
         )
+        .with_code(codes::INVALID_RESPONSE)
     })
 }
 
@@ -764,10 +798,17 @@ fn http_get(
     loop {
         let result = http::request::<Vec<u8>>(&request, None)
             .map_err(|error| {
-                Failure::new(
+                let failure = Failure::new(
                     FailureKind::Unreachable,
                     format!("{label} request failed: {error}"),
-                )
+                );
+                if scryer_plugin_pdk::error::plugin_error_from(&error).code
+                    == PluginErrorCode::from(codes::TLS_ERROR)
+                {
+                    failure.with_code(codes::TLS_ERROR)
+                } else {
+                    failure
+                }
             })
             .and_then(|response| match response.status_code() {
                 429 => map_http_status(label, &response).map(|()| response),
@@ -847,7 +888,7 @@ fn validation_error_response(failure: &Failure) -> SubtitlePluginValidateConfigR
     };
     SubtitlePluginValidateConfigResponse {
         status,
-        message: Some(failure.message.clone()),
+        message: Some(failure.clone().into_plugin_error().public_message),
         retry_after_seconds: failure.retry_after_seconds,
     }
 }
@@ -1158,6 +1199,38 @@ mod tests {
         assert_eq!(
             page_url(&config, "tt0903747", SubtitleQueryMediaKind::Episode),
             "https://wizdom.xyz/series/tt0903747"
+        );
+    }
+
+    #[test]
+    fn failures_carry_their_codes_without_upstream_text() {
+        let refused = map_http_status_details("probe", 403, "fixture upstream text", None)
+            .unwrap_err()
+            .into_plugin_error();
+        assert_eq!(refused.code, PluginErrorCode::AuthFailed);
+        let server = map_http_status_details("probe", 502, "fixture upstream text", None)
+            .unwrap_err()
+            .into_plugin_error();
+        assert_eq!(server.code, PluginErrorCode::UpstreamUnavailable);
+        assert!(!server.public_message.contains("fixture upstream text"));
+        assert!(
+            server
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("fixture upstream text")
+        );
+        let limited = map_http_status_details("probe", 429, "", Some(9))
+            .unwrap_err()
+            .into_plugin_error();
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(9));
+        let unreadable = Failure::new(FailureKind::Unsupported, "Wizdom JSON parse error: x")
+            .with_code(codes::INVALID_RESPONSE)
+            .into_plugin_error();
+        assert_eq!(
+            unreadable.code,
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
         );
     }
 
