@@ -103,6 +103,8 @@ struct FloodTorrent {
     tags: Vec<String>,
     #[serde(default, rename = "dateFinished")]
     date_finished: Option<i64>,
+    #[serde(default, rename = "dateAdded")]
+    date_added: Option<i64>,
     #[serde(default, rename = "upTotal")]
     up_total: Option<i64>,
     #[serde(default, rename = "downTotal")]
@@ -145,25 +147,18 @@ struct FloodSeedConfig {
 /// mirroring `FloodProxy.HandleRequest` (`FloodProxy.cs:62-83`) and
 /// `Flood.Test` (`Flood.cs:260-274`), which splits authentication failures onto
 /// the `Password` field and everything else onto `Host`.
-fn plugin_error(code: PluginErrorCode, public_message: impl Into<String>) -> PluginError {
-    PluginError {
-        code,
-        public_message: public_message.into(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+fn typed_error(code: impl Into<PluginErrorCode>, public_message: impl Into<String>) -> PluginError {
+    plugin_error(code, public_message).build()
 }
 
 fn detailed_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: impl Into<String>,
     debug_message: impl Into<String>,
 ) -> PluginError {
-    PluginError {
-        debug_message: Some(debug_message.into()),
-        ..plugin_error(code, public_message)
-    }
+    plugin_error(code, public_message)
+        .debug(debug_message.into())
+        .build()
 }
 
 fn respond<T: serde::Serialize>(result: Result<T, PluginError>) -> FnResult<String> {
@@ -192,6 +187,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "flood".to_string(),
             provider_aliases: vec![],
@@ -222,6 +218,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
                 per_download_directory: true,
                 host_fs_required: false,
                 test_connection: true,
+                // Flood fronts torrent clients only.
+                http: None,
                 torrent: Some(DownloadTorrentCapabilities {
                     supported_sources: vec![
                         DownloadInputKind::MagnetUri,
@@ -336,7 +334,7 @@ fn add(input: &str) -> Result<PluginDownloadClientAddResponse, PluginError> {
             Some(serde_json::Value::Object(body)),
         )?
     } else {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Permanent,
             "download source is missing",
         ));
@@ -453,7 +451,7 @@ fn control(input: &str) -> Result<(), PluginError> {
     let config = FloodConfig::from_host();
     let hash = normalize_hash(&request.client_item_id);
     if hash.is_empty() {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Permanent,
             "client_item_id is required",
         ));
@@ -478,8 +476,8 @@ fn control(input: &str) -> Result<(), PluginError> {
         }
         DownloadControlAction::Pause | DownloadControlAction::Resume => {
             let Some(client_hash) = resolve_client_hash(&config, &hash)? else {
-                return Err(plugin_error(
-                    PluginErrorCode::Permanent,
+                return Err(typed_error(
+                    codes::ITEM_NOT_FOUND,
                     "download item was not found",
                 ));
             };
@@ -492,7 +490,7 @@ fn control(input: &str) -> Result<(), PluginError> {
             )?;
         }
         DownloadControlAction::ForceStart => {
-            return Err(plugin_error(
+            return Err(typed_error(
                 PluginErrorCode::Unsupported,
                 "Flood has no force-start; its start route honours the backend's queue",
             ));
@@ -545,7 +543,7 @@ fn mark_imported(input: &str) -> Result<(), PluginError> {
             .unwrap_or(request.client_item_id.as_str()),
     );
     if hash.is_empty() {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Permanent,
             "client_item_id is required",
         ));
@@ -733,7 +731,7 @@ fn test_connection() -> Result<String, PluginError> {
 /// `FloodSettingsValidator` (`FloodSettings.cs:11-21`) in Scryer's shape.
 fn validate_config(config: &FloodConfig) -> Option<PluginError> {
     if config.host.trim().is_empty() {
-        return Some(plugin_error(
+        return Some(typed_error(
             PluginErrorCode::InvalidConfig,
             "Host is required.",
         ));
@@ -741,7 +739,7 @@ fn validate_config(config: &FloodConfig) -> Option<PluginError> {
     match config.port.trim().parse::<u32>() {
         Ok(port) if (1..=65_535).contains(&port) => {}
         _ => {
-            return Some(plugin_error(
+            return Some(typed_error(
                 PluginErrorCode::InvalidConfig,
                 "Port must be between 1 and 65535.",
             ));
@@ -759,7 +757,7 @@ fn validate_config(config: &FloodConfig) -> Option<PluginError> {
         .map(|tag| tag.as_str())
         .collect();
     if !overlap.is_empty() {
-        return Some(plugin_error(
+        return Some(typed_error(
             PluginErrorCode::InvalidConfig,
             format!(
                 "Post Import Tags must not include any tags in the Tags list ({}). A torrent \
@@ -943,9 +941,19 @@ fn api_call(
             encoded.as_deref(),
         )?;
     }
-    if let Some(error) = classify_response(&response) {
-        if matches!(error.code, PluginErrorCode::AuthFailed) {
+    if let Some(mut error) = classify_response(&response) {
+        if error.code == PluginErrorCode::AuthFailed
+            || error.code == PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        {
             let _ = var::remove(COOKIE_VAR_KEY);
+        }
+        // Fastify's schema rejection on an add route is Flood refusing the item.
+        if error.code == PluginErrorCode::Permanent
+            && matches!(response.status, 400 | 422)
+            && path.starts_with("/torrents/add-")
+        {
+            error.code = codes::DOWNLOAD_REJECTED.into();
+            error.public_message = "Flood refused to add the torrent.".to_string();
         }
         return Err(error);
     }
@@ -1017,7 +1025,7 @@ fn send(
         request = request.with_header("Cookie", cookie);
     }
     let response = http::request::<Vec<u8>>(&request, body.map(<[u8]>::to_vec))
-        .map_err(|error| classify_transport_error(&error.to_string()))?;
+        .map_err(|error| classify_transport_error(&error))?;
     Ok(FloodResponse {
         status: response.status_code(),
         body: String::from_utf8_lossy(&response.body()).to_string(),
@@ -1042,7 +1050,7 @@ fn is_path_access_denied(response: &FloodResponse) -> bool {
 fn classify_response(response: &FloodResponse) -> Option<PluginError> {
     if is_path_access_denied(response) {
         return Some(detailed_error(
-            PluginErrorCode::InvalidConfig,
+            codes::PATH_NOT_WRITABLE,
             "Flood refused the download destination: the path is outside the directories Flood is \
              allowed to write to. Fix Destination, or add the path to Flood's allowedPaths.",
             truncate(&response.body),
@@ -1051,27 +1059,34 @@ fn classify_response(response: &FloodResponse) -> Option<PluginError> {
     classify_http_status(
         response.status,
         header_value(response, "location").as_deref(),
+        header_value(response, "retry-after")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|seconds| *seconds >= 0),
         &response.body,
     )
 }
 
-fn classify_http_status(status: u16, location: Option<&str>, body: &str) -> Option<PluginError> {
+fn classify_http_status(
+    status: u16,
+    location: Option<&str>,
+    retry_after: Option<i64>,
+    body: &str,
+) -> Option<PluginError> {
     match status {
         200..=299 => None,
         // The host runs plugin HTTP with `redirect::Policy::none()`, so a login
         // page in front of Flood arrives as a 3xx rather than as unparsable JSON.
-        300..=399 => Some(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            match location.map(str::trim).filter(|value| !value.is_empty()) {
-                Some(location) => format!("Flood's API redirected to {location}"),
-                None => {
-                    "Flood's API redirected the request; check host, port and URL base.".to_string()
-                }
-            },
+        300..=399 => Some(detailed_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "Flood's API redirected the request; check host, port and URL base.",
+            format!(
+                "HTTP {status} redirect to {}",
+                location.map(str::trim).unwrap_or_default()
+            ),
         )),
         // `UnauthorizedError` — `FLOOD_UNAUTHORIZED` (`server/errors.ts:3`).
         401 => Some(detailed_error(
-            PluginErrorCode::AuthFailed,
+            codes::INVALID_USERNAME_PASSWORD,
             "Failed to authenticate with Flood. Check the username and password.",
             truncate(body),
         )),
@@ -1082,7 +1097,7 @@ fn classify_http_status(status: u16, location: Option<&str>, body: &str) -> Opti
             truncate(body),
         )),
         404 => Some(detailed_error(
-            PluginErrorCode::InvalidConfig,
+            codes::ENDPOINT_NOT_FOUND,
             "Flood's API was not found at the configured address; check the URL base.",
             truncate(body),
         )),
@@ -1094,16 +1109,17 @@ fn classify_http_status(status: u16, location: Option<&str>, body: &str) -> Opti
         )),
         // `/api/auth/*` is rate limited to 200 requests per 5 minutes
         // (`server/routes/api/auth.ts:63-66`).
-        429 => Some(PluginError {
-            retry_after_seconds: Some(60),
-            ..detailed_error(
+        429 => Some(
+            plugin_error(
                 PluginErrorCode::RateLimited,
                 "Flood is rate limiting Scryer.",
-                truncate(body),
             )
-        }),
+            .debug(truncate(body))
+            .retry_after_seconds(retry_after.unwrap_or(60))
+            .build(),
+        ),
         500..=599 => Some(detailed_error(
-            PluginErrorCode::Temporary,
+            PluginErrorCode::UpstreamUnavailable,
             format!("Flood returned HTTP {status}."),
             truncate(body),
         )),
@@ -1116,33 +1132,19 @@ fn classify_http_status(status: u16, location: Option<&str>, body: &str) -> Opti
 }
 
 /// Sonarr collapses every transport failure into "Unable to connect to Flood,
-/// please check your settings" (`FloodProxy.cs:77-82`). Scryer can separate a
-/// timeout (retry) from an unreachable host (upstream down).
-fn classify_transport_error(detail: &str) -> PluginError {
-    let lowered = detail.to_ascii_lowercase();
-    if lowered.contains("timeout") || lowered.contains("timed out") {
-        detailed_error(
-            PluginErrorCode::Temporary,
-            "Flood did not answer in time.",
-            detail,
-        )
-    } else if lowered.contains("certificate")
-        || lowered.contains("tls")
-        || lowered.contains("ssl")
-        || lowered.contains("trust")
-    {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to connect to Flood: certificate validation failed.",
-            detail,
-        )
+/// please check your settings" (`FloodProxy.cs:77-82`). The PDK classifies the
+/// host's transport error, so Scryer can separate a timeout (retry), a
+/// certificate failure and an unreachable host (upstream down).
+fn classify_transport_error(error: &Error) -> PluginError {
+    let mut classified = scryer_plugin_pdk::error::plugin_error_from(error);
+    classified.public_message = if classified.code == PluginErrorCode::from(codes::TLS_ERROR) {
+        "Unable to connect to Flood: certificate validation failed.".to_string()
+    } else if classified.code == PluginErrorCode::UpstreamUnavailable {
+        "Unable to connect to Flood, please check your settings.".to_string()
     } else {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to connect to Flood, please check your settings.",
-            detail,
-        )
-    }
+        "Flood did not answer in time.".to_string()
+    };
+    classified
 }
 
 fn header_value(response: &FloodResponse, name: &str) -> Option<String> {
@@ -1202,7 +1204,11 @@ fn list_torrents(config: &FloodConfig) -> Result<HashMap<String, FloodTorrent>, 
     let body = api_call(config, "GET", "/torrents", None)?;
     let summary: TorrentListSummary = serde_json::from_str(&body).map_err(|error| {
         detailed_error(
-            PluginErrorCode::InvalidConfig,
+            if body.trim_start().starts_with('<') {
+                codes::ENDPOINT_NOT_FOUND
+            } else {
+                codes::INVALID_RESPONSE
+            },
             "The configured URL did not answer with a Flood torrent list; check host, port and \
              URL base.",
             format!("{error}: {}", truncate(&body)),
@@ -1239,7 +1245,7 @@ fn get_contents(config: &FloodConfig, client_hash: &str) -> Result<Vec<String>, 
     )?;
     let contents: Vec<TorrentContent> = serde_json::from_str(&body).map_err(|error| {
         detailed_error(
-            PluginErrorCode::Temporary,
+            codes::INVALID_RESPONSE,
             "Flood returned an unreadable torrent content list.",
             format!("{error}: {}", truncate(&body)),
         )
@@ -1397,6 +1403,8 @@ fn torrent_to_item(client_hash: &str, torrent: FloodTorrent, now: i64) -> Plugin
         removed: Some(false),
         raw_state: Some(torrent.status.join(",")),
         completed_at: completed_at(&torrent),
+        added_at: added_at(&torrent),
+        http: None,
     }
 }
 
@@ -1428,6 +1436,7 @@ fn torrent_to_completed(
         completed_at,
         parameters: Vec::new(),
         release_name: None,
+        subtitle_paths: Vec::new(),
     }
 }
 
@@ -1470,6 +1479,14 @@ fn join_path(directory: &str, path: &str) -> String {
 /// bare Unix-seconds string, so the epoch value Flood reports goes through
 /// as-is. Sonarr guards on `DateFinished is > 0` (`Flood.cs:173`) because a
 /// never-finished torrent reports `0` — which would otherwise become 1970.
+/// Flood's `dateAdded`, in Unix seconds like `dateFinished`.
+fn added_at(torrent: &FloodTorrent) -> Option<String> {
+    torrent
+        .date_added
+        .filter(|added| *added > 0)
+        .map(|added| added.to_string())
+}
+
 fn completed_at(torrent: &FloodTorrent) -> Option<String> {
     torrent
         .date_finished
@@ -1927,7 +1944,9 @@ fn source_url(request: &PluginDownloadClientAddRequest) -> Option<String> {
             .clone()
             .or_else(|| request.source.download_url.clone())
             .or_else(|| request.source.magnet_uri.clone()),
-        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl => None,
+        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl | DownloadInputKind::HttpResource => {
+            None
+        }
     }
 }
 
@@ -2747,24 +2766,46 @@ mod tests {
     #[test]
     fn http_status_codes_carry_honest_plugin_error_codes() {
         let cases = [
-            (301_u16, PluginErrorCode::InvalidConfig),
+            (301_u16, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)),
             (400, PluginErrorCode::Permanent),
-            (401, PluginErrorCode::AuthFailed),
+            (401, PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)),
             (403, PluginErrorCode::AuthFailed),
-            (404, PluginErrorCode::InvalidConfig),
+            (404, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)),
             (422, PluginErrorCode::Permanent),
             (429, PluginErrorCode::RateLimited),
-            (500, PluginErrorCode::Temporary),
-            (503, PluginErrorCode::Temporary),
+            (500, PluginErrorCode::UpstreamUnavailable),
+            (503, PluginErrorCode::UpstreamUnavailable),
             (418, PluginErrorCode::Permanent),
         ];
         for (status, expected) in cases {
-            let error = classify_http_status(status, None, "{}").expect("{status} must fail");
+            let error = classify_http_status(status, None, None, "{}").expect("{status} must fail");
             assert_eq!(error.code, expected, "status {status}");
         }
-        assert!(classify_http_status(200, None, "{}").is_none());
-        assert!(classify_http_status(202, None, "[]").is_none());
-        assert!(classify_http_status(207, None, "[]").is_none());
+        assert!(classify_http_status(200, None, None, "{}").is_none());
+        assert!(classify_http_status(202, None, None, "[]").is_none());
+        assert!(classify_http_status(207, None, None, "[]").is_none());
+        let limited = classify_http_status(429, None, Some(7), "{}").expect("429");
+        assert_eq!(limited.retry_after_seconds, Some(7));
+        let redirect =
+            classify_http_status(302, Some("https://login.test.invalid/"), None, "").expect("302");
+        assert!(!redirect.public_message.contains("login.test.invalid"));
+    }
+
+    /// `POST /api/auth/authenticate` answers wrong credentials with
+    /// `401 {"message":"Failed login."}` (`server/routes/api/auth.ts`).
+    #[test]
+    fn a_failed_login_names_the_username_and_password() {
+        let refused = FloodResponse {
+            status: 401,
+            body: r#"{"message":"Failed login."}"#.to_string(),
+            headers: Vec::new(),
+        };
+        let error = classify_response(&refused).expect("a 401 is an error");
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        assert!(!error.public_message.contains("Failed login"));
     }
 
     #[test]
@@ -2781,7 +2822,7 @@ mod tests {
         assert!(is_path_access_denied(&denied));
         assert_eq!(
             classify_response(&denied).map(|error| error.code),
-            Some(PluginErrorCode::InvalidConfig)
+            Some(PluginErrorCode::from(codes::PATH_NOT_WRITABLE))
         );
 
         let forbidden = FloodResponse {
@@ -2796,18 +2837,27 @@ mod tests {
         );
     }
 
+    fn host_failure(detail: &str) -> Error {
+        scryer_plugin_pdk::host::HostCallError::Service(
+            plugin_error(PluginErrorCode::Temporary, "request failed")
+                .debug(detail)
+                .build(),
+        )
+        .into()
+    }
+
     #[test]
     fn transport_failures_separate_timeouts_from_unreachable_hosts() {
         assert_eq!(
-            classify_transport_error("request timeout").code,
+            classify_transport_error(&host_failure("request timeout")).code,
             PluginErrorCode::Temporary
         );
         assert_eq!(
-            classify_transport_error("invalid peer certificate").code,
-            PluginErrorCode::UpstreamUnavailable
+            classify_transport_error(&host_failure("tls: invalid peer certificate")).code,
+            PluginErrorCode::from(codes::TLS_ERROR)
         );
         assert_eq!(
-            classify_transport_error("connection refused").code,
+            classify_transport_error(&host_failure("dns error: connection refused")).code,
             PluginErrorCode::UpstreamUnavailable
         );
     }
