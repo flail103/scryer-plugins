@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, HashMap};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
-use scryer_plugin_pdk::component::{self, LogLevel, StartRateGate, structured_plugin_error};
+use scryer_plugin_pdk::component::{self, LogLevel, StartRateGate};
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
@@ -45,7 +45,7 @@ use scryer_plugin_sdk::{
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchIncompleteReason, IndexerSearchInput, IndexerSearchInvalidResponseKind,
     IndexerSearchPluginError, IndexerSourceKind, IndexerStrategyPlanCapability,
-    IndexerTorrentCapabilities, PluginDescriptor, PluginError, PluginErrorCode, PluginErrorDetails,
+    IndexerTorrentCapabilities, PluginDescriptor, PluginErrorCode, PluginErrorDetails,
     PluginSearchRequest as SearchRequest, PluginSearchRequestKind,
     PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult, ProviderDescriptor,
     SDK_VERSION, torrent_result,
@@ -223,6 +223,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: PROVIDER_ID.to_string(),
             provider_aliases: vec!["torrent-leech".to_string()],
@@ -235,6 +236,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 // The feed takes no query, id, season or episode parameter.
                 supported_ids: HashMap::new(),
                 deduplicates_aliases: false,
@@ -272,6 +276,7 @@ fn build_descriptor() -> PluginDescriptor {
                     rate_limit_hint_seconds: Some(RATE_LIMIT_HINT_SECONDS as u32),
                     api_quota_supported: false,
                     grab_quota_supported: false,
+                    paged_search: false,
                 }),
                 torrent: Some(IndexerTorrentCapabilities {
                     // Seeders/leechers come out of `<description>`
@@ -556,8 +561,8 @@ fn classify_response(
         }
         401 | 403 => {
             if is_html_delivery(headers, body) {
-                return Err(invalid_response_error(
-                    IndexerSearchInvalidResponseKind::UnexpectedContentType,
+                return Err(html_page_error(
+                    body,
                     format!(
                         "TorrentLeech answered HTTP {status} with an HTML page: the site is likely \
                          blocking Scryer (Cloudflare), or 'base_url' is an http:// URL that \
@@ -603,8 +608,8 @@ fn classify_response(
     })?;
 
     if is_html_delivery(headers, body) {
-        return Err(invalid_response_error(
-            IndexerSearchInvalidResponseKind::UnexpectedContentType,
+        return Err(html_page_error(
+            body,
             format!(
                 "TorrentLeech returned content type {:?} instead of RSS: the site is likely \
                  blocking Scryer (Cloudflare), or 'base_url' names a mirror that does not serve \
@@ -686,13 +691,14 @@ fn typed_error(
     retry_after_seconds: Option<i64>,
     details: Option<IndexerSearchPluginError>,
 ) -> Error {
-    structured_plugin_error(PluginError {
-        code,
-        public_message,
-        debug_message: Some(debug_message),
-        retry_after_seconds,
-        details: details.map(PluginErrorDetails::IndexerSearch),
-    })
+    let mut error = plugin_error(code, public_message).debug(debug_message);
+    if let Some(seconds) = retry_after_seconds {
+        error = error.retry_after_seconds(seconds);
+    }
+    if let Some(details) = details {
+        error = error.details(PluginErrorDetails::IndexerSearch(details));
+    }
+    error.into_error()
 }
 
 /// A configuration fault. Deliberately NOT a deferred error: the host must
@@ -707,9 +713,10 @@ fn invalid_config_error(field: &str, detail: String) -> Error {
     )
 }
 
+/// The feed authenticates with the RSS key in 'api_key'.
 fn auth_failed_error(detail: String) -> Error {
     typed_error(
-        PluginErrorCode::AuthFailed,
+        PluginErrorCode::from(codes::INVALID_API_KEY),
         "TorrentLeech rejected the configured 'api_key' (RSS key)".to_string(),
         detail,
         None,
@@ -755,11 +762,36 @@ fn deferred_error(
 
 fn invalid_response_error(kind: IndexerSearchInvalidResponseKind, detail: String) -> Error {
     typed_error(
-        PluginErrorCode::UpstreamUnavailable,
+        PluginErrorCode::from(codes::INVALID_RESPONSE),
         "TorrentLeech returned a response Scryer could not read".to_string(),
         detail,
         None,
         Some(IndexerSearchPluginError::InvalidResponse { kind }),
+    )
+}
+
+/// An HTML page where the feed belongs: a challenge page asks for a CAPTCHA
+/// (a Cloudflare clearance cookie); anything else is unreadable.
+fn html_page_error(body: &[u8], detail: String) -> Error {
+    let page = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if page.contains("captcha")
+        || page.contains("cf-challenge")
+        || page.contains("challenge-platform")
+        || page.contains("attention required")
+    {
+        return typed_error(
+            PluginErrorCode::from(codes::CAPTCHA_REQUIRED),
+            "TorrentLeech answered with a CAPTCHA challenge".to_string(),
+            detail,
+            None,
+            Some(IndexerSearchPluginError::InvalidResponse {
+                kind: IndexerSearchInvalidResponseKind::UnexpectedContentType,
+            }),
+        );
+    }
+    invalid_response_error(
+        IndexerSearchInvalidResponseKind::UnexpectedContentType,
+        detail,
     )
 }
 
@@ -2229,7 +2261,7 @@ mod tests {
 
         let error = detect_error_item(&items).expect("sentinel is detected");
         let error = plugin_error(&error);
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
         assert!(error.public_message.contains("api_key"));
         assert!(
             error
@@ -2330,7 +2362,7 @@ mod tests {
         )
         .expect_err("403 html is an error");
         let error = plugin_error(&error);
-        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
         assert!(matches!(
             error.details,
             Some(PluginErrorDetails::IndexerSearch(
@@ -2345,7 +2377,7 @@ mod tests {
     fn a_bare_401_is_an_auth_failure() {
         let error = classify_response(401, &headers(&[]), b"nope").expect_err("401 is an error");
         let error = plugin_error(&error);
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
         assert!(error.public_message.contains("api_key"));
     }
 
@@ -2980,5 +3012,18 @@ mod tests {
             let (year, month, day) = civil_from_days(days);
             assert_eq!(days_from_civil(year, month, day), days);
         }
+    }
+
+    #[test]
+    fn a_challenge_page_is_captcha_required() {
+        let error = classify_response(
+            403,
+            &headers(&[("Content-Type", "text/html")]),
+            b"<html><div id=\"cf-challenge\">Please complete the captcha</div></html>",
+        )
+        .expect_err("a challenge page is an error");
+        let error = plugin_error(&error);
+        assert_eq!(error.code, PluginErrorCode::from(codes::CAPTCHA_REQUIRED));
+        assert!(!error.public_message.contains("cf-challenge"));
     }
 }
