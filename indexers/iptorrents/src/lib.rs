@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashMap};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
-use scryer_plugin_pdk::component::{self, LogLevel, StartRateGate, structured_plugin_error};
+use scryer_plugin_pdk::component::{self, LogLevel, StartRateGate};
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
@@ -40,7 +40,7 @@ use scryer_plugin_sdk::{
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchIncompleteReason, IndexerSearchInput, IndexerSearchInvalidResponseKind,
     IndexerSearchPluginError, IndexerSourceKind, IndexerStrategyPlanCapability,
-    IndexerTorrentCapabilities, PluginDescriptor, PluginError, PluginErrorCode, PluginErrorDetails,
+    IndexerTorrentCapabilities, PluginDescriptor, PluginErrorCode, PluginErrorDetails,
     PluginSearchRequest as SearchRequest, PluginSearchRequestKind,
     PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult, ProviderDescriptor,
     SDK_VERSION, torrent_result,
@@ -182,6 +182,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: PROVIDER_ID.to_string(),
             provider_aliases: vec!["ip-torrents".to_string()],
@@ -194,6 +195,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 // The feed takes no query, id, season or episode parameter.
                 supported_ids: HashMap::new(),
                 deduplicates_aliases: false,
@@ -230,6 +234,7 @@ fn build_descriptor() -> PluginDescriptor {
                     rate_limit_hint_seconds: Some(2),
                     api_quota_supported: false,
                     grab_quota_supported: false,
+                    paged_search: false,
                 }),
                 torrent: Some(IndexerTorrentCapabilities {
                     // Sonarr's fixture asserts null for every one of these: the
@@ -476,8 +481,8 @@ fn classify_response(
         }
         401 | 403 => {
             if is_html_delivery(headers, body) {
-                return Err(invalid_response_error(
-                    IndexerSearchInvalidResponseKind::UnexpectedContentType,
+                return Err(html_page_error(
+                    body,
                     format!(
                         "IPTorrents answered HTTP {status} with an HTML page: the site is likely \
                          blocking Scryer (Cloudflare) or the feed credentials in 'feed_url' are \
@@ -490,6 +495,15 @@ fn classify_response(
                 "IPTorrents rejected the feed credentials with HTTP {status}: {}",
                 body_excerpt(body)
             )));
+        }
+        404 => {
+            return Err(typed_error(
+                PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND),
+                "the IPTorrents feed address was not found".to_string(),
+                format!("IPTorrents returned HTTP 404: {}", body_excerpt(body)),
+                None,
+                None,
+            ));
         }
         429 => return Err(rate_limited_error(retry_after_seconds(headers))),
         _ => {
@@ -520,8 +534,8 @@ fn classify_response(
     })?;
 
     if is_html_delivery(headers, body) {
-        return Err(invalid_response_error(
-            IndexerSearchInvalidResponseKind::UnexpectedContentType,
+        return Err(html_page_error(
+            body,
             format!(
                 "IPTorrents returned content type {:?} instead of RSS: the site is likely blocking \
                  Scryer (Cloudflare) or the feed credentials in 'feed_url' are no longer valid: {}",
@@ -625,13 +639,14 @@ fn typed_error(
     retry_after_seconds: Option<i64>,
     details: Option<IndexerSearchPluginError>,
 ) -> Error {
-    structured_plugin_error(PluginError {
-        code,
-        public_message,
-        debug_message: Some(debug_message),
-        retry_after_seconds,
-        details: details.map(PluginErrorDetails::IndexerSearch),
-    })
+    let mut error = plugin_error(code, public_message).debug(debug_message);
+    if let Some(seconds) = retry_after_seconds {
+        error = error.retry_after_seconds(seconds);
+    }
+    if let Some(details) = details {
+        error = error.details(PluginErrorDetails::IndexerSearch(details));
+    }
+    error.into_error()
 }
 
 /// A configuration fault. Deliberately NOT a deferred error: the host must
@@ -647,9 +662,11 @@ fn invalid_config_error(field: &str, detail: String) -> Error {
     )
 }
 
+/// The feed authenticates with the `tp=` torrent pass in `feed_url`, so a
+/// credential rejection names the passkey.
 fn auth_failed_error(detail: String) -> Error {
     typed_error(
-        PluginErrorCode::AuthFailed,
+        PluginErrorCode::from(codes::INVALID_PASSKEY),
         "IPTorrents rejected the credentials in the configured 'feed_url'".to_string(),
         detail,
         None,
@@ -695,11 +712,47 @@ fn deferred_error(
 
 fn invalid_response_error(kind: IndexerSearchInvalidResponseKind, detail: String) -> Error {
     typed_error(
-        PluginErrorCode::UpstreamUnavailable,
+        PluginErrorCode::from(codes::INVALID_RESPONSE),
         "IPTorrents returned a response Scryer could not read".to_string(),
         detail,
         None,
         Some(IndexerSearchPluginError::InvalidResponse { kind }),
+    )
+}
+
+/// An HTML page where the feed belongs. A challenge page asks for a CAPTCHA
+/// (a Cloudflare clearance cookie), a login page means the feed credentials
+/// were refused, and anything else is a response Scryer cannot read.
+fn html_page_error(body: &[u8], detail: String) -> Error {
+    let page = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let (code, public_message) = if page.contains("captcha")
+        || page.contains("cf-challenge")
+        || page.contains("challenge-platform")
+        || page.contains("attention required")
+    {
+        (
+            PluginErrorCode::from(codes::CAPTCHA_REQUIRED),
+            "IPTorrents answered with a CAPTCHA challenge",
+        )
+    } else if page.contains("login.php") || page.contains("type=\"password\"") {
+        (
+            PluginErrorCode::from(codes::INVALID_PASSKEY),
+            "IPTorrents rejected the credentials in the configured 'feed_url'",
+        )
+    } else {
+        (
+            PluginErrorCode::from(codes::INVALID_RESPONSE),
+            "IPTorrents returned a response Scryer could not read",
+        )
+    };
+    typed_error(
+        code,
+        public_message.to_string(),
+        detail,
+        None,
+        Some(IndexerSearchPluginError::InvalidResponse {
+            kind: IndexerSearchInvalidResponseKind::UnexpectedContentType,
+        }),
     )
 }
 
@@ -2085,7 +2138,7 @@ mod tests {
             )
             .unwrap_err(),
         );
-        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
         assert!(matches!(
             error.details,
             Some(PluginErrorDetails::IndexerSearch(
@@ -2137,7 +2190,7 @@ mod tests {
         for status in [401_u16, 403] {
             let error =
                 plugin_error(&classify_response(status, &headers(&[]), b"denied").unwrap_err());
-            assert_eq!(error.code, PluginErrorCode::AuthFailed);
+            assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_PASSKEY));
             assert!(error.public_message.contains("feed_url"));
             assert!(error.debug_message.unwrap().contains("denied"));
             assert!(error.details.is_none(), "an auth fault must not defer");
@@ -2508,5 +2561,38 @@ mod tests {
             releases[0].provider_categories,
             vec!["TV/x264".to_string(), "TV/Packs".to_string()]
         );
+    }
+
+    #[test]
+    fn a_challenge_page_is_captcha_required() {
+        let error = plugin_error(
+            &classify_response(
+                403,
+                &headers(&[("content-type", "text/html")]),
+                b"<html><div id=\"cf-challenge\">Please complete the captcha</div></html>",
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(error.code, PluginErrorCode::from(codes::CAPTCHA_REQUIRED));
+        assert!(!error.public_message.contains("cf-challenge"));
+    }
+
+    #[test]
+    fn a_login_page_is_a_rejected_passkey() {
+        let error = plugin_error(
+            &classify_response(
+                200,
+                &headers(&[("content-type", "text/html")]),
+                b"<html><form action=\"/login.php\"><input type=\"password\"></form></html>",
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_PASSKEY));
+    }
+
+    #[test]
+    fn a_missing_feed_is_endpoint_not_found() {
+        let error = plugin_error(&classify_response(404, &headers(&[]), b"").unwrap_err());
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
     }
 }
