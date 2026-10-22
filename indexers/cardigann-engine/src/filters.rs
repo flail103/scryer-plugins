@@ -98,8 +98,8 @@ fn regexp_extract(value: &str, args: &[String]) -> Result<String, String> {
     let pattern = args.first().map(String::as_str).unwrap_or_default();
     let regex = cardigann_regex(pattern)
         .map_err(|error| format!("invalid regexp pattern `{pattern}`: {error}"))?;
-    // Prowlarr reads `Groups[1].Value` of the match, which is the empty string
-    // when nothing matched. Erroring here instead dropped whole rows through
+    // The reference Cardigann engine reads the first capture group of the
+    // match, which is the empty string when nothing matched. Erroring here instead dropped whole rows through
     // the required-field path.
     let Some(captures) = regex
         .captures(value)
@@ -427,10 +427,10 @@ fn parse_time_of_day(value: &str) -> Result<Duration, String> {
     Err(format!("could not parse time of day `{value}`"))
 }
 
-/// Prowlarr's `DateTimeUtil.FromUnknown`, for the forms it resolves itself
+/// The untyped date forms the reference Cardigann engine resolves itself
 /// before handing the rest to its fuzzy parser.
 ///
-/// The order is Prowlarr's: RFC 1123, a bare unix timestamp, anything naming
+/// The order is the reference engine's: RFC 1123, a bare unix timestamp, anything naming
 /// `now`, anything naming `ago`, the named days, `<weekday> at <time>`, then the
 /// two shapes that omit the year, and only then the fixed layouts.
 fn parse_unknown_datetime_at(value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
@@ -488,7 +488,7 @@ fn parse_unknown_datetime_at(value: &str, now: DateTime<Utc>) -> Result<DateTime
             "saturday" => Weekday::Sat,
             _ => Weekday::Sun,
         };
-        // Prowlarr steps back from today, so today itself counts.
+        // The reference engine steps back from today, so today itself counts.
         while parsed.weekday() != target {
             parsed -= Duration::days(1);
         }
@@ -605,7 +605,7 @@ fn dotnet_to_chrono_pattern(pattern: &str) -> String {
     output
 }
 
-/// Prowlarr's `DateTimeUtil.FromTimeAgo`.
+/// Relative times (`3 hours ago`), as the reference Cardigann engine reads them.
 ///
 /// The corpus writes relative times in every abbreviation a tracker template
 /// happens to use — `3 hrs ago`, `5 mins ago`, `2 wks`, `1h` — so the unit is
@@ -888,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_prowlarr_date_split_trim_and_encoding_edge_cases() {
+    fn matches_the_reference_date_split_trim_and_encoding_edge_cases() {
         let dateparse = vec![FilterBlock {
             name: "dateparse".into(),
             args: Some(serde_yaml::Value::String("yyyy-MM-dd".into())),
@@ -1044,7 +1044,8 @@ mod tests {
         assert!(re_replace("(unclosed", "", "value").is_err());
     }
 
-    /// Prowlarr reads `Groups[1].Value` of a failed match, which is empty.
+    /// The reference engine reads the first capture group of a failed match,
+    /// which is empty.
     #[test]
     fn a_regexp_filter_that_does_not_match_yields_an_empty_string() {
         let regexp = |pattern: &str, value: &str| {
@@ -1062,10 +1063,10 @@ mod tests {
         assert!(regexp("(unclosed", "size=42").is_err());
     }
 
-    /// Prowlarr's `FromTimeAgo` matches any unit token containing the unit
+    /// The reference engine matches any unit token containing the unit
     /// name, so `3 hrs ago` and `5 mins ago` are ordinary corpus values.
     #[test]
-    fn parses_the_abbreviated_relative_times_prowlarr_accepts() {
+    fn parses_the_abbreviated_relative_times_the_reference_engine_accepts() {
         let ago = |value: &str| {
             let parsed = parse_relative_time(value).unwrap();
             let parsed = DateTime::parse_from_rfc3339(&parsed)
@@ -1082,7 +1083,7 @@ mod tests {
         assert!((ago("1 year") - 365 * 86_400).abs() <= 2);
         assert!((ago("1 day, 2 hours and 3 minutes ago") - (86_400 + 7_200 + 180)).abs() <= 2);
         assert!(ago("just now").abs() <= 2);
-        // Prowlarr throws on a unit it cannot name, and so does this.
+        // The reference engine throws on a unit it cannot name, and so does this.
         assert!(parse_relative_time("2 fortnights ago").is_err());
     }
 
@@ -1091,7 +1092,7 @@ mod tests {
     /// them an untyped `date` field kept the tracker's own text, which the host
     /// then had no date for.
     #[test]
-    fn resolves_the_untyped_date_forms_prowlarr_resolves() {
+    fn resolves_the_untyped_date_forms_the_reference_engine_resolves() {
         // A Monday, so "Saturday at …" is two days back.
         let now = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
         for (value, expected) in [

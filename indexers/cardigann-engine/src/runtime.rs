@@ -236,7 +236,7 @@ pub fn begin(
         Operation::Search(request) => StoredOperation::Search(request),
         Operation::Grab(url) => StoredOperation::Grab(url),
     };
-    // Prowlarr's `HttpIndexerBase.Fetch` skips a search whose criteria use an id
+    // The reference Cardigann engine skips a search whose criteria use an id
     // the definition's `caps.modes` does not list. Without that gate an id-only
     // strategy renders an empty keyword search on every definition that cannot
     // read the id, and the tracker's front page comes back as results.
@@ -1107,8 +1107,8 @@ fn submit_form_login(mut context: Context, response: &PluginHttpResponse) -> Res
 /// Start the operation the caller asked for.
 ///
 /// The definition's `ratio:` block is deliberately not consulted. In Cardigann
-/// it is a Jackett-era display of the operator's own account ratio, and Prowlarr
-/// parses it without ever evaluating it. Fetching it cost one extra
+/// it is a Jackett-era display of the operator's own account ratio, and the
+/// reference engine parses it without ever evaluating it. Fetching it cost one extra
 /// authenticated request before every search and grab on 328 definitions and
 /// stamped a fabricated `minimum_seed_ratio` onto every release.
 fn continue_operation(definition: &Definition, context: Context) -> Result<Step, String> {
@@ -1471,7 +1471,7 @@ fn complete_grab_response(context: &Context, response: PluginHttpResponse) -> Re
             "torrent response exceeded the {MAX_TORRENT_BYTES}-byte runtime limit"
         ));
     }
-    // Prowlarr rejects an HTML-typed download outright: it is a login wall, a
+    // An HTML-typed download is rejected outright: it is a login wall, a
     // rate-limit notice or an interstitial, never a torrent. A tracker that
     // mislabels a real bencoded body is still believed.
     let html_typed = response.headers.iter().any(|(name, value)| {
@@ -1751,9 +1751,8 @@ fn search_variables(
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
         ),
-        // Prowlarr binds `.Query.IMDBID` to the `tt`-prefixed, seven-digit form
-        // and `.Query.IMDBIDShort` to the bare id, whichever spelling reached
-        // it. 238 definitions read one of the two.
+        // `.Query.IMDBID` is the `tt`-prefixed, seven-digit form and
+        // `.Query.IMDBIDShort` the bare id, whichever spelling reached us. 238 definitions read one of the two.
         ("IMDBID", full_imdb_id(&imdb)),
         ("IMDBIDShort", short_imdb_id(&imdb)),
         ("TMDBID", id(&["tmdb_id", "tmdb", "tmdbid"])),
@@ -1865,7 +1864,7 @@ fn caps_mode_parameters(definition: &Definition, mode: &str) -> Vec<String> {
 ///
 /// An id-only search (no keywords) against a definition whose `caps.modes` lists
 /// none of the supplied ids renders an empty keyword search and returns the
-/// tracker's front page, so Prowlarr skips it outright. A request that also
+/// tracker's front page, so it is skipped outright. A request that also
 /// carries keywords still scopes the search, so it proceeds either way.
 fn id_search_is_supported(definition: &Definition, request: &PluginSearchRequest) -> bool {
     if !request.query.trim().is_empty() {
@@ -1902,7 +1901,7 @@ fn imdb_digits(value: &str) -> String {
         .collect()
 }
 
-/// Prowlarr's `FullImdbId`: `tt` plus the id padded to seven digits.
+/// The full IMDb id: `tt` plus the id padded to seven digits.
 fn full_imdb_id(value: &str) -> String {
     let digits = imdb_digits(value);
     if digits.is_empty() || digits.chars().all(|digit| digit == '0') {
@@ -1968,8 +1967,8 @@ fn map_categories(definition: &Definition, request: &PluginSearchRequest) -> Vec
     if mapped.is_empty() {
         mapped = defaults;
     }
-    // Prowlarr's `MapTorznabCapsToTrackers` keeps the definition's mapping order
-    // and only de-duplicates, which is the order `{{ range .Categories }}`
+    // The reference engine keeps the definition's mapping order and only
+    // de-duplicates, which is the order `{{ range .Categories }}`
     // renders. Sorting reordered every multi-category request.
     let mut seen = BTreeSet::new();
     mapped.retain(|id| seen.insert(id.clone()));
@@ -1980,7 +1979,7 @@ fn map_categories(definition: &Definition, request: &PluginSearchRequest) -> Vec
 ///
 /// A request category may be a torznab id (`5040`), a standard name (`TV/HD`) or
 /// a bare parent name (`Movies`). A parent matches the parent itself and every
-/// child under it — Prowlarr expands a parent id to its whole subtree — while a
+/// child under it — a parent id expands to its whole subtree — while a
 /// child matches only its own name.
 fn category_matches(requested: &[String], category: &str) -> bool {
     requested.iter().any(|requested| {
@@ -1996,8 +1995,8 @@ fn category_matches(requested: &[String], category: &str) -> bool {
     })
 }
 
-/// The standard newznab category tree Prowlarr routes request categories
-/// through (`NewznabStandardCategory`). Custom (`>= 100000`) categories are a
+/// The standard newznab category tree request categories are routed
+/// through. Custom (`>= 100000`) categories are a
 /// per-indexer construct the engine does not synthesize.
 const STANDARD_CATEGORIES: &[(&str, &str)] = &[
     ("1000", "Console"),
@@ -2117,8 +2116,8 @@ fn merge_response_cookies(
 
 /// The attribute names a `Cookie` header may not be carrying as a cookie.
 ///
-/// Prowlarr's `CookieUtil.FilterProps`, minus its `DISCORD` typo for the
-/// RFC 2965 `Discard` attribute, which is what the list means.
+/// The reference engine's attribute list, with the RFC 2965 `Discard`
+/// attribute spelled correctly.
 const COOKIE_ATTRIBUTE_NAMES: [&str; 12] = [
     "COMMENT",
     "COMMENTURL",
@@ -2135,7 +2134,7 @@ const COOKIE_ATTRIBUTE_NAMES: [&str; 12] = [
 ];
 
 /// Every cookie in a `Cookie`-header value (`uid=1; pass=abc; …`), the way
-/// Prowlarr's `CookieUtil.CookieHeaderToDictionary` reads one.
+/// the reference engine reads one.
 ///
 /// This is not [`merge_cookie_header`]: a `Set-Cookie` field carries one cookie
 /// followed by its attributes, while the operator's `cookie` setting and a
@@ -2244,9 +2243,9 @@ fn login_headers(
 }
 
 /// The header templates every login request renders: the login block's own
-/// `headers:` when it has the key, otherwise the search headers. Prowlarr's
-/// `Login?.Headers ?? Search?.Headers` is why an API tracker whose only
-/// `Authorization` header sits under `search:` still authenticates its login.
+/// `headers:` when it has the key, otherwise the search headers. That fallback
+/// is why an API tracker whose only `Authorization` header sits under
+/// `search:` still authenticates its login.
 fn login_header_templates(definition: &Definition) -> &ScalarMap {
     definition
         .login
@@ -2442,8 +2441,8 @@ fn need_http(
 /// Whether two hosts belong to the same registrable site, the way a cookie
 /// container with a `Domain=.tracker.example` attribute treats them.
 ///
-/// Prowlarr keeps one `CookieContainer` per indexer and sends a domain cookie to
-/// every host under it, so a tracker whose download or API endpoint lives on a
+/// The reference engine keeps one cookie jar per indexer and sends a domain
+/// cookie to every host under it, so a tracker whose download or API endpoint lives on a
 /// sibling subdomain keeps its session. Same-origin stripping lost it.
 fn same_site_host(base_host: &str, target_host: &str) -> bool {
     let base = base_host.to_ascii_lowercase();
@@ -2587,7 +2586,7 @@ fn retry_login_if_needed(
         return Ok(None);
     }
 
-    // Prowlarr's `CheckIfLoginIsNeeded`: any redirect that was not followed, any
+    // Login is needed again on any redirect that was not followed, any
     // HTTP error status, or an HTML body missing the login test selector. A 3xx
     // can only reach here unfollowed — `follow_redirect` returns a fresh request
     // when redirects are enabled for this request — so the status test is the
@@ -2883,10 +2882,9 @@ fn parse_selector(selector: &str) -> Result<CardigannSelector, String> {
         .map_err(|error| format!("invalid CSS selector `{selector}`: {error:?}"))
 }
 
-/// Prowlarr's `CheckForError` for a login response.
+/// The definition's error check for a login response.
 ///
-/// Prowlarr sends every login request with `SuppressHttpError`, so a non-2xx
-/// response still reaches the definition's `error:` blocks. They run first
+/// A non-2xx response still reaches the definition's `error:` blocks. They run first
 /// here for every status, which keeps the definition's own explanation of a
 /// rejected login whatever status the tracker answered it with. A non-2xx
 /// response no block explains is reported as the HTTP failure it is.
@@ -3112,8 +3110,8 @@ fn select_element_value(
                 );
             }
         }
-        // Prowlarr: when no case selector matches, the field is null (an error
-        // when required). Falling through to the field's own selector would
+        // When no case selector matches, the field is null (an error when
+        // required). Falling through to the field's own selector would
         // hand back the row's text instead.
         if required {
             return Err("none of the case selectors matched".to_string());
@@ -3458,8 +3456,7 @@ fn parse_markup_results(
             Ok(None)
         })();
         // A row that fails outside field parsing — a required `dateheaders`
-        // selector, say — is skipped on its own. Prowlarr does the same, and a
-        // page whose rows all fail is an empty page, never an indexer error:
+        // selector, say — is skipped on its own, and a page whose rows all fail is an empty page, never an indexer error:
         // a header row matched by `rows.selector`, a "no results" row, or a
         // Cloudflare interstitial must not turn into a failing indexer.
         if let Ok(result) = parsed {
@@ -3514,14 +3511,14 @@ fn is_id_search(variables: &Variables) -> bool {
     })
 }
 
-/// Prowlarr's `IndexerBase.FilterReleasesByQuery`, which is what `andmatch`
-/// means.
+/// The release filter `andmatch` means.
 ///
 /// The query is split on runs of non-word characters, one-character terms and
 /// the common words are dropped, and a release passes when a term appears in its
 /// title *or its description*. With more than one term two must match; with one,
 /// one. An RSS search and an id search are not filtered at all. Requiring every
-/// whitespace-separated token in the title alone dropped releases Prowlarr keeps.
+/// whitespace-separated token in the title alone dropped releases the reference
+/// engine keeps.
 fn should_keep_row(
     definition: &Definition,
     result: &PluginSearchResult,
@@ -3574,7 +3571,7 @@ fn should_keep_row(
     matches >= required
 }
 
-/// Parse one HTML row into a release, Prowlarr's way.
+/// Parse one HTML row into a release.
 ///
 /// A field that cannot be read — a selector that missed a required field, a
 /// filter that errored on the tracker's own malformed value — binds
@@ -4146,8 +4143,8 @@ fn normalize_result(definition: &Definition, result: &mut PluginSearchResult) {
     }
 }
 
-/// The tracker list Prowlarr's `MagnetLinkBuilder` puts on every magnet it
-/// synthesizes from a bare infohash. A magnet with no `tr=` entry is only
+/// The public tracker list put on every magnet synthesized from a bare
+/// infohash. A magnet with no `tr=` entry is only
 /// resolvable through DHT, which several clients do not run.
 const PUBLIC_MAGNET_TRACKERS: [&str; 20] = [
     "http://tracker.opentrackr.org:1337/announce",
@@ -4172,7 +4169,7 @@ const PUBLIC_MAGNET_TRACKERS: [&str; 20] = [
     "udp://movies.zsw.ca:6969/announce",
 ];
 
-/// Prowlarr's `MagnetLinkBuilder.BuildPublicMagnetLink`.
+/// A magnet link for a bare infohash, carrying the public tracker list.
 fn public_magnet_link(info_hash: &str, title: &str) -> String {
     let encode =
         |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
@@ -4204,7 +4201,7 @@ fn parse_i64(value: &str) -> Option<i64> {
         .ok()
 }
 
-/// Prowlarr's `ParseUtil.NormalizeNumber` for a non-integer value.
+/// Normalize a non-integer number the way the reference engine does.
 ///
 /// Everything but digits, `.` and `,` is dropped; `,` becomes `.`; and when more
 /// than one `.` survives, all but the last are removed, so the thousands
@@ -4227,11 +4224,11 @@ fn normalize_number(value: &str) -> Option<f64> {
     normalized.parse::<f64>().ok()
 }
 
-/// Prowlarr's `ParseUtil.GetBytes`.
+/// Parse a size into bytes the way the reference engine does.
 ///
 /// The unit is every letter of the value, lower-cased, with `i` removed, so
-/// `GiB`, `GIB` and `GB` are the same unit — and every unit Prowlarr names is a
-/// power of 1024, never of 1000. (Prowlarr strips the `i` before lower-casing,
+/// `GiB`, `GIB` and `GB` are the same unit — and every unit named is a power
+/// of 1024, never of 1000. (The reference engine strips the `i` before lower-casing,
 /// which reads an all-caps `GIB` as bytes; lower-casing first is the intent.)
 /// The number is read the `NormalizeNumber` way, which is what makes `1,5 GB`
 /// and `1.234,5 MB` parse.
@@ -4686,7 +4683,7 @@ search:
         assert_eq!(value(".Query.Type"), "tv-search");
 
         // The bare spellings a pasted definition may still carry keep working,
-        // and a bare id is promoted to the `tt` form Prowlarr binds.
+        // and a bare id is promoted to the `tt` form the template binds.
         let mut bare = request.clone();
         bare.ids = std::collections::HashMap::from([("imdbid".to_string(), "111161".to_string())]);
         bare.facet = Some("movie".to_string());
@@ -4881,7 +4878,7 @@ search:
         assert_eq!(results[0].title, "xml valid");
 
         // A page whose only matched row yields no title is an empty result, the
-        // way Prowlarr reports it. The previous "all HTML rows failed" error
+        // way the reference engine reports it. The previous "all HTML rows failed" error
         // turned a decorative header row, a "no results" row, or a Cloudflare
         // interstitial into a failing indexer.
         let results = parse_search_response(
@@ -4913,8 +4910,8 @@ search:
         assert!(results.is_empty());
     }
 
-    /// Prowlarr records a field error, binds `.Result.<name>` to null, and
-    /// still emits the release. Dropping the row instead is how a single
+    /// The reference engine records a field error, binds `.Result.<name>` to
+    /// null, and still emits the release. Dropping the row instead is how a single
     /// divergent filter — a date layout, a regex dialect — turned into missing
     /// releases.
     #[test]
@@ -5396,7 +5393,7 @@ search:
         assert_eq!(result.guid, result.magnet_url);
     }
 
-    /// A magnet synthesized from a bare infohash carries Prowlarr's public
+    /// A magnet synthesized from a bare infohash carries the public
     /// tracker list; without it the link only resolves through DHT.
     #[test]
     fn synthesized_magnets_carry_the_public_tracker_list() {
@@ -5592,7 +5589,7 @@ search:
     /// the number before parsing it. Treating `GB` as 1000³ understated every
     /// size by 7–10 %, and `1.234,5 GB` did not parse at all.
     #[test]
-    fn parses_sizes_the_prowlarr_way() {
+    fn parses_sizes_the_reference_way() {
         for (value, expected) in [
             ("1 GB", Some(1_073_741_824)),
             ("1.5 GiB", Some(1_610_612_736)),
@@ -5687,7 +5684,7 @@ search:
         );
     }
 
-    /// Prowlarr translates the request's torznab ids through the standard
+    /// The request's torznab ids are translated through the standard
     /// category tree: a parent id claims its whole subtree, a child id claims
     /// only its own name, and the definition's mapping order is preserved.
     #[test]
@@ -5759,11 +5756,11 @@ search:
         assert!(map_categories(&definition, &PluginSearchRequest::default()).is_empty());
     }
 
-    /// `andmatch` is Prowlarr's `FilterReleasesByQuery`: two of the query's
+    /// `andmatch` is the reference release filter: two of the query's
     /// terms have to appear in the title *or* the description, common words and
     /// one-character tokens do not count, and RSS and id searches are exempt.
     #[test]
-    fn andmatch_filters_rows_the_way_prowlarr_filters_releases() {
+    fn andmatch_filters_rows_the_way_the_reference_engine_filters_releases() {
         let definition = parse_definition(
             r#"
 id: fixture
@@ -5977,7 +5974,7 @@ search:
     }
 
     /// Cardigann's `ratio:` block is a Jackett-era display of the operator's own
-    /// account ratio; Prowlarr parses it and never evaluates it. Fetching it
+    /// account ratio; the reference engine parses it and never evaluates it. Fetching it
     /// spent an extra authenticated request before every search and grab and
     /// stamped a seeding requirement the tracker never stated onto every
     /// release.
@@ -6119,8 +6116,7 @@ search:
         request
     }
 
-    /// Prowlarr's `Login?.Headers ?? Search?.Headers`: a login block without a
-    /// `headers:` key sends the search headers, so the API key reaches the
+    /// A login block without a `headers:` key sends the search headers, so the API key reaches the
     /// login check instead of the tracker rejecting an anonymous request.
     #[test]
     fn get_login_without_headers_sends_the_search_headers() {
@@ -6212,8 +6208,7 @@ search:
         );
     }
 
-    /// Prowlarr sends logins with `SuppressHttpError`, so the definition's own
-    /// explanation survives an error status; a status no block explains is
+    /// The definition's own explanation survives an error status; a status no block explains is
     /// reported by what the status means.
     #[test]
     fn login_error_status_prefers_the_definitions_message() {
@@ -6294,7 +6289,7 @@ search:
         assert!(error.public_message.ends_with('…'));
     }
 
-    /// Prowlarr re-logs in on any unfollowed redirect and any HTTP error, not
+    /// Login is redone on any unfollowed redirect and any HTTP error, not
     /// only on 401/403 or a `Location` naming the login path, and then reissues
     /// the request that provoked it.
     #[test]
@@ -6980,7 +6975,7 @@ search:
     }
 
     #[test]
-    fn raw_query_matrix_matches_prowlarr_split_then_encode_semantics() {
+    fn raw_query_matrix_matches_the_reference_split_then_encode_semantics() {
         let definition = parse_definition(PUBLIC_DEFINITION).unwrap();
         let variables = BTreeMap::from([(
             ".Keywords".to_string(),
@@ -7117,7 +7112,7 @@ search:
 
     /// A tracker whose download endpoint lives on a sibling subdomain shares the
     /// session cookie with its base host, exactly as a `Domain=` cookie does in
-    /// Prowlarr's cookie container. Same-origin stripping lost it on every one.
+    /// the reference engine's cookie jar. Same-origin stripping lost it on every one.
     #[test]
     fn attaches_cookies_across_the_configured_site_but_never_beyond_it() {
         assert!(same_site_host("tracker.example", "dl.tracker.example"));
@@ -7241,77 +7236,5 @@ search:
             panic!()
         };
         assert_eq!(request.url, "https://tracker.example/health");
-    }
-
-    /// A UNIT3D-style API definition: the API key is only a search header, and
-    /// the login block, which checks the key, declares no headers of its own.
-    fn api_definition(login: &str) -> String {
-        PUBLIC_DEFINITION
-            .replace(
-                "search:\n  paths:\n",
-                &format!(
-                    "settings:\n  - {{ name: apikey, type: text, label: API Key }}\n{login}search:\n  headers:\n    Authorization: [\"Bearer {{{{ .Config.apikey }}}}\"]\n  paths:\n"
-                ),
-            )
-            .replace("id: fixture", "id: example-api")
-    }
-
-    fn api_key_config() -> BTreeMap<String, String> {
-        BTreeMap::from([("apikey".to_string(), "synthetic-key".to_string())])
-    }
-
-    fn first_request(definition: &str) -> PluginHttpRequest {
-        let Step::NeedHttp { request, .. } = begin(
-            compiled(definition),
-            Operation::Search(Box::default()),
-            api_key_config(),
-        )
-        .unwrap() else {
-            panic!("login request expected")
-        };
-        request
-    }
-
-    /// Prowlarr's `Login?.Headers ?? Search?.Headers`: a login block without a
-    /// `headers:` key sends the search headers, so the API key reaches the
-    /// login check instead of the tracker rejecting an anonymous request.
-    #[test]
-    fn get_login_without_headers_sends_the_search_headers() {
-        let request = first_request(&api_definition(
-            "login:\n  path: api/torrents\n  method: get\n",
-        ));
-        assert_eq!(request.url, "https://tracker.example/api/torrents");
-        assert_eq!(
-            request.headers.get("authorization").map(String::as_str),
-            Some("Bearer synthetic-key")
-        );
-    }
-
-    #[test]
-    fn form_login_landing_without_headers_sends_the_search_headers() {
-        let request = first_request(&api_definition("login:\n  path: login\n  method: form\n"));
-        assert_eq!(request.url, "https://tracker.example/login");
-        assert_eq!(
-            request.headers.get("authorization").map(String::as_str),
-            Some("Bearer synthetic-key")
-        );
-    }
-
-    /// The fallback only covers an absent key: login headers the definition
-    /// does declare, even an empty map, replace the search headers.
-    #[test]
-    fn explicit_login_headers_replace_the_search_headers() {
-        let request = first_request(&api_definition(
-            "login:\n  path: api/torrents\n  method: get\n  headers:\n    Authorization: \"Bearer login-{{ .Config.apikey }}\"\n",
-        ));
-        assert_eq!(
-            request.headers.get("authorization").map(String::as_str),
-            Some("Bearer login-synthetic-key")
-        );
-
-        let request = first_request(&api_definition(
-            "login:\n  path: api/torrents\n  method: get\n  headers: {}\n",
-        ));
-        assert!(!request.headers.contains_key("authorization"));
     }
 }

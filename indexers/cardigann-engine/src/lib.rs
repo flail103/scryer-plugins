@@ -163,7 +163,7 @@ fn config_fields() -> Vec<sdk::ConfigFieldDef> {
                 sdk::ConfigFieldType::Multiline,
                 false,
                 None,
-                Some("A Prowlarr Cardigann v11 YAML definition."),
+                Some("A Cardigann v11 YAML definition."),
             )
         },
         sdk::ConfigFieldDef {
