@@ -1,6 +1,6 @@
 [package]
 name = "plex-list-provider"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Plex watchlist list provider over the public watchlist RSS feed or a linked Plex account"
@@ -11,7 +11,9 @@ plugin_id = "plex-list"
 catalog_versions = ["v3"]
 # The first Scryer release that links members' own accounts for list
 # providers. An older host cannot hand this plugin a member credential.
-min_scryer_version = "0.21.15"
+# Raised to 0.21.21, the first host that decodes the open error codes
+# (such as `invalid_response`) this plugin now sends.
+min_scryer_version = "0.21.21"
 docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/plex"
 source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/lists/plex"
 
@@ -21,7 +23,7 @@ crate-type = ["cdylib"]
 [dependencies]
 list-provider-common = { path = "../list-common" }
 scryer-plugin-pdk = "0.8.0"
-scryer-plugin-sdk = "3.12.0"
+scryer-plugin-sdk = "3.18.0"
 serde_json = "1"
 wit-bindgen = { version = "0.61", features = ["async"] }
 

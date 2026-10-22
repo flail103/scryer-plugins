@@ -43,8 +43,8 @@
 use std::collections::BTreeSet;
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, invalid_config, permanent, plugin_error, rate_limited,
-    retry_after_seconds, unavailable, unsupported_source,
+    Access, auth_failed, check_status, invalid_config, invalid_response, permanent, plugin_error,
+    rate_limited, retry_after_seconds, unavailable, unsupported_source, with_debug,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, json_body};
 use list_provider_common::ids::{
@@ -318,6 +318,7 @@ pub fn descriptor() -> PluginDescriptor {
         sdk_version: scryer_plugin_sdk::SDK_VERSION.to_string(),
         sdk_constraint: scryer_plugin_sdk::current_sdk_constraint(),
         socket_permissions: Vec::new(),
+        settings: Vec::new(),
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: Vec::new(),
@@ -352,6 +353,7 @@ pub fn descriptor() -> PluginDescriptor {
                 byo_app: false,
                 scopes: vec![SCOPE_READ.to_string()],
             },
+            member_key: None,
             groups: vec![ListProviderGroup {
                 label: "Your Simkl library".to_string(),
                 auth_badge: ListAuthBadge::MemberAccount,
@@ -576,7 +578,7 @@ impl<'a, H: ListHttp> Client<'a, H> {
             .await?;
         let external_user_id =
             json_id(body.get("account").and_then(|account| account.get("id")))
-                .ok_or_else(|| permanent("Simkl did not return the member's account id"))?;
+                .ok_or_else(|| invalid_response("Simkl did not return the member's account id"))?;
         let user = body.get("user");
         let name = json_text(user.and_then(|user| user.get("name")));
         let avatar_url = json_text(user.and_then(|user| user.get("avatar")))
@@ -645,60 +647,63 @@ fn response_error_name(response: &PluginHttpResponse) -> Option<String> {
 /// Eastern. The host's rate-limited class pauses only the list that hit the
 /// limit, which keeps a member's spent allowance from reading as Simkl being
 /// down. Anything else follows the shared mapping.
+///
+/// Public messages never carry Simkl's status or error name; both go to the
+/// host log only. A rejected token stays `auth_failed` rather than
+/// `invalid_api_key`: the host expires the linked account and asks for a
+/// reconnect only on that well-known code.
 fn check_simkl_status(response: &PluginHttpResponse, what: &str) -> Result<(), PluginError> {
     let status = response.status;
     let name = response_error_name(response);
     let detail = match &name {
-        Some(name) => format!("HTTP {status}, {name}"),
-        None => format!("HTTP {status}"),
+        Some(name) => format!("{what}: HTTP {status}, {name}"),
+        None => format!("{what}: HTTP {status}"),
     };
-    match status {
-        400 if name.as_deref() == Some("max_items") => Err(permanent(format!(
-            "Simkl will not send the {what} because it is too large to build ({detail}); \
-             Scryer already asks for one type and status at a time in the ID-only form, so \
-             this list cannot be followed in full until Simkl raises its limit"
-        ))),
-        401 => Err(auth_failed(format!(
-            "Simkl rejected the linked account ({detail})"
-        ))),
+    let error = match status {
+        400 if name.as_deref() == Some("max_items") => permanent(format!(
+            "Simkl will not send the {what} because it is too large to build; Scryer already \
+             asks for one type and status at a time in the ID-only form, so this list cannot \
+             be followed in full until Simkl raises its limit"
+        )),
+        401 => auth_failed("Simkl rejected the linked account"),
         403 if matches!(
             name.as_deref(),
             Some("insufficient_scope" | "oauth2_token_required")
         ) =>
         {
-            Err(auth_failed(format!(
-                "Simkl needs the account linked to Scryer's Simkl app again ({detail})"
-            )))
+            auth_failed("Simkl needs the account linked to Scryer's Simkl app again")
         }
-        403 => Err(permanent(format!("Simkl refused the request ({detail})"))),
-        412 => Err(unavailable(format!(
-            "Simkl refused Scryer's Simkl app ({detail}); Simkl answers this for a wrong or \
-             suspended app id or while it throttles the app"
-        ))),
-        429 => Err(simkl_rate_limited(response, name.as_deref())),
-        _ => check_status(response, Access::ServerKey, what),
-    }
+        403 => permanent("Simkl refused the request"),
+        412 => unavailable(
+            "Simkl refused Scryer's Simkl app; Simkl answers this for a wrong or suspended app \
+             id or while it throttles the app",
+        ),
+        429 => simkl_rate_limited(response, name.as_deref()),
+        _ => return check_status(response, Access::ServerKey, what),
+    };
+    Err(with_debug(error, detail))
 }
 
+/// Simkl's daily allowances are rate limits to the host, not a quota code: its
+/// rate-limited class is what pauses only the list that hit the limit until
+/// `Retry-After`.
 fn simkl_rate_limited(response: &PluginHttpResponse, name: Option<&str>) -> PluginError {
     let daily = |whose: &str| {
-        let error = rate_limited(retry_after_seconds(response));
+        let mut error = rate_limited(retry_after_seconds(response));
         let seconds = error.retry_after_seconds.unwrap_or_default();
-        PluginError {
-            public_message: format!(
-                "{whose} daily Simkl request allowance is used up (HTTP 429); Simkl resets it at \
-                 midnight US Eastern, in {seconds} seconds"
-            ),
-            ..error
-        }
+        error.public_message = format!(
+            "{whose} daily Simkl request allowance is used up; Simkl resets it at midnight US \
+             Eastern, in {seconds} seconds"
+        );
+        error
     };
     match name {
-        Some("rate_limit") => PluginError {
-            public_message: "Simkl's per-second request limit was hit (HTTP 429, rate_limit); \
-                             it clears in about a second"
-                .to_string(),
-            ..rate_limited(Some(BURST_RETRY_SECONDS))
-        },
+        Some("rate_limit") => {
+            let mut error = rate_limited(Some(BURST_RETRY_SECONDS));
+            error.public_message =
+                "Simkl's per-second request limit was hit; it clears in about a second".to_string();
+            error
+        }
         Some("user_limit_exceeded") => daily("this member's"),
         Some("app_limit_exceeded") => daily("the Simkl app's"),
         _ => rate_limited(retry_after_seconds(response)),
@@ -748,16 +753,19 @@ fn library_entries(body: &Value, library: Library) -> Result<&[Value], PluginErr
             None | Some(Value::Null) => {
                 if map.contains_key("error") {
                     let name = error_name(body).unwrap_or("unnamed");
-                    return Err(permanent(format!("Simkl answered with an error ({name})")));
+                    return Err(with_debug(
+                        permanent("Simkl answered with an error"),
+                        format_args!("Simkl library error {name}"),
+                    ));
                 }
                 Ok(&[])
             }
             Some(Value::Array(entries)) => Ok(entries),
-            Some(_) => Err(permanent(
+            Some(_) => Err(invalid_response(
                 "the Simkl library response has an unexpected shape",
             )),
         },
-        _ => Err(permanent(
+        _ => Err(invalid_response(
             "the Simkl library response has an unexpected shape",
         )),
     }

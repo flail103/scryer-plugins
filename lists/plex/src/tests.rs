@@ -270,7 +270,7 @@ fn upstream_failures_map_to_host_classes() {
         block_on(fetch(&html, &request(FEED_URL, None)))
             .unwrap_err()
             .code,
-        PluginErrorCode::Permanent
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE)
     );
 }
 
@@ -853,7 +853,11 @@ fn account_falls_back_to_the_uuid_and_title() {
     ] {
         let http = RecordedHttp::new().with(ACCOUNT_URL, 200, body);
         let error = block_on(account(&http, &account_request(TOKEN))).unwrap_err();
-        assert_eq!(error.code, PluginErrorCode::Permanent, "{body}");
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE),
+            "{body}"
+        );
     }
 }
 
@@ -870,19 +874,35 @@ fn a_rejected_token_marks_the_account_expired() {
         assert_eq!(error.code, PluginErrorCode::AuthFailed, "{status}");
         assert!(!error.public_message.contains(TOKEN));
         assert!(!error.public_message.contains("discover.provider"));
-        assert!(error.debug_message.is_none());
+        // The status reaches the host log only; the token never does.
+        assert_eq!(
+            error.debug_message.as_deref(),
+            Some(format!("Plex watchlist: HTTP {status}").as_str())
+        );
 
+        // `auth_failed`, not `invalid_api_key`: the host expires the linked
+        // account and asks for a reconnect only on this well-known code.
         let account_http = RecordedHttp::new().with(ACCOUNT_URL, status, "");
         let error = block_on(account(&account_http, &account_request(TOKEN))).unwrap_err();
         assert_eq!(error.code, PluginErrorCode::AuthFailed, "{status}");
         assert!(!error.public_message.contains(TOKEN));
+        assert!(!error.public_message.contains(&status.to_string()));
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| !debug.contains(TOKEN))
+        );
     }
 }
 
 #[test]
 fn other_watchlist_failures_map_to_host_classes() {
     let cases = [
-        (404, PluginErrorCode::Permanent),
+        (
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ENDPOINT_NOT_FOUND),
+        ),
         (429, PluginErrorCode::RateLimited),
         (502, PluginErrorCode::UpstreamUnavailable),
     ];
@@ -915,7 +935,11 @@ fn other_watchlist_failures_map_to_host_classes() {
             NOW_MS,
         ))
         .unwrap_err();
-        assert_eq!(error.code, PluginErrorCode::Permanent, "{body}");
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE),
+            "{body}"
+        );
     }
     // An empty watchlist is an empty list, not a failure.
     let empty = RecordedHttp::new().with(

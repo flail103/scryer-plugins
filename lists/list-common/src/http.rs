@@ -11,7 +11,9 @@ use scryer_plugin_pdk::runtime::{self, HostError};
 use scryer_plugin_sdk::PluginError;
 use scryer_plugin_sdk::host::{PluginHttpRequest, PluginHttpResponse};
 
-use crate::error::{invalid_config, permanent, plugin_error, unavailable};
+use crate::error::{
+    invalid_config, invalid_response, permanent, plugin_error, unavailable, with_debug,
+};
 
 pub trait ListHttp {
     fn send(
@@ -35,7 +37,7 @@ impl ListHttp for HostHttp {
 
 /// Map a transport failure (no HTTP status at all) onto a plugin error.
 pub fn transport_error(error: HostError, host: &str) -> PluginError {
-    match error {
+    let mapped = match error {
         HostError::ForbiddenOrigin => {
             invalid_config(format!("Scryer does not allow this plugin to reach {host}"))
         }
@@ -46,9 +48,10 @@ pub fn transport_error(error: HostError, host: &str) -> PluginError {
             "the request was cancelled",
         ),
         HostError::Timeout | HostError::Capacity | HostError::Transport => {
-            unavailable(format!("could not reach {host}: {error}"))
+            unavailable(format!("could not reach {host}"))
         }
-    }
+    };
+    with_debug(mapped, format_args!("{host}: {error}"))
 }
 
 /// A GET request with the headers every list plugin sends.
@@ -81,11 +84,11 @@ pub fn body_text(response: &PluginHttpResponse) -> String {
     String::from_utf8_lossy(&response.body).into_owned()
 }
 
-/// Decode a JSON body; a body that is not JSON is a permanent failure,
-/// because retrying the same URL returns the same document.
+/// Decode a JSON body; a body that is not JSON is an unreadable answer
+/// (`invalid_response`), which the host does not retry as transient.
 pub fn json_body(response: &PluginHttpResponse) -> Result<serde_json::Value, PluginError> {
     serde_json::from_slice(&response.body)
-        .map_err(|_| permanent("the provider response is not valid JSON"))
+        .map_err(|error| invalid_response(format_args!("the response is not valid JSON: {error}")))
 }
 
 /// The lowercase host of an absolute http(s) URL.
@@ -150,9 +153,32 @@ mod tests {
             scryer_plugin_sdk::PluginErrorCode::InvalidConfig
         );
         assert!(error.public_message.contains("feeds.example.test"));
+        let timeout = transport_error(HostError::Timeout, "x");
         assert_eq!(
-            transport_error(HostError::Timeout, "x").code,
+            timeout.code,
             scryer_plugin_sdk::PluginErrorCode::UpstreamUnavailable
         );
+        assert!(
+            timeout
+                .debug_message
+                .is_some_and(|debug| debug.starts_with("x: "))
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_an_invalid_response() {
+        let response = PluginHttpResponse {
+            status: 200,
+            headers: Default::default(),
+            body: b"<html>".to_vec(),
+        };
+        let error = json_body(&response).unwrap_err();
+        assert_eq!(
+            error.code,
+            scryer_plugin_sdk::PluginErrorCode::from(
+                scryer_plugin_pdk::error::codes::INVALID_RESPONSE
+            )
+        );
+        assert!(!error.public_message.contains("html"));
     }
 }

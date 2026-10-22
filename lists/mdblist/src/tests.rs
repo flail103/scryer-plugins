@@ -324,7 +324,7 @@ fn errors_map_to_host_failure_classes() {
     );
     assert_eq!(
         public(200, "<html></html>").code,
-        PluginErrorCode::Permanent
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE)
     );
 
     let unknown = ListPluginFetchRequest {
@@ -429,8 +429,22 @@ fn a_key_mdblist_refuses_is_an_auth_failure_and_other_trouble_is_not() {
         let http = RecordedHttp::new().with(&user_url, status, r#"{"error":"Invalid API key"}"#);
         account_of(&http, MEMBER_KEY).unwrap_err()
     };
-    assert_eq!(refused(401).code, PluginErrorCode::AuthFailed);
-    assert_eq!(refused(403).code, PluginErrorCode::AuthFailed);
+    // `auth_failed`, not `invalid_api_key`: for a member key that is the
+    // credential, the host reads only this code as "the provider refused the
+    // key".
+    for status in [401, 403] {
+        let error = refused(status);
+        assert_eq!(error.code, PluginErrorCode::AuthFailed, "{status}");
+        assert!(!error.public_message.contains(MEMBER_KEY), "{status}");
+        assert!(
+            !error.public_message.contains("Invalid API key"),
+            "{status}"
+        );
+        assert_eq!(
+            error.debug_message.as_deref(),
+            Some(format!("MDBList answered HTTP {status}").as_str())
+        );
+    }
     assert_eq!(refused(503).code, PluginErrorCode::UpstreamUnavailable);
 
     let limited = RecordedHttp::new().with_headers(
@@ -449,7 +463,7 @@ fn a_key_mdblist_refuses_is_an_auth_failure_and_other_trouble_is_not() {
     let nameless = RecordedHttp::new().with(&user_url, 200, r#"{"username": "fixture-member"}"#);
     assert_eq!(
         account_of(&nameless, MEMBER_KEY).unwrap_err().code,
-        PluginErrorCode::Permanent
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE)
     );
 
     // A blank key is refused without asking MDBList.

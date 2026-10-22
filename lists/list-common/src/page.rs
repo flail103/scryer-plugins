@@ -8,7 +8,7 @@
 
 use scryer_plugin_sdk::{ListPluginFetchResponse, ListPluginItem, PluginError};
 
-use crate::error::permanent;
+use crate::error::{permanent, with_debug};
 
 /// Decode a numeric cursor (a page number or an offset). No cursor means the
 /// first page, which is `first`.
@@ -17,7 +17,7 @@ pub fn numeric_cursor(cursor: Option<&str>, first: u32) -> Result<u32, PluginErr
         None => Ok(first),
         Some(cursor) => cursor
             .parse::<u32>()
-            .map_err(|_| permanent(format!("invalid page cursor {cursor}"))),
+            .map_err(|error| with_debug(permanent(format!("invalid page cursor {cursor}")), error)),
     }
 }
 

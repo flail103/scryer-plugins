@@ -11,7 +11,7 @@ use quick_xml::XmlVersion;
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use scryer_plugin_sdk::{ListMediaKind, PluginError};
 
-use crate::error::permanent;
+use crate::error::invalid_response;
 use crate::ids::{Ids, normalize_imdb, positive_id, split_title_year, year_from_date};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -141,7 +141,7 @@ fn apply_text(entry: &mut RawEntry, name: &str, text: String) {
 }
 
 /// Parse a feed body. A document with no RSS or Atom root, or one that is not
-/// well-formed XML, is a permanent failure.
+/// well-formed XML, is an unreadable answer (`invalid_response`).
 pub fn parse_feed(body: &str) -> Result<Feed, PluginError> {
     let mut reader = Reader::from_str(body);
     reader.config_mut().trim_text(false);
@@ -153,9 +153,9 @@ pub fn parse_feed(body: &str) -> Result<Feed, PluginError> {
     let mut entry: Option<(usize, RawEntry)> = None;
 
     loop {
-        let event = reader
-            .read_event()
-            .map_err(|_| permanent("the feed is not well-formed XML"))?;
+        let event = reader.read_event().map_err(|error| {
+            invalid_response(format_args!("the feed is not well-formed XML: {error}"))
+        })?;
         match event {
             Event::Start(start) => {
                 let name = local(&start);
@@ -191,7 +191,7 @@ pub fn parse_feed(body: &str) -> Result<Feed, PluginError> {
             Event::GeneralRef(reference) => text.push_str(&resolve_reference(&reference)),
             Event::End(_) => {
                 let Some(name) = stack.pop() else {
-                    return Err(permanent("the feed is not well-formed XML"));
+                    return Err(invalid_response("the feed is not well-formed XML"));
                 };
                 let value = text.trim().to_string();
                 text.clear();
@@ -222,7 +222,7 @@ pub fn parse_feed(body: &str) -> Result<Feed, PluginError> {
     }
 
     if !saw_root {
-        return Err(permanent("the document is not an RSS or Atom feed"));
+        return Err(invalid_response("the document is not an RSS or Atom feed"));
     }
     Ok(feed)
 }
@@ -255,11 +255,12 @@ fn scan_reference(value: &str, ids: &mut Ids, kind: &mut Option<ListMediaKind>) 
                 }
             }
         }
-    } else if lower.contains("thetvdb.com/") && lower.contains("id=") {
-        if let Some((_, rest)) = lower.split_once("id=") {
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            *ids = std::mem::take(ids).with_tvdb(Some(digits));
-        }
+    } else if lower.contains("thetvdb.com/")
+        && lower.contains("id=")
+        && let Some((_, rest)) = lower.split_once("id=")
+    {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        *ids = std::mem::take(ids).with_tvdb(Some(digits));
     }
     if lower.starts_with("imdb://") || lower.contains("imdb.com/") || lower.starts_with("tt") {
         *ids = std::mem::take(ids).with_imdb(normalize_imdb(value));
@@ -392,9 +393,20 @@ mod tests {
     }
 
     #[test]
-    fn non_feeds_are_permanent_failures() {
-        assert!(parse_feed("<html><body>nope</body></html>").is_err());
-        assert!(parse_feed("{\"not\":\"xml\"}").is_err());
-        assert!(parse_feed("<rss><channel><item><title>x</item></channel></rss>").is_err());
+    fn non_feeds_are_invalid_responses() {
+        for body in [
+            "<html><body>nope</body></html>",
+            "{\"not\":\"xml\"}",
+            "<rss><channel><item><title>x</item></channel></rss>",
+        ] {
+            let error = parse_feed(body).unwrap_err();
+            assert_eq!(
+                error.code,
+                scryer_plugin_sdk::PluginErrorCode::from(
+                    scryer_plugin_pdk::error::codes::INVALID_RESPONSE
+                ),
+                "{body}"
+            );
+        }
     }
 }

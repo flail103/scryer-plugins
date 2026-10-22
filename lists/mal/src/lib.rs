@@ -19,7 +19,8 @@
 //! client id header.
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, permanent, plugin_error, unavailable, unsupported_source,
+    Access, auth_failed, check_status, invalid_response, permanent, plugin_error, unavailable,
+    unsupported_source, with_debug,
 };
 use list_provider_common::http::{HostHttp, ListHttp, get, json_body};
 use list_provider_common::ids::{dedupe_and_rank, json_id, json_text, json_year};
@@ -105,6 +106,7 @@ pub fn descriptor() -> PluginDescriptor {
         sdk_version: scryer_plugin_sdk::SDK_VERSION.to_string(),
         sdk_constraint: scryer_plugin_sdk::current_sdk_constraint(),
         socket_permissions: Vec::new(),
+        settings: Vec::new(),
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec!["myanimelist".to_string()],
@@ -128,6 +130,7 @@ pub fn descriptor() -> PluginDescriptor {
                 byo_app: true,
                 scopes: vec![SCOPE.to_string()],
             },
+            member_key: None,
             groups: vec![ListProviderGroup {
                 label: "Your account".to_string(),
                 auth_badge: ListAuthBadge::MemberAccount,
@@ -218,14 +221,18 @@ fn authorized_get(url: String, token: &str) -> PluginHttpRequest {
 /// as "DoS detected etc." and also answers 403 to a request that carries no
 /// client credentials, so 403 is MyAnimeList refusing the request for now,
 /// never a sign that the list is gone.
+///
+/// A refused token stays `auth_failed` rather than `invalid_api_key`: the host
+/// expires the linked account and asks for a reconnect only on that
+/// well-known code.
 fn check_mal_status(response: &PluginHttpResponse, what: &str) -> Result<(), PluginError> {
-    match response.status {
-        401 => Err(auth_failed(
-            "MyAnimeList no longer accepts the linked account (HTTP 401)",
-        )),
-        403 => Err(unavailable("MyAnimeList refused the request (HTTP 403)")),
-        _ => check_status(response, Access::ServerKey, what),
-    }
+    let status = response.status;
+    let error = match status {
+        401 => auth_failed("MyAnimeList no longer accepts the linked account"),
+        403 => unavailable("MyAnimeList refused the request"),
+        _ => return check_status(response, Access::ServerKey, what),
+    };
+    Err(with_debug(error, format_args!("{what}: HTTP {status}")))
 }
 
 /// The MyAnimeList status and label a source type names.
@@ -266,7 +273,7 @@ pub async fn fetch<H: ListHttp>(
     let entries = body
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| permanent("the MyAnimeList list response has no entries"))?;
+        .ok_or_else(|| invalid_response("the MyAnimeList list response has no entries"))?;
     let items: Vec<ListPluginItem> = entries.iter().filter_map(to_item).collect();
     let next = next_offset(&body, offset, entries.len())?;
     let list_name = Some(format!("MyAnimeList {label}"));
@@ -428,9 +435,9 @@ pub async fn account<H: ListHttp>(
     check_mal_status(&response, "MyAnimeList account")?;
     let body = json_body(&response)?;
     let external_user_id = json_id(body.get("id"))
-        .ok_or_else(|| permanent("the MyAnimeList account response has no user id"))?;
+        .ok_or_else(|| invalid_response("the MyAnimeList account response has no user id"))?;
     let username = json_text(body.get("name"))
-        .ok_or_else(|| permanent("the MyAnimeList account response has no user name"))?;
+        .ok_or_else(|| invalid_response("the MyAnimeList account response has no user name"))?;
     let avatar_url = json_text(body.get("picture")).filter(|url| url.starts_with("https://"));
     Ok(ListPluginAccountResponse {
         external_user_id,

@@ -825,7 +825,14 @@ fn errors_map_to_host_failure_classes() {
         (PluginErrorCode::RateLimited, Some(30))
     );
     let locked = member(423);
-    assert_eq!(locked.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        locked.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ACCOUNT_DISABLED)
+    );
+    assert_eq!(
+        locked.debug_message.as_deref(),
+        Some("Trakt watchlist: HTTP 423")
+    );
     assert!(!locked.public_message.contains("not found"));
     assert_eq!(member(426).code, PluginErrorCode::Permanent);
     for status in [500, 503, 520] {
@@ -834,13 +841,11 @@ fn errors_map_to_host_failure_classes() {
             PluginErrorCode::UpstreamUnavailable
         );
     }
-    assert_eq!(
-        public(200, &[], "not json").code,
-        PluginErrorCode::Permanent
-    );
+    let invalid_response = PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE);
+    assert_eq!(public(200, &[], "not json").code, invalid_response);
     assert_eq!(
         public(200, &[], r#"{"error": "unexpected"}"#).code,
-        PluginErrorCode::Permanent
+        invalid_response
     );
 
     let http = RecordedHttp::new();
@@ -1301,4 +1306,33 @@ fn a_page_beyond_the_reported_count_is_rejected() {
     ));
     assert_eq!(error.code, PluginErrorCode::Permanent);
     assert!(error.public_message.contains("paging headers"));
+}
+
+#[test]
+fn a_rejected_member_token_is_auth_failed_on_account_and_fetch() {
+    // The host expires the linked account and asks for a reconnect only on
+    // the well-known `auth_failed` code, so a refused token keeps it.
+    let body = r#"{"error":"invalid_grant","error_description":"fixture token revoked"}"#;
+    let http = RecordedHttp::new().with(&api("/users/settings"), 401, body);
+    let unlinked = ListCredential {
+        username: None,
+        ..credential()
+    };
+    let refused = err(account_of(&http, CLIENT, unlinked));
+    assert_eq!(refused.code, PluginErrorCode::AuthFailed);
+    assert!(!refused.public_message.contains(TOKEN));
+    assert!(!refused.public_message.contains("fixture token revoked"));
+    assert_eq!(
+        refused.debug_message.as_deref(),
+        Some("Trakt account: HTTP 401")
+    );
+
+    let watchlist = api("/users/me/watchlist/movie,show/rank?page=1&limit=250");
+    let http = RecordedHttp::new().with(&watchlist, 401, body);
+    let lapsed = err(fetch(&http, CLIENT, member_request("watchlist", &[], None)));
+    assert_eq!(lapsed.code, PluginErrorCode::AuthFailed);
+    assert_eq!(
+        lapsed.debug_message.as_deref(),
+        Some("Trakt watchlist: HTTP 401")
+    );
 }

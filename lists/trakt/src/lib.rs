@@ -26,8 +26,8 @@
 use std::collections::BTreeMap;
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, invalid_config, missing_param, not_found, permanent,
-    plugin_error, unsupported_source,
+    Access, auth_failed, check_status, invalid_config, invalid_response, missing_param, not_found,
+    permanent, plugin_error, unsupported_source, with_debug,
 };
 use list_provider_common::http::{
     HostHttp, ListHttp, body_text, encode_component, get, header, json_body,
@@ -36,6 +36,7 @@ use list_provider_common::ids::{
     Ids, build_item, dedupe_and_rank, json_id, json_text, json_year, kind_str, positive_id,
 };
 use list_provider_common::page::{numeric_cursor, single_page};
+use scryer_plugin_pdk::error::codes;
 use scryer_plugin_sdk::command::{PluginListCommand, PluginListCommandResult};
 use scryer_plugin_sdk::host::{PluginHttpRequest, PluginHttpResponse};
 use scryer_plugin_sdk::{
@@ -173,6 +174,7 @@ pub fn descriptor() -> PluginDescriptor {
         sdk_version: scryer_plugin_sdk::SDK_VERSION.to_string(),
         sdk_constraint: scryer_plugin_sdk::current_sdk_constraint(),
         socket_permissions: Vec::new(),
+        settings: Vec::new(),
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: Vec::new(),
@@ -199,6 +201,7 @@ pub fn descriptor() -> PluginDescriptor {
                 byo_app: false,
                 scopes: Vec::new(),
             },
+            member_key: None,
             groups: vec![
                 ListProviderGroup {
                     label: "Public lists".to_string(),
@@ -596,7 +599,10 @@ impl<H: ListHttp> Client<'_, H> {
             let response = self.send(path, token, &target.what).await?;
             // Trakt answers a list id that names no list with an empty 204.
             if response.status == 204 {
-                return Err(not_found(format!("{} (HTTP 204)", target.what)));
+                return Err(with_debug(
+                    not_found(&target.what),
+                    format_args!("{}: HTTP 204", target.what),
+                ));
             }
             let summary = json_body(&response)?;
             list_name = json_text(summary.get("name"));
@@ -619,7 +625,7 @@ impl<H: ListHttp> Client<'_, H> {
             .await?;
         let body = json_body(&response)?;
         let entries = body.as_array().ok_or_else(|| {
-            permanent(format!(
+            invalid_response(format_args!(
                 "Trakt answered {} with an unexpected document",
                 target.what
             ))
@@ -713,13 +719,13 @@ impl<H: ListHttp> Client<'_, H> {
         )?;
         let user = settings
             .get("user")
-            .ok_or_else(|| permanent("Trakt answered without the account's user"))?;
+            .ok_or_else(|| invalid_response("Trakt answered without the account's user"))?;
         let ids = user.get("ids");
         let slug = ids.and_then(|ids| json_text(ids.get("slug")));
         let profile = member_profile(user);
         let username = profile
             .username
-            .ok_or_else(|| permanent("Trakt answered without the account's username"))?;
+            .ok_or_else(|| invalid_response("Trakt answered without the account's username"))?;
         // The uuid survives a username change; older payloads carry only the
         // numeric id.
         let external_user_id = ids
@@ -809,39 +815,39 @@ fn check_trakt_status(
     authorized: bool,
     what: &str,
 ) -> Result<(), PluginError> {
-    match response.status {
-        401 if authorized => Err(auth_failed(
-            "Trakt rejected the account token; reconnect the Trakt account",
-        )),
-        401 => Err(not_found(format!("{what} (private, HTTP 401)"))),
+    let status = response.status;
+    let error = match status {
+        // `auth_failed`, not `invalid_api_key`: the host expires the linked
+        // account and asks for a reconnect only on this well-known code.
+        401 if authorized => {
+            auth_failed("Trakt rejected the account token; reconnect the Trakt account")
+        }
+        401 => not_found(format!("{what} (private)")),
         403 if body_text(response)
             .to_ascii_lowercase()
             .contains("private or does not exist") =>
         {
-            Err(not_found(format!("{what} (private or deleted, HTTP 403)")))
+            not_found(format!("{what} (private or deleted)"))
         }
-        403 => Err(invalid_config(format!(
-            "Trakt refused {what} (HTTP 403): the Trakt app client id was rejected, or the \
-             list is private"
-        ))),
-        410 if authorized => Err(auth_failed(
+        403 => invalid_config(format!(
+            "Trakt refused {what}: the Trakt app client id was rejected, or the list is private"
+        )),
+        410 if authorized => auth_failed(
             "the Trakt account is deactivated; its owner must sign in on trakt.tv to reactivate \
-             it, then reconnect it (HTTP 410)",
+             it, then reconnect it",
+        ),
+        410 => permanent(format!(
+            "Trakt answered {what} as gone; the owner's account may be deactivated"
         )),
-        410 => Err(permanent(format!(
-            "Trakt answered {what} with HTTP 410; the owner's account may be deactivated"
-        ))),
-        420 => Err(permanent(format!(
-            "{what} is over a Trakt account limit (HTTP 420)"
-        ))),
-        423 => Err(permanent(
-            "the Trakt account is locked; its owner must contact Trakt support (HTTP 423)",
-        )),
-        426 => Err(permanent(format!(
-            "{what} needs a Trakt VIP account (HTTP 426)"
-        ))),
-        _ => check_status(response, Access::Public, what),
-    }
+        420 => permanent(format!("{what} is over a Trakt account limit")),
+        423 => plugin_error(
+            codes::ACCOUNT_DISABLED,
+            "the Trakt account is locked; its owner must contact Trakt support",
+        ),
+        426 => permanent(format!("{what} needs a Trakt VIP account")),
+        _ => return check_status(response, Access::Public, what),
+    };
+    Err(with_debug(error, format_args!("{what}: HTTP {status}")))
 }
 
 /// The list's own address: the owner's slug and list slug when Trakt gives

@@ -17,8 +17,8 @@
 //! The public source never reads a member's key.
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, invalid_config, missing_param, permanent, plugin_error,
-    unsupported_source,
+    Access, auth_failed, check_status, invalid_config, invalid_response, missing_param, not_found,
+    permanent, plugin_error, unsupported_source, with_debug,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, header, json_body};
 use list_provider_common::ids::{Ids, build_item, dedupe_and_rank, json_id, json_text, json_year};
@@ -227,11 +227,18 @@ fn member_key(credential: Option<&ListCredential>) -> Result<&str, PluginError> 
 
 /// MDBList answers a key it does not accept with 401 or 403. On a member's
 /// own read that is the key, never the thing being read.
+///
+/// The refusal stays `auth_failed` rather than `invalid_api_key`: for a member
+/// key that is the credential, the host reads only `auth_failed` as "the
+/// provider refused the key" when linking, and as "reconnect" on a fetch.
 fn check_member_key(
     response: &scryer_plugin_sdk::host::PluginHttpResponse,
 ) -> Result<(), PluginError> {
     match response.status {
-        401 | 403 => Err(auth_failed("MDBList did not accept the API key")),
+        401 | 403 => Err(with_debug(
+            auth_failed("MDBList did not accept the API key"),
+            format_args!("MDBList answered HTTP {}", response.status),
+        )),
         _ => Ok(()),
     }
 }
@@ -244,10 +251,10 @@ fn check_member_status(
 ) -> Result<(), PluginError> {
     check_member_key(response)?;
     match response.status {
-        404 | 410 => Err(permanent(format!(
-            "MDBList has no {what} for this account (HTTP {})",
-            response.status
-        ))),
+        404 | 410 => Err(with_debug(
+            permanent(format!("MDBList has no {what} for this account")),
+            format_args!("{what}: HTTP {}", response.status),
+        )),
         _ => check_status(response, Access::ServerKey, what),
     }
 }
@@ -269,7 +276,7 @@ pub async fn account<H: ListHttp>(
     check_member_status(&response, "account")?;
     let user = json_body(&response)?;
     let external_user_id = json_id(user.get("user_id"))
-        .ok_or_else(|| permanent("MDBList did not say whose API key this is"))?;
+        .ok_or_else(|| invalid_response("MDBList did not say whose API key this is"))?;
     let username = json_text(user.get("username")).unwrap_or_else(|| external_user_id.clone());
 
     let response = http
@@ -477,10 +484,10 @@ async fn fetch_public<H: ListHttp>(
     check_status(&response, Access::Public, &what(list))?;
     let body = json_body(&response)?;
     if let Some(error) = body.get("error").and_then(Value::as_str) {
-        return Err(list_provider_common::error::not_found(format!(
-            "{} ({error})",
-            what(list)
-        )));
+        return Err(with_debug(
+            not_found(what(list)),
+            format_args!("{}: MDBList answered {error}", what(list)),
+        ));
     }
     Ok(single_page(
         entries(&body),
