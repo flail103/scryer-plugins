@@ -7242,4 +7242,76 @@ search:
         };
         assert_eq!(request.url, "https://tracker.example/health");
     }
+
+    /// A UNIT3D-style API definition: the API key is only a search header, and
+    /// the login block, which checks the key, declares no headers of its own.
+    fn api_definition(login: &str) -> String {
+        PUBLIC_DEFINITION
+            .replace(
+                "search:\n  paths:\n",
+                &format!(
+                    "settings:\n  - {{ name: apikey, type: text, label: API Key }}\n{login}search:\n  headers:\n    Authorization: [\"Bearer {{{{ .Config.apikey }}}}\"]\n  paths:\n"
+                ),
+            )
+            .replace("id: fixture", "id: example-api")
+    }
+
+    fn api_key_config() -> BTreeMap<String, String> {
+        BTreeMap::from([("apikey".to_string(), "synthetic-key".to_string())])
+    }
+
+    fn first_request(definition: &str) -> PluginHttpRequest {
+        let Step::NeedHttp { request, .. } = begin(
+            compiled(definition),
+            Operation::Search(Box::default()),
+            api_key_config(),
+        )
+        .unwrap() else {
+            panic!("login request expected")
+        };
+        request
+    }
+
+    /// Prowlarr's `Login?.Headers ?? Search?.Headers`: a login block without a
+    /// `headers:` key sends the search headers, so the API key reaches the
+    /// login check instead of the tracker rejecting an anonymous request.
+    #[test]
+    fn get_login_without_headers_sends_the_search_headers() {
+        let request = first_request(&api_definition(
+            "login:\n  path: api/torrents\n  method: get\n",
+        ));
+        assert_eq!(request.url, "https://tracker.example/api/torrents");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer synthetic-key")
+        );
+    }
+
+    #[test]
+    fn form_login_landing_without_headers_sends_the_search_headers() {
+        let request = first_request(&api_definition("login:\n  path: login\n  method: form\n"));
+        assert_eq!(request.url, "https://tracker.example/login");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer synthetic-key")
+        );
+    }
+
+    /// The fallback only covers an absent key: login headers the definition
+    /// does declare, even an empty map, replace the search headers.
+    #[test]
+    fn explicit_login_headers_replace_the_search_headers() {
+        let request = first_request(&api_definition(
+            "login:\n  path: api/torrents\n  method: get\n  headers:\n    Authorization: \"Bearer login-{{ .Config.apikey }}\"\n",
+        ));
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer login-synthetic-key")
+        );
+
+        let request = first_request(&api_definition(
+            "login:\n  path: api/torrents\n  method: get\n  headers: {}\n",
+        ));
+        assert!(!request.headers.contains_key("authorization"));
+    }
 }
