@@ -7,8 +7,8 @@ use scryer_plugin_sdk::{
     DownloadTorrentCapabilities, PluginCompletedDownload, PluginDescriptor,
     PluginDownloadClientAddRequest, PluginDownloadClientAddResponse,
     PluginDownloadClientControlRequest, PluginDownloadClientMarkImportedRequest,
-    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadOutputKind, PluginError,
-    PluginErrorCode, PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
+    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadOutputKind, PluginErrorCode,
+    PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
 };
 use std::fs;
 use std::io::Write;
@@ -26,14 +26,31 @@ struct BlackholeConfig {
     read_only: bool,
 }
 
-fn plugin_error<T>(code: PluginErrorCode, public_message: impl Into<String>) -> PluginResult<T> {
-    PluginResult::Err(PluginError {
-        code,
-        public_message: public_message.into(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    })
+fn error_result<T>(
+    code: impl Into<PluginErrorCode>,
+    public_message: impl Into<String>,
+) -> PluginResult<T> {
+    PluginResult::Err(plugin_error(code, public_message).build())
+}
+
+/// A filesystem failure: permission and read-only answers are a folder Scryer
+/// cannot write to; anything else is reported as a transient failure. The OS
+/// text goes to the debug detail only.
+fn io_failure(error: &std::io::Error, public_message: &str) -> Error {
+    let code: PluginErrorCode = match error.kind() {
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => {
+            codes::PATH_NOT_WRITABLE.into()
+        }
+        _ => PluginErrorCode::Temporary,
+    };
+    plugin_error(code, public_message).debug(error).into_error()
+}
+
+/// A folder Scryer must write into but cannot create or write to.
+fn unwritable(error: &std::io::Error, public_message: &str) -> Error {
+    plugin_error(codes::PATH_NOT_WRITABLE, public_message)
+        .debug(error)
+        .into_error()
 }
 
 pub fn scryer_describe(_input: String) -> FnResult<String> {
@@ -44,6 +61,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "torrent-blackhole".to_string(),
             provider_aliases: vec!["blackhole".to_string()],
@@ -58,6 +76,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             ],
             isolation_modes: vec![DownloadIsolationMode::Directory],
             capabilities: DownloadClientCapabilities {
+                // The watch folder only takes torrent and magnet files.
+                http: None,
                 pause: false,
                 resume: false,
                 remove: true,
@@ -119,7 +139,7 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
     let request: PluginDownloadClientAddRequest = serde_json::from_str(&input)?;
     let config = BlackholeConfig::from_config()?;
     fs::create_dir_all(&config.torrent_folder)
-        .map_err(|error| Error::msg(format!("failed to create torrent folder: {error}")))?;
+        .map_err(|error| unwritable(&error, "Scryer cannot create the Torrent Folder."))?;
     let title = clean_file_name(
         request
             .release
@@ -129,9 +149,10 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
             .unwrap_or("download"),
     );
     let path = if let Some(bytes) = request.source.torrent_bytes_base64.as_deref() {
-        let decoded = STANDARD
-            .decode(bytes)
-            .map_err(|error| Error::msg(format!("invalid torrent_bytes_base64: {error}")))?;
+        let decoded = STANDARD.decode(bytes).or_plugin_error(
+            PluginErrorCode::Permanent,
+            "Scryer sent torrent bytes that could not be decoded.",
+        )?;
         let path = Path::new(&config.torrent_folder).join(format!("{title}.torrent"));
         write_file(&path, &decoded)?;
         path
@@ -148,7 +169,7 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
         .filter(|value| value.starts_with("magnet:"))
     {
         if !config.save_magnet_files {
-            return Ok(serde_json::to_string(&plugin_error::<
+            return Ok(serde_json::to_string(&error_result::<
                 PluginDownloadClientAddResponse,
             >(
                 PluginErrorCode::Unsupported,
@@ -163,7 +184,7 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
         write_file(&path, magnet.as_bytes())?;
         path
     } else {
-        return Ok(serde_json::to_string(&plugin_error::<
+        return Ok(serde_json::to_string(&error_result::<
             PluginDownloadClientAddResponse,
         >(
             PluginErrorCode::Permanent,
@@ -224,13 +245,13 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
     match request.action {
         DownloadControlAction::Remove => {
             if !request.remove_data {
-                return Ok(serde_json::to_string(&plugin_error::<()>(
+                return Ok(serde_json::to_string(&error_result::<()>(
                     PluginErrorCode::Unsupported,
                     "Blackhole cannot remove a download item without deleting data",
                 ))?);
             }
             if config.read_only {
-                return Ok(serde_json::to_string(&plugin_error::<()>(
+                return Ok(serde_json::to_string(&error_result::<()>(
                     PluginErrorCode::Unsupported,
                     "Blackhole is configured read-only",
                 ))?);
@@ -238,16 +259,16 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
             let path = Path::new(&request.client_item_id);
             if path.is_dir() {
                 fs::remove_dir_all(path)
-                    .map_err(|error| Error::msg(format!("failed to remove directory: {error}")))?;
+                    .map_err(|error| io_failure(&error, "Scryer could not remove the download."))?;
             } else if path.exists() {
                 fs::remove_file(path)
-                    .map_err(|error| Error::msg(format!("failed to remove file: {error}")))?;
+                    .map_err(|error| io_failure(&error, "Scryer could not remove the download."))?;
             }
         }
         DownloadControlAction::Pause
         | DownloadControlAction::Resume
         | DownloadControlAction::ForceStart => {
-            return Ok(serde_json::to_string(&plugin_error::<()>(
+            return Ok(serde_json::to_string(&error_result::<()>(
                 PluginErrorCode::Unsupported,
                 "Torrent Blackhole does not support active control actions",
             ))?);
@@ -281,8 +302,8 @@ pub fn scryer_download_status(_input: String) -> FnResult<String> {
 
 pub fn scryer_download_test_connection(_input: String) -> FnResult<String> {
     let config = BlackholeConfig::from_config()?;
-    ensure_directory(&config.torrent_folder, "Torrent Folder")?;
-    ensure_directory(&config.watch_folder, "Watch Folder")?;
+    ensure_directory(&config.torrent_folder, "torrent_folder", "Torrent Folder")?;
+    ensure_directory(&config.watch_folder, "watch_folder", "Watch Folder")?;
     Ok(serde_json::to_string(&PluginResult::Ok("ok".to_string()))?)
 }
 
@@ -346,9 +367,9 @@ fn config_fields() -> Vec<ConfigFieldDef> {
 
 fn write_file(path: &Path, content: &[u8]) -> Result<(), Error> {
     let mut file = fs::File::create(path)
-        .map_err(|error| Error::msg(format!("failed to open file: {error}")))?;
+        .map_err(|error| unwritable(&error, "Scryer cannot write to the Torrent Folder."))?;
     file.write_all(content)
-        .map_err(|error| Error::msg(format!("failed to write file: {error}")))
+        .map_err(|error| unwritable(&error, "Scryer cannot write to the Torrent Folder."))
 }
 
 fn torrent_file_url(request: &PluginDownloadClientAddRequest) -> Option<String> {
@@ -365,17 +386,26 @@ fn get_external_bytes(url: &str) -> Result<Vec<u8>, Error> {
         .with_method("GET")
         .with_header("User-Agent", "scryer-torrent-blackhole-plugin/0.1");
     let response = http::request::<Vec<u8>>(&request, None)
-        .map_err(|error| Error::msg(format!("torrent URL request failed: {error}")))?;
+        .map_err(|error| error.context("torrent URL request failed"))?;
     let status = response.status_code();
     let body = response.body();
-    if status >= 400 {
-        return Err(Error::msg(format!(
+    let retry_after = response
+        .headers()
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.clone());
+    check_http_status(status, retry_after.as_deref()).map_err(|error| {
+        error.context(format!(
             "torrent URL returned HTTP {status}: {}",
             String::from_utf8_lossy(&body)
-        )));
-    }
+        ))
+    })?;
     if body.is_empty() {
-        return Err(Error::msg("torrent URL returned an empty response body"));
+        return Err(plugin_error(
+            codes::INVALID_RESPONSE,
+            "The torrent URL returned an empty file.",
+        )
+        .into_error());
     }
     Ok(body)
 }
@@ -496,6 +526,9 @@ fn entry_to_item(config: &BlackholeConfig, entry: WatchFolderEntry) -> PluginDow
             "waiting-for-stable-watch-folder-entry".to_string()
         }),
         completed_at: None,
+        // A blackhole hands the file to another client and never learns when it was added.
+        added_at: None,
+        http: None,
     }
 }
 
@@ -523,6 +556,7 @@ fn entry_to_completed(entry: WatchFolderEntry) -> PluginCompletedDownload {
         size_bytes: Some(path_size(&path)),
         completed_at: None,
         parameters: Vec::new(),
+        subtitle_paths: Vec::new(),
         release_name: None,
     }
 }
@@ -570,14 +604,28 @@ fn path_size(path: &Path) -> i64 {
         .sum()
 }
 
-fn ensure_directory(path: &str, label: &str) -> Result<(), Error> {
+fn ensure_directory(path: &str, key: &str, label: &str) -> Result<(), Error> {
     if path.trim().is_empty() {
-        return Err(Error::msg(format!("{label} is required")));
+        return Err(plugin_error(
+            PluginErrorCode::InvalidConfig,
+            format!("{key}: {label} is required."),
+        )
+        .into_error());
     }
-    let metadata = fs::metadata(path)
-        .map_err(|error| Error::msg(format!("{label} is not accessible: {error}")))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        plugin_error(
+            codes::PATH_NOT_WRITABLE,
+            format!("{key}: Scryer cannot access the {label}."),
+        )
+        .debug(error)
+        .into_error()
+    })?;
     if !metadata.is_dir() {
-        return Err(Error::msg(format!("{label} is not a directory")));
+        return Err(plugin_error(
+            PluginErrorCode::InvalidConfig,
+            format!("{key}: {label} is not a directory."),
+        )
+        .into_error());
     }
     Ok(())
 }
@@ -700,6 +748,40 @@ mod tests {
             entry_to_item(&config(true), entry(None)).can_move_files,
             Some(false)
         );
+    }
+
+    fn report(error: &Error) -> PluginError {
+        scryer_plugin_pdk::error::plugin_error_from(error)
+    }
+
+    #[test]
+    fn a_missing_folder_setting_is_invalid_config_naming_the_key() {
+        let failure =
+            report(&ensure_directory("  ", "torrent_folder", "Torrent Folder").unwrap_err());
+        assert_eq!(failure.code, PluginErrorCode::InvalidConfig);
+        assert!(failure.public_message.starts_with("torrent_folder:"));
+    }
+
+    #[test]
+    fn a_folder_scryer_cannot_reach_or_write_is_path_not_writable() {
+        let missing = "/nonexistent-scryer-fixture/blackhole";
+        let failure =
+            report(&ensure_directory(missing, "torrent_folder", "Torrent Folder").unwrap_err());
+        assert_eq!(
+            failure.code,
+            PluginErrorCode::from(codes::PATH_NOT_WRITABLE)
+        );
+        assert!(!failure.public_message.contains(missing));
+
+        let write = report(
+            &write_file(
+                Path::new("/nonexistent-scryer-fixture/blackhole/Fixture.Release"),
+                b"x",
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(write.code, PluginErrorCode::from(codes::PATH_NOT_WRITABLE));
+        assert!(!write.public_message.contains("nonexistent"));
     }
 }
 
