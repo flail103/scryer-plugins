@@ -20,7 +20,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-scryer-plugin-pdk = { path = "../../pdk/scryer-plugin-pdk", version = "0.8.0" }
+scryer-plugin-pdk = "0.8.0"
 scryer-plugin-sdk = "3.18.0"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde = { version = "1", features = ["derive"] }

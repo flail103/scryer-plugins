@@ -31,7 +31,7 @@ crate-type = ["cdylib"]
 base64 = "0.23"
 roxmltree = "0.21"
 scryer-plugin-sdk = "3.18.0"
-scryer-plugin-pdk = { path = "../../pdk/scryer-plugin-pdk", version = "0.8.0" }
+scryer-plugin-pdk = "0.8.0"
 serde = "1"
 serde_json = "1"
 # `aria2.addUri` answers with a GID, never with the info hash, and the GID it

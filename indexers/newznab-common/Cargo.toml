@@ -5,7 +5,7 @@ edition = "2021"
 license = "GPL-3.0-only"
 
 [dependencies]
-scryer-plugin-pdk = { path = "../../pdk/scryer-plugin-pdk", version = "0.8.0" }
+scryer-plugin-pdk = "0.8.0"
 quick-xml = "0.42"
 scryer-plugin-sdk = "3.18.0"
 serde = { version = "1", features = ["derive"] }

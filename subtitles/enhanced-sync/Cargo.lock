@@ -1483,6 +1483,8 @@ dependencies = [
 [[package]]
 name = "scryer-plugin-pdk"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd05e4ac0d93f86458afce9cb834791f0f27e2a4a8b16d900cd637e42769a48f"
 dependencies = [
  "anyhow",
  "futures-util",

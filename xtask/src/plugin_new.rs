@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     PluginKindArg, PluginNewArgs, SdkDependency, TaskContext, current_sdk_dependency, ok,
-    repo_cargo_command_in, run_checked,
+    package_version, repo_cargo_command_in, run_checked,
 };
 
 const NOTIFICATION_LIB_RS_TEMPLATE: &str =
@@ -54,15 +54,17 @@ const SUBTITLE_WIT_PACKAGES: [&str; 3] = ["host-v1.0.0", "runtime-v1.0.0", "subt
 
 /// The Scryer floor for a component plugin.
 ///
-/// Scryer 0.20.0 is the first release whose family hosts are all
-/// component-backed (and whose subtitle host serves world 1.1.0). A Preview 1
-/// host cannot instantiate a component at all, so a new plugin declares that
-/// release as its floor, the same one every first-party component carries.
-const COMPONENT_MIN_SCRYER_VERSION: &str = "0.20.0";
+/// A Preview 1 host cannot instantiate a component at all, and a host before
+/// 0.21.21 cannot decode the open error codes the PDK reports failures with,
+/// so a new plugin declares that release as its floor, the same one every
+/// first-party component carries.
+const COMPONENT_MIN_SCRYER_VERSION: &str = "0.21.21";
 
 const WIT_BINDGEN_VERSION: &str = "0.61";
-const PDK_PATH_FROM_PLUGIN: &str = "../../pdk/scryer-plugin-pdk";
-const PDK_VERSION: &str = "0.7.0";
+/// The PDK manifest whose version a scaffold depends on. Plugins take the PDK
+/// from crates.io like any third-party plugin; the in-tree manifest only says
+/// which published release is current.
+const PDK_MANIFEST: &str = "pdk/scryer-plugin-pdk/Cargo.toml";
 const CONFORMANCE_PATH_FROM_PLUGIN: &str = "../../pdk/scryer-plugin-conformance";
 
 pub(crate) fn run_plugin_new(ctx: &TaskContext, args: PluginNewArgs) -> Result<()> {
@@ -89,7 +91,10 @@ fn scaffold_plugin(
         validate_family_wit(repo_root, spec.kind)?;
         fs::write(
             plugin_dir.join("Cargo.toml"),
-            spec.render_manifest(&current_sdk_dependency(ctx)?),
+            spec.render_manifest(
+                &current_sdk_dependency(ctx)?,
+                &current_pdk_version(repo_root)?,
+            ),
         )?;
         fs::write(plugin_dir.join("src/lib.rs"), spec.render_lib_rs()?)?;
         fs::create_dir_all(plugin_dir.join("tests"))?;
@@ -107,6 +112,13 @@ fn scaffold_plugin(
     }
 
     Ok(plugin_dir)
+}
+
+/// The published PDK release a scaffold depends on, read from the PDK manifest.
+fn current_pdk_version(repo_root: &Path) -> Result<String> {
+    let manifest = repo_root.join(PDK_MANIFEST);
+    package_version(&manifest)
+        .with_context(|| format!("failed to read the PDK version from {}", manifest.display()))
 }
 
 /// Check the canonical contracts before generating references to them.
@@ -174,7 +186,7 @@ impl ScaffoldSpec {
     /// contributor opens has real section headers and the comments that explain
     /// the two settings they are most likely to get wrong. It is parsed back in
     /// the tests, so a malformed template fails there.
-    fn render_manifest(&self, sdk: &SdkDependency) -> String {
+    fn render_manifest(&self, sdk: &SdkDependency, pdk_version: &str) -> String {
         let repo_path = format!("{}/{}", self.kind.directory(), self.plugin_id);
         let source_url = format!("https://github.com/OWNER/REPO/tree/main/{repo_path}");
         format!(
@@ -199,7 +211,7 @@ source_repo = "{source_url}"
 crate-type = ["cdylib"]
 
 [dependencies]
-scryer-plugin-pdk = {{ path = "{pdk_path}", version = "{pdk_version}" }}
+scryer-plugin-pdk = "{pdk_version}"
 scryer-plugin-sdk = {sdk_dependency}
 serde_json = "1"
 wit-bindgen = "{wit_bindgen_version}"
@@ -227,8 +239,7 @@ panic = "abort"
             plugin_id = self.plugin_id,
             min_scryer_version = COMPONENT_MIN_SCRYER_VERSION,
             source_url = source_url,
-            pdk_path = PDK_PATH_FROM_PLUGIN,
-            pdk_version = PDK_VERSION,
+            pdk_version = pdk_version,
             sdk_dependency = render_sdk_dependency(sdk),
             wit_bindgen_version = WIT_BINDGEN_VERSION,
             conformance_path = CONFORMANCE_PATH_FROM_PLUGIN,
@@ -387,6 +398,8 @@ mod tests {
 
     /// The SDK declaration the scaffold has to mirror, read from the real
     /// `xtask/Cargo.toml` so the test tracks the fleet instead of restating it.
+    const TEST_PDK_VERSION: &str = "0.8.0";
+
     fn test_sdk_dependency() -> SdkDependency {
         crate::sdk_dependency_from_manifest(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
@@ -528,7 +541,7 @@ mod tests {
             (PluginKindArg::Subtitle, "subtitle"),
         ] {
             let spec = ScaffoldSpec::new(kind, "Example Plugin").expect("build spec");
-            let manifest = spec.render_manifest(&test_sdk_dependency());
+            let manifest = spec.render_manifest(&test_sdk_dependency(), TEST_PDK_VERSION);
             let document = manifest.parse::<DocumentMut>().expect("parse manifest");
 
             let entry = &document["dev-dependencies"]["scryer-plugin-conformance"];
@@ -575,7 +588,7 @@ mod tests {
     fn render_manifest_marks_new_plugins_as_non_official() {
         let spec = ScaffoldSpec::new(PluginKindArg::Notification, "Example Plugin")
             .expect("build scaffold spec");
-        let manifest = spec.render_manifest(&test_sdk_dependency());
+        let manifest = spec.render_manifest(&test_sdk_dependency(), TEST_PDK_VERSION);
         let document = manifest.parse::<DocumentMut>().expect("parse manifest");
 
         assert_eq!(
@@ -589,7 +602,7 @@ mod tests {
         let spec =
             ScaffoldSpec::new(PluginKindArg::Notification, "Webhook Example").expect("build spec");
         let sdk = test_sdk_dependency();
-        let manifest = spec.render_manifest(&sdk);
+        let manifest = spec.render_manifest(&sdk, TEST_PDK_VERSION);
         let document = manifest.parse::<DocumentMut>().expect("parse manifest");
 
         assert_eq!(
@@ -603,9 +616,10 @@ mod tests {
             document["dependencies"].get("extism-pdk").is_none(),
             "the scaffold must not depend on extism-pdk"
         );
+        // The PDK comes from crates.io, never from a path into this tree.
         assert_eq!(
-            document["dependencies"]["scryer-plugin-pdk"]["version"].as_str(),
-            Some(PDK_VERSION)
+            document["dependencies"]["scryer-plugin-pdk"].as_str(),
+            Some(TEST_PDK_VERSION)
         );
         assert_eq!(
             document["dependencies"]["wit-bindgen"].as_str(),
@@ -694,6 +708,15 @@ mod tests {
         )
         .expect("write xtask manifest");
 
+        // The scaffold takes its PDK version from the PDK manifest.
+        fs::create_dir_all(ctx.repo_root.join("pdk/scryer-plugin-pdk")).expect("create pdk dir");
+        fs::write(
+            ctx.repo_root.join(PDK_MANIFEST),
+            include_str!("../../pdk/scryer-plugin-pdk/Cargo.toml"),
+        )
+        .expect("write pdk manifest");
+        let pdk_version = current_pdk_version(&ctx.repo_root).expect("read pdk version");
+
         // Only the PDK supplies contracts; no sibling plugin is needed.
         for (kind, packages) in [
             (PluginKindArg::Notification, &NOTIFICATION_WIT_PACKAGES[..]),
@@ -729,6 +752,15 @@ mod tests {
             assert!(
                 !plugin_dir.join("wit").exists(),
                 "scaffolds must not duplicate contracts"
+            );
+            let manifest = fs::read_to_string(&cargo_toml)
+                .expect("read generated manifest")
+                .parse::<DocumentMut>()
+                .expect("parse generated manifest");
+            assert_eq!(
+                manifest["dependencies"]["scryer-plugin-pdk"].as_str(),
+                Some(pdk_version.as_str()),
+                "the scaffold must take the published PDK, not a path"
             );
             let source = fs::read_to_string(&lib_rs).expect("read generated source");
             for package in packages {
