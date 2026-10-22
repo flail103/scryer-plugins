@@ -1,6 +1,6 @@
 [package]
 name = "enhanced-subtitle-sync-plugin"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2024"
 autolib = false
 license = "GPL-3.0-only"
@@ -14,7 +14,9 @@ catalog_versions = ["v3"]
 # `scryer:subtitle/subtitle-provider@1.1.0`. A host that only serves the 1.0.0
 # world (or the Preview 1 command runtime before it) cannot bind this artifact
 # at all, so the floor is load-bearing, not advisory.
-min_scryer_version = "0.20.0"
+# 0.21.21 is the first host that decodes the open error codes this plugin
+# sends.
+min_scryer_version = "0.21.21"
 # Both flavors are kept on purpose. Unlike the catalog providers — which are
 # I/O-bound and gained nothing from SIMD, so their variants were dropped — this
 # is the fleet's one DSP plugin: FFmpeg's decoders, libfvad and the FFT
@@ -29,8 +31,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 base64 = "0.23"
-scryer-plugin-pdk = { path = "../../pdk/scryer-plugin-pdk", version = "0.7.0" }
-scryer-plugin-sdk = "3.12.0"
+scryer-plugin-pdk = { path = "../../pdk/scryer-plugin-pdk", version = "0.8.0" }
+scryer-plugin-sdk = "3.18.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustfft = "6"
