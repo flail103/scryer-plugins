@@ -47,7 +47,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use scryer_plugin_pdk::sdk::command::{PluginSubtitleCommand, PluginSubtitleCommandResult};
-use scryer_plugin_pdk::{HttpRequest, HttpResponse, config, http};
+use scryer_plugin_pdk::{HttpRequest, HttpResponse, codes, config, http, plugin_error};
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldType, ConfigFieldValueSource, PluginDescriptor, PluginError,
@@ -110,6 +110,8 @@ struct Failure {
     kind: FailureKind,
     message: String,
     retry_after_seconds: Option<i64>,
+    /// A PDK code more specific than the kind's own.
+    code: Option<PluginErrorCode>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,34 +239,25 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         // `SubtitleCapabilities::mode` and never routes a generate here, so
         // this arm answers in-band rather than trapping.
         PluginSubtitleCommand::Generate(_) => {
-            PluginSubtitleCommandResult::Generate(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "Subdl is a catalog subtitle provider and cannot generate \
-                                 subtitles"
-                    .to_string(),
-                debug_message: Some(
-                    "SubtitleProviderMode::Catalog advertises no generate capability".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
+            PluginSubtitleCommandResult::Generate(PluginResult::Err(
+                plugin_error(
+                    PluginErrorCode::Unsupported,
+                    "Subdl is a catalog subtitle provider and cannot generate subtitles",
+                )
+                .debug("SubtitleProviderMode::Catalog advertises no generate capability")
+                .build(),
+            ))
         }
         // Alignment moved into this envelope when the subtitle-sync plugin
         // migrated off its own transport, so every subtitle provider now sees
         // the operation whether or not it can serve one. Subdl cannot: it has
         // no audio decoder and advertises no `sync` capability. Same in-band
         // refusal as `Generate`, for the same reason.
-        PluginSubtitleCommand::Sync(_) => {
-            PluginSubtitleCommandResult::Sync(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "Subdl cannot align subtitles".to_string(),
-                debug_message: Some(
-                    "SubtitleCapabilities::sync is None for this provider".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
-        }
+        PluginSubtitleCommand::Sync(_) => PluginSubtitleCommandResult::Sync(PluginResult::Err(
+            plugin_error(PluginErrorCode::Unsupported, "Subdl cannot align subtitles")
+                .debug("SubtitleCapabilities::sync is None for this provider")
+                .build(),
+        )),
     }
 }
 
@@ -287,11 +280,11 @@ fn validate_config(
 fn search(request: &SubtitlePluginSearchRequest) -> PluginResult<SubtitlePluginSearchResponse> {
     let config = match SubdlConfig::from_host() {
         Ok(config) => config,
-        Err(failure) => return PluginResult::Err(plugin_error(failure)),
+        Err(failure) => return PluginResult::Err(failure.into_plugin_error()),
     };
     match search_subtitles_impl(&config, request) {
         Ok(results) => PluginResult::Ok(SubtitlePluginSearchResponse { results }),
-        Err(failure) => PluginResult::Err(plugin_error(failure)),
+        Err(failure) => PluginResult::Err(failure.into_plugin_error()),
     }
 }
 
@@ -300,43 +293,82 @@ fn download(
 ) -> PluginResult<SubtitlePluginDownloadResponse> {
     let config = match SubdlConfig::from_host() {
         Ok(config) => config,
-        Err(failure) => return PluginResult::Err(plugin_error(failure)),
+        Err(failure) => return PluginResult::Err(failure.into_plugin_error()),
     };
     let reference: SubdlDownloadRef = match serde_json::from_str(&request.provider_file_id) {
         Ok(reference) => reference,
         Err(error) => {
-            return PluginResult::Err(plugin_error(Failure::new(
-                FailureKind::Unsupported,
-                format!("Subdl subtitle reference is not valid: {error}"),
-            )));
+            return PluginResult::Err(
+                Failure::new(
+                    FailureKind::Unsupported,
+                    format!("Subdl subtitle reference is not valid: {error}"),
+                )
+                .into_plugin_error(),
+            );
         }
     };
     match download_subtitle_impl(&config, &reference) {
         Ok(response) => PluginResult::Ok(response),
-        Err(failure) => PluginResult::Err(plugin_error(failure)),
+        Err(failure) => PluginResult::Err(failure.into_plugin_error()),
     }
 }
 
-/// The typed counterpart of [`validation_error_response`].
-///
-/// Both read the same [`FailureKind`], so a `search` or `download` failure and
-/// a `validate_config` failure describe the same problem the same way — which
-/// they could not do while the old channel flattened everything but the
-/// message.
-fn plugin_error(failure: Failure) -> PluginError {
-    let code = match failure.kind {
-        FailureKind::InvalidConfig => PluginErrorCode::InvalidConfig,
-        FailureKind::AuthFailed => PluginErrorCode::AuthFailed,
-        FailureKind::RateLimited => PluginErrorCode::RateLimited,
-        FailureKind::Unreachable => PluginErrorCode::UpstreamUnavailable,
-        FailureKind::Unsupported | FailureKind::Provider => PluginErrorCode::Temporary,
-    };
-    PluginError {
-        code,
-        public_message: failure.message,
-        debug_message: None,
-        retry_after_seconds: failure.retry_after_seconds,
-        details: None,
+impl Failure {
+    /// The typed counterpart of [`validation_error_response`].
+    ///
+    /// Both read the same [`FailureKind`], so a `search` or `download` failure
+    /// and a `validate_config` failure describe the same problem the same way.
+    /// A specific code, where one was recorded, refines the kind's code. The
+    /// message can carry Subdl's own text, so it goes to the debug detail;
+    /// configuration messages are the plugin's own wording and stay public.
+    fn into_plugin_error(self) -> PluginError {
+        let code: PluginErrorCode = match (self.code.clone(), self.kind) {
+            (Some(code), _) => code,
+            (None, FailureKind::InvalidConfig) => PluginErrorCode::InvalidConfig,
+            (None, FailureKind::AuthFailed) => PluginErrorCode::AuthFailed,
+            (None, FailureKind::RateLimited) => PluginErrorCode::RateLimited,
+            (None, FailureKind::Unreachable) => PluginErrorCode::UpstreamUnavailable,
+            (None, FailureKind::Unsupported | FailureKind::Provider) => PluginErrorCode::Temporary,
+        };
+        if self.kind == FailureKind::InvalidConfig {
+            return plugin_error(code, self.message).build();
+        }
+        let mut builder = plugin_error(code.clone(), public_message(&code)).debug(self.message);
+        if let Some(seconds) = self.retry_after_seconds {
+            builder = builder.retry_after_seconds(seconds);
+        }
+        builder.build()
+    }
+
+    /// The operator-facing sentence for this failure.
+    fn public_message(&self) -> String {
+        if self.kind == FailureKind::InvalidConfig {
+            return self.message.clone();
+        }
+        self.clone().into_plugin_error().public_message
+    }
+}
+
+fn public_message(code: &PluginErrorCode) -> &'static str {
+    match code {
+        code if *code == PluginErrorCode::from(codes::INVALID_API_KEY) => {
+            "Subdl rejected the API key."
+        }
+        code if *code == PluginErrorCode::from(codes::QUOTA_EXCEEDED) => {
+            "The Subdl daily download limit is used up."
+        }
+        code if *code == PluginErrorCode::from(codes::INVALID_RESPONSE) => {
+            "Subdl returned a response Scryer could not read."
+        }
+        code if *code == PluginErrorCode::from(codes::TLS_ERROR) => {
+            "A secure connection to Subdl could not be established."
+        }
+        PluginErrorCode::AuthFailed => "Subdl rejected the credentials.",
+        PluginErrorCode::RateLimited => "Subdl is rate limiting requests.",
+        PluginErrorCode::UpstreamUnavailable => {
+            "Subdl could not be reached or answered with a server error."
+        }
+        _ => "The Subdl request could not be completed.",
     }
 }
 
@@ -354,7 +386,13 @@ impl Failure {
             kind,
             message: message.into(),
             retry_after_seconds: None,
+            code: None,
         }
+    }
+
+    fn with_code(mut self, code: impl Into<PluginErrorCode>) -> Self {
+        self.code = Some(code.into());
+        self
     }
 
     fn with_retry_after(mut self, retry_after_seconds: Option<i64>) -> Self {
@@ -371,6 +409,7 @@ fn descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Subtitle(SubtitleDescriptor {
             provider_type: "subdl".to_string(),
             provider_aliases: vec![],
@@ -770,12 +809,8 @@ fn http_get_json(url: &str) -> Result<SubdlSearchResponse, Failure> {
         .with_method("GET")
         .with_header("Accept", "application/json")
         .with_header("User-Agent", USER_AGENT);
-    let response = http::request::<Vec<u8>>(&request, None).map_err(|error| {
-        Failure::new(
-            FailureKind::Unreachable,
-            format!("Subdl request failed: {error}"),
-        )
-    })?;
+    let response = http::request::<Vec<u8>>(&request, None)
+        .map_err(|error| transport_failure("Subdl request failed", &error))?;
 
     map_http_status("Subdl search", &response)?;
     let parsed: SubdlSearchResponse =
@@ -784,6 +819,7 @@ fn http_get_json(url: &str) -> Result<SubdlSearchResponse, Failure> {
                 FailureKind::Unsupported,
                 format!("Subdl JSON parse error: {error}"),
             )
+            .with_code(codes::INVALID_RESPONSE)
         })?;
     if !parsed.success_flag() {
         let error = parsed
@@ -792,6 +828,11 @@ fn http_get_json(url: &str) -> Result<SubdlSearchResponse, Failure> {
             .unwrap_or_else(|| "Subdl search failed".to_string());
         if looks_like_not_found(&error) {
             return Ok(parsed);
+        }
+        if names_api_key(&error) {
+            return Err(
+                Failure::new(FailureKind::AuthFailed, error).with_code(codes::INVALID_API_KEY)
+            );
         }
         return Err(Failure::new(FailureKind::Provider, error));
     }
@@ -803,18 +844,15 @@ fn http_get_download(url: &str) -> Result<DownloadArtifact, Failure> {
         .with_method("GET")
         .with_header("Accept", "*/*")
         .with_header("User-Agent", USER_AGENT);
-    let response = http::request::<Vec<u8>>(&request, None).map_err(|error| {
-        Failure::new(
-            FailureKind::Unreachable,
-            format!("Subdl download request failed: {error}"),
-        )
-    })?;
+    let response = http::request::<Vec<u8>>(&request, None)
+        .map_err(|error| transport_failure("Subdl download request failed", &error))?;
 
     let body_text = response_body_text(&response);
     if is_download_rate_limited(response.status_code(), body_text.as_str()) {
-        return Err(download_rate_limited_failure(retry_after_seconds(
-            &response,
-        )));
+        return Err(download_failure(
+            response.status_code(),
+            retry_after_seconds(&response),
+        ));
     }
 
     map_http_status("Subdl download", &response)?;
@@ -825,6 +863,17 @@ fn http_get_download(url: &str) -> Result<DownloadArtifact, Failure> {
         filename: response_header(&response, "content-disposition")
             .and_then(|value| content_disposition_filename(value.as_str())),
     })
+}
+
+fn transport_failure(label: &str, error: &scryer_plugin_pdk::Error) -> Failure {
+    let failure = Failure::new(FailureKind::Unreachable, format!("{label}: {error}"));
+    if scryer_plugin_pdk::error::plugin_error_from(error).code
+        == PluginErrorCode::from(codes::TLS_ERROR)
+    {
+        failure.with_code(codes::TLS_ERROR)
+    } else {
+        failure
+    }
 }
 
 fn map_http_status(label: &str, response: &HttpResponse) -> Result<(), Failure> {
@@ -847,8 +896,9 @@ fn map_http_status_details(
         200 => Ok(()),
         403 => Err(Failure::new(
             FailureKind::AuthFailed,
-            format!("{label} authentication failed"),
-        )),
+            format!("{label} authentication failed: {body_text}"),
+        )
+        .with_code(codes::INVALID_API_KEY)),
         429 => {
             let message = match retry_after_seconds {
                 Some(seconds) if seconds > 0 => {
@@ -862,7 +912,8 @@ fn map_http_status_details(
         status if status >= 500 => Err(Failure::new(
             FailureKind::Unsupported,
             format!("{label} returned HTTP {status}: {body_text}"),
-        )),
+        )
+        .with_code(PluginErrorCode::UpstreamUnavailable)),
         status => Err(Failure::new(
             FailureKind::Unsupported,
             format!("{label} returned HTTP {status}: {body_text}"),
@@ -908,7 +959,7 @@ fn validation_error_response(failure: &Failure) -> SubtitlePluginValidateConfigR
     };
     SubtitlePluginValidateConfigResponse {
         status,
-        message: Some(failure.message.clone()),
+        message: Some(failure.public_message()),
         retry_after_seconds: failure.retry_after_seconds,
     }
 }
@@ -960,6 +1011,24 @@ fn download_rate_limited_failure(retry_after_seconds: Option<i64>) -> Failure {
         "Subdl rate limited — daily download limit exceeded",
     )
     .with_retry_after(retry_after_seconds)
+}
+
+/// Subdl's answer once the daily download allowance is spent: HTTP 500 with
+/// this literal body. A 429 is ordinary throttling.
+fn download_failure(status: u16, retry_after_seconds: Option<i64>) -> Failure {
+    let failure = download_rate_limited_failure(retry_after_seconds);
+    if status == 429 {
+        failure
+    } else {
+        failure.with_code(codes::QUOTA_EXCEEDED)
+    }
+}
+
+/// Subdl answers a bad key in its JSON envelope (`{"status": false, "error":
+/// "..."}`), so the text is the only signal.
+fn names_api_key(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    lowered.contains("api key") || lowered.contains("api_key") || lowered.contains("apikey")
 }
 
 fn normalize_non_empty(value: &str) -> Option<String> {
@@ -2011,6 +2080,48 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_api_key_reports_invalid_api_key_without_subdls_text() {
+        let failure = map_http_status_details("Subdl search", 403, "fixture upstream text", None)
+            .expect_err("auth error")
+            .into_plugin_error();
+        assert_eq!(
+            failure.code,
+            PluginErrorCode::from(scryer_plugin_pdk::codes::INVALID_API_KEY)
+        );
+        assert!(!failure.public_message.contains("fixture upstream text"));
+        assert!(
+            failure
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("fixture upstream text")
+        );
+        assert!(names_api_key("Invalid API key"));
+        assert!(!names_api_key("can't find movie"));
+    }
+
+    #[test]
+    fn the_daily_download_limit_is_a_quota_and_429_is_a_rate_limit() {
+        let quota = http_download_failure_for_test(500, "Download limit exceeded", None)
+            .into_plugin_error();
+        assert_eq!(
+            quota.code,
+            PluginErrorCode::from(scryer_plugin_pdk::codes::QUOTA_EXCEEDED)
+        );
+        let throttled =
+            http_download_failure_for_test(429, "Too many requests", Some(30)).into_plugin_error();
+        assert_eq!(throttled.code, PluginErrorCode::RateLimited);
+        assert_eq!(throttled.retry_after_seconds, Some(30));
+        assert_eq!(
+            map_http_status_details("Subdl search", 502, "bad gateway", None)
+                .expect_err("server error")
+                .into_plugin_error()
+                .code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+    }
+
+    #[test]
     fn validation_error_response_preserves_retry_after() {
         let failure =
             Failure::new(FailureKind::RateLimited, "too many requests").with_retry_after(Some(12));
@@ -2025,7 +2136,7 @@ mod tests {
         retry_after_seconds: Option<i64>,
     ) -> Failure {
         if is_download_rate_limited(status, body_text) {
-            download_rate_limited_failure(retry_after_seconds)
+            download_failure(status, retry_after_seconds)
         } else {
             map_http_status_details("Subdl download", status, body_text, retry_after_seconds)
                 .expect_err("failure")
