@@ -13,7 +13,7 @@ use scryer_plugin_sdk::{
     PluginDownloadClientStatus, PluginDownloadFeedbackScope, PluginDownloadItem,
     PluginDownloadListRecentCompletedRequest, PluginDownloadOutputKind,
     PluginDownloadScopedListRequest, PluginDownloadScopedListResponse,
-    PluginDownloadScopedRecentCompletedRequest, PluginError, PluginErrorCode, PluginResult,
+    PluginDownloadScopedRecentCompletedRequest, PluginErrorCode, PluginResult,
     PluginTorrentContentLayout, PluginTorrentInitialState, PluginTorrentItem, ProviderDescriptor,
     SDK_VERSION,
 };
@@ -24,23 +24,9 @@ const COOKIE_VAR_KEY: &str = "qbittorrent.sid";
 const IMPORTED_TAG_DEFAULT: &str = "scryer:imported";
 const ROUTING_CATEGORY_TAG_PREFIX: &str = "scryer:routing-category:";
 
-fn plugin_error<T>(code: PluginErrorCode, public_message: impl Into<String>) -> PluginResult<T> {
-    PluginResult::Err(PluginError {
-        code,
-        public_message: public_message.into(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    })
-}
-
-fn plugin_error_response<T: serde::Serialize>(
-    code: PluginErrorCode,
-    public_message: impl Into<String>,
-) -> FnResult<String> {
-    Ok(serde_json::to_string(&plugin_error::<T>(
-        code,
-        public_message,
+fn plugin_error_response<T: serde::Serialize>(error: PluginErrorBuilder) -> FnResult<String> {
+    Ok(serde_json::to_string(&PluginResult::<T>::Err(
+        error.build(),
     ))?)
 }
 
@@ -90,6 +76,8 @@ struct QbTorrent {
     progress: Option<f64>,
     #[serde(default)]
     completion_on: Option<i64>,
+    #[serde(default)]
+    added_on: Option<i64>,
     #[serde(default)]
     tags: Option<String>,
     #[serde(default)]
@@ -161,6 +149,7 @@ fn build_descriptor_json() -> Result<String, Error> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "qbittorrent".to_string(),
             provider_aliases: vec!["qbit".to_string()],
@@ -230,6 +219,7 @@ fn build_descriptor_json() -> Result<String, Error> {
                     reports_content_paths: true,
                     ..DownloadTorrentCapabilities::default()
                 }),
+                http: None,
             },
         }),
     };
@@ -238,15 +228,7 @@ fn build_descriptor_json() -> Result<String, Error> {
 
 pub fn scryer_download_add(input: String) -> FnResult<String> {
     let request: PluginDownloadClientAddRequest = serde_json::from_str(&input)?;
-    let config = match QbittorrentConfig::from_config() {
-        Ok(config) => config,
-        Err(err) => {
-            return plugin_error_response::<PluginDownloadClientAddResponse>(
-                PluginErrorCode::InvalidConfig,
-                err.to_string(),
-            );
-        }
-    };
+    let config = QbittorrentConfig::from_config()?;
     let response = handle_download_add(config, request)?;
     Ok(serde_json::to_string(&response)?)
 }
@@ -269,9 +251,13 @@ fn handle_download_add(
             let bytes = match general_purpose::STANDARD.decode(torrent_bytes_base64) {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    return Ok(plugin_error(
-                        PluginErrorCode::Permanent,
-                        format!("invalid torrent_bytes_base64: {err}"),
+                    return Ok(PluginResult::Err(
+                        plugin_error(
+                            PluginErrorCode::Permanent,
+                            "the torrent file could not be decoded",
+                        )
+                        .debug(format_args!("invalid torrent_bytes_base64: {err}"))
+                        .build(),
                     ));
                 }
             };
@@ -328,10 +314,18 @@ fn handle_download_add(
                     .magnet_uri
                     .clone()
                     .or_else(|| request.source.download_url.clone()),
+                DownloadInputKind::HttpResource => {
+                    return Ok(PluginResult::Err(
+                        plugin_error(
+                            PluginErrorCode::Unsupported,
+                            "qBittorrent cannot download HTTP resources",
+                        )
+                        .build(),
+                    ));
+                }
             }) else {
-                return Ok(plugin_error(
-                    PluginErrorCode::Permanent,
-                    "download source is missing",
+                return Ok(PluginResult::Err(
+                    plugin_error(PluginErrorCode::Permanent, "download source is missing").build(),
                 ));
             };
 
@@ -398,6 +392,7 @@ fn handle_download_add(
 
     let add_response = post_add(&config, prepared_request)?;
     let hash = match add_disposition(
+        &config,
         add_response.status_code(),
         &String::from_utf8_lossy(&add_response.body()),
         expected_hash.as_deref(),
@@ -725,22 +720,18 @@ fn handle_download_control(
 ) -> Result<PluginResult<()>, Error> {
     let hash = normalize_hash(&request.client_item_id);
     if hash.is_empty() {
-        return Ok(PluginResult::Err(PluginError {
-            code: PluginErrorCode::Permanent,
-            public_message: "client_item_id is required".to_string(),
-            debug_message: None,
-            retry_after_seconds: None,
-            details: None,
-        }));
+        return Ok(PluginResult::Err(
+            plugin_error(PluginErrorCode::Permanent, "client_item_id is required").build(),
+        ));
     }
     if matches!(request.action, DownloadControlAction::ForceStart) {
-        return Ok(PluginResult::Err(PluginError {
-            code: PluginErrorCode::Unsupported,
-            public_message: "unsupported control action: force_start".to_string(),
-            debug_message: None,
-            retry_after_seconds: None,
-            details: None,
-        }));
+        return Ok(PluginResult::Err(
+            plugin_error(
+                PluginErrorCode::Unsupported,
+                "unsupported control action: force_start",
+            )
+            .build(),
+        ));
     }
 
     let config = QbittorrentConfig::from_config()?;
@@ -807,10 +798,10 @@ fn mark_imported_non_destructive(input: String) -> FnResult<String> {
             .unwrap_or_else(|| request.client_item_id.clone()),
     );
     if hash.is_empty() {
-        return plugin_error_response::<()>(
+        return plugin_error_response::<()>(plugin_error(
             PluginErrorCode::Permanent,
             "client_item_id is required",
-        );
+        ));
     }
 
     let config = QbittorrentConfig::from_config()?;
@@ -927,9 +918,11 @@ fn validate_auth_configuration(api_key: &str, username: &str, password: &str) ->
     let has_username = !username.trim().is_empty();
     let has_password = !password.is_empty();
     if has_username != has_password {
-        return Err(Error::msg(
-            "qBittorrent requires both username and password, or leave both blank for unauthenticated access",
-        ));
+        return plugin_error(
+            PluginErrorCode::InvalidConfig,
+            "qBittorrent requires both the username and password settings, or neither for unauthenticated access",
+        )
+        .err();
     }
     Ok(())
 }
@@ -945,20 +938,24 @@ impl QbittorrentConfig {
 
     fn from_config() -> Result<Self, Error> {
         let base_url = config::get("base_url")
-            .map_err(|e| Error::msg(format!("missing config base_url: {e}")))?
+            .map_err(|e| e.context("reading config base_url"))?
             .unwrap_or_default();
         if base_url.trim().is_empty() {
-            return Err(Error::msg("qBittorrent requires base_url"));
+            return plugin_error(
+                PluginErrorCode::InvalidConfig,
+                "qBittorrent requires the base_url setting",
+            )
+            .err();
         }
 
         let api_key = config::get("api_key")
-            .map_err(|e| Error::msg(format!("missing config api_key: {e}")))?
+            .map_err(|e| e.context("reading config api_key"))?
             .unwrap_or_default();
         let username = config::get("username")
-            .map_err(|e| Error::msg(format!("missing config username: {e}")))?
+            .map_err(|e| e.context("reading config username"))?
             .unwrap_or_default();
         let password = config::get("password")
-            .map_err(|e| Error::msg(format!("missing config password: {e}")))?
+            .map_err(|e| e.context("reading config password"))?
             .unwrap_or_default();
         validate_auth_configuration(&api_key, &username, &password)?;
 
@@ -1288,23 +1285,32 @@ fn login(config: &QbittorrentConfig) -> Result<String, Error> {
         .with_header("Origin", webui_header_url(config))
         .with_header("User-Agent", "scryer-qbittorrent-plugin/0.1");
     let response = http::request::<Vec<u8>>(&request, Some(body.into_bytes()))
-        .map_err(|e| Error::msg(format!("qBittorrent login request failed: {e}")))?;
-    if response.status_code() >= 400 {
-        let body = String::from_utf8_lossy(&response.body()).to_string();
-        return Err(Error::msg(format!(
-            "qBittorrent login failed with HTTP {}: {}",
-            response.status_code(),
-            body
-        )));
-    }
-    let cookie = extract_cookie(&response)
-        .ok_or_else(|| Error::msg("qBittorrent login did not return a session cookie"))?;
+        .map_err(|e| e.context("qBittorrent login request failed"))?;
     let body = String::from_utf8_lossy(&response.body()).trim().to_string();
-    if !login_response_is_success(&body) {
-        return Err(Error::msg(format!(
-            "qBittorrent login rejected credentials: {body}"
-        )));
+    if response.status_code() >= 400 {
+        return Err(http_failure(
+            config,
+            "/auth/login",
+            response.status_code(),
+            retry_after(&response),
+            &body,
+        ));
     }
+    if !login_response_is_success(&body) {
+        return plugin_error(
+            codes::INVALID_USERNAME_PASSWORD,
+            "qBittorrent rejected the username or password",
+        )
+        .debug(format_args!("qBittorrent login answered: {body}"))
+        .err();
+    }
+    let Some(cookie) = extract_cookie(&response) else {
+        return plugin_error(
+            codes::INVALID_RESPONSE,
+            "qBittorrent accepted the login but returned no session cookie",
+        )
+        .err();
+    };
     var::set(COOKIE_VAR_KEY, cookie.clone())?;
     Ok(cookie)
 }
@@ -1327,14 +1333,14 @@ fn request_with_auth(
 
     let request = build_request(config, method, path, cookie.as_deref(), content_type);
     let response = http::request::<Vec<u8>>(&request, body.clone())
-        .map_err(|e| Error::msg(format!("qBittorrent request failed: {e}")))?;
+        .map_err(|e| e.context("qBittorrent request failed"))?;
 
     if should_retry_cookie_auth(config, response.status_code()) {
         var::remove(COOKIE_VAR_KEY)?;
         let cookie = login(config)?;
         let retry = build_request(config, method, path, Some(&cookie), content_type);
         return http::request::<Vec<u8>>(&retry, body)
-            .map_err(|e| Error::msg(format!("qBittorrent retry failed: {e}")));
+            .map_err(|e| e.context("qBittorrent retry failed"));
     }
 
     Ok(response)
@@ -1373,7 +1379,7 @@ fn build_request(
 
 fn get_text(config: &QbittorrentConfig, path: &str) -> Result<String, Error> {
     let response = request_with_auth(config, "GET", path, None, None)?;
-    ensure_success(path, &response)?;
+    ensure_success(config, path, &response)?;
     Ok(String::from_utf8_lossy(&response.body()).trim().to_string())
 }
 
@@ -1382,10 +1388,30 @@ fn get_json<T: for<'de> Deserialize<'de>>(
     path: &str,
 ) -> Result<T, Error> {
     let response = request_with_auth(config, "GET", path, None, None)?;
-    ensure_success(path, &response)?;
-    response
-        .json()
-        .map_err(|e| Error::msg(format!("invalid qBittorrent JSON from {path}: {e}")))
+    ensure_success(config, path, &response)?;
+    response.json().map_err(|e| {
+        let body = response.body();
+        let code = if looks_like_html(&body) {
+            codes::ENDPOINT_NOT_FOUND
+        } else {
+            codes::INVALID_RESPONSE
+        };
+        plugin_error(
+            code,
+            "qBittorrent answered with something other than its Web API",
+        )
+        .debug(format_args!("invalid qBittorrent JSON from {path}: {e}"))
+        .into_error()
+    })
+}
+
+/// A reverse proxy or another web app at the configured URL answers with a
+/// page, not the Web API's JSON.
+fn looks_like_html(body: &[u8]) -> bool {
+    let start = String::from_utf8_lossy(&body[..body.len().min(256)])
+        .trim_start()
+        .to_ascii_lowercase();
+    start.starts_with("<!doctype html") || start.starts_with("<html")
 }
 
 fn post_form(
@@ -1400,7 +1426,7 @@ fn post_form(
         Some(form_encode(fields).into_bytes()),
         Some("application/x-www-form-urlencoded"),
     )?;
-    ensure_success(path, &response)
+    ensure_success(config, path, &response)
 }
 
 const TORRENTS_ADD_PATH: &str = "/torrents/add";
@@ -1446,6 +1472,7 @@ enum AddDisposition {
 /// and queue placement; qBittorrent sets those only inside the add request, so
 /// the held torrent is left exactly as it is).
 fn add_disposition(
+    config: &QbittorrentConfig,
     status_code: u16,
     body: &str,
     expected_hash: Option<&str>,
@@ -1460,23 +1487,95 @@ fn add_disposition(
     {
         return Ok(AddDisposition::AlreadyPresent(hash.to_string()));
     }
-    Err(http_failure(TORRENTS_ADD_PATH, status_code, body))
+    // 400 (bad request), 409 (nothing added) and 415 (not a torrent file) are
+    // qBittorrent refusing this add, not failing to answer.
+    if matches!(status_code, 400 | 409 | 415) {
+        return plugin_error(
+            codes::DOWNLOAD_REJECTED,
+            "qBittorrent refused to add the torrent",
+        )
+        .debug(format_args!(
+            "qBittorrent {TORRENTS_ADD_PATH} failed with HTTP {status_code}: {}",
+            body.trim()
+        ))
+        .err();
+    }
+    Err(http_failure(
+        config,
+        TORRENTS_ADD_PATH,
+        status_code,
+        None,
+        body,
+    ))
 }
 
-fn http_failure(path: &str, status_code: u16, body: &str) -> Error {
-    Error::msg(format!(
+/// The error for a non-success Web API answer, classified by what the status
+/// means for this client's authentication.
+fn http_failure(
+    config: &QbittorrentConfig,
+    path: &str,
+    status_code: u16,
+    retry_after: Option<&str>,
+    body: &str,
+) -> Error {
+    let debug = format!(
         "qBittorrent {} failed with HTTP {}: {}",
         path,
         status_code,
         body.trim()
-    ))
+    );
+    match status_code {
+        401 | 403 => auth_rejection(config).debug(debug).into_error(),
+        404 => plugin_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "the qBittorrent Web API was not found at the configured URL",
+        )
+        .debug(debug)
+        .into_error(),
+        _ => match check_http_status(status_code, retry_after) {
+            Err(error) => error.context(debug),
+            Ok(()) => Error::msg(debug),
+        },
+    }
 }
 
-fn ensure_success(path: &str, response: &HttpResponse) -> Result<(), Error> {
+fn retry_after(response: &HttpResponse) -> Option<&str> {
+    response
+        .headers()
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.as_str())
+}
+
+/// qBittorrent answers a request it will not authorise with 401 or 403; which
+/// credential it rejected follows from how this client is configured.
+fn auth_rejection(config: &QbittorrentConfig) -> PluginErrorBuilder {
+    if config.uses_api_key() {
+        plugin_error(codes::INVALID_API_KEY, "qBittorrent rejected the API key")
+    } else if config.uses_credentials() {
+        plugin_error(
+            codes::INVALID_USERNAME_PASSWORD,
+            "qBittorrent rejected the username or password",
+        )
+    } else {
+        plugin_error(
+            PluginErrorCode::AuthFailed,
+            "qBittorrent requires authentication; set a username and password or an API key",
+        )
+    }
+}
+
+fn ensure_success(
+    config: &QbittorrentConfig,
+    path: &str,
+    response: &HttpResponse,
+) -> Result<(), Error> {
     if response.status_code() >= 400 {
         return Err(http_failure(
+            config,
             path,
             response.status_code(),
+            retry_after(response),
             &String::from_utf8_lossy(&response.body()),
         ));
     }
@@ -1555,10 +1654,11 @@ fn resolve_unlisted_added_hash(expected_hash: Option<String>) -> Result<String, 
         return Ok(expected_hash);
     }
 
-    Err(Error::msg(
-        "torrent was added to qBittorrent, but the plugin could not resolve its hash; provide an info-hash hint or magnet URI"
-            .to_string(),
-    ))
+    plugin_error(
+        PluginErrorCode::Temporary,
+        "torrent was added to qBittorrent, but the plugin could not resolve its hash; provide an info-hash hint or magnet URI",
+    )
+    .err()
 }
 
 fn candidate_names(request: &PluginDownloadClientAddRequest) -> Vec<String> {
@@ -2318,6 +2418,8 @@ fn torrent_to_item_with_preferences(
         removed: Some(false),
         raw_state,
         completed_at: unix_to_rfc3339(torrent.completion_on),
+        added_at: unix_to_rfc3339(torrent.added_on),
+        http: None,
     }
 }
 
@@ -2348,6 +2450,7 @@ fn torrent_to_completed_download(torrent: QbTorrent) -> Option<PluginCompletedDo
         size_bytes: torrent.total_size.or(torrent.size),
         completed_at: unix_to_rfc3339(torrent.completion_on),
         parameters: parameters_from_tags(torrent.tags.as_deref()),
+        subtitle_paths: Vec::new(),
     })
 }
 
@@ -3588,7 +3691,9 @@ mod tests {
                 assert_eq!(error.code, PluginErrorCode::Permanent);
                 assert!(
                     error
-                        .public_message
+                        .debug_message
+                        .as_deref()
+                        .unwrap()
                         .contains("invalid torrent_bytes_base64")
                 );
             }
@@ -3603,7 +3708,7 @@ mod tests {
         // qBittorrent 5.x refuses a duplicate add with 409 where 4.6 answered
         // 200 "Fails."; either way the torrent the grab asked for is there.
         let mut probed = None;
-        let disposition = add_disposition(409, "Fails.", Some(HELD_HASH), |hash| {
+        let disposition = add_disposition(&test_config(), 409, "Fails.", Some(HELD_HASH), |hash| {
             probed = Some(hash.to_string());
             Ok(true)
         })
@@ -3619,40 +3724,107 @@ mod tests {
     #[test]
     fn add_conflict_for_a_torrent_qbittorrent_does_not_hold_stays_an_error() {
         // 409 also covers an add whose every source was invalid.
-        let error = add_disposition(409, "Fails.", Some(HELD_HASH), |_| Ok(false))
-            .expect_err("nothing was added and nothing is held");
+        let error = add_disposition(&test_config(), 409, "Fails.", Some(HELD_HASH), |_| {
+            Ok(false)
+        })
+        .expect_err("nothing was added and nothing is held");
 
-        assert!(error.to_string().contains("HTTP 409"), "{error}");
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::from(codes::DOWNLOAD_REJECTED));
+        assert!(
+            error.debug_message.as_deref().unwrap().contains("HTTP 409"),
+            "{error:?}"
+        );
     }
 
     #[test]
     fn add_conflict_without_a_known_hash_stays_an_error() {
-        let error = add_disposition(409, "Fails.", None, |_| {
+        let error = add_disposition(&test_config(), 409, "Fails.", None, |_| {
             panic!("there is no hash to look up")
         })
         .expect_err("an unidentified conflict cannot be adopted");
 
-        assert!(error.to_string().contains("HTTP 409"), "{error}");
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::from(codes::DOWNLOAD_REJECTED));
     }
 
     #[test]
     fn non_conflict_add_failures_never_adopt() {
-        for status in [400, 403, 415, 500] {
-            let error = add_disposition(status, "nope", Some(HELD_HASH), |_| {
+        for (status, code) in [
+            (400, PluginErrorCode::from(codes::DOWNLOAD_REJECTED)),
+            (403, PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)),
+            (415, PluginErrorCode::from(codes::DOWNLOAD_REJECTED)),
+            (500, PluginErrorCode::UpstreamUnavailable),
+        ] {
+            let error = add_disposition(&test_config(), status, "nope", Some(HELD_HASH), |_| {
                 panic!("only a conflict can mean the torrent is already held")
             })
             .expect_err("a rejected add is a failure");
 
+            let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+            assert_eq!(error.code, code, "{status}");
             assert!(
-                error.to_string().contains(&format!("HTTP {status}")),
-                "{error}"
+                error
+                    .debug_message
+                    .as_deref()
+                    .unwrap()
+                    .contains(&format!("HTTP {status}")),
+                "{error:?}"
             );
         }
     }
 
     #[test]
+    fn a_rejected_request_names_the_credential_qbittorrent_refused() {
+        let classify = |config: &QbittorrentConfig, status: u16| {
+            scryer_plugin_pdk::error::plugin_error_from(&http_failure(
+                config,
+                "/torrents/info",
+                status,
+                None,
+                "Forbidden",
+            ))
+        };
+
+        let credentials = test_config();
+        let error = classify(&credentials, 403);
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+
+        let mut api_key = test_config();
+        api_key.api_key = "synthetic-key".to_string();
+        assert_eq!(
+            classify(&api_key, 401).code,
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
+
+        let mut anonymous = test_config();
+        anonymous.username.clear();
+        anonymous.password.clear();
+        assert_eq!(classify(&anonymous, 403).code, PluginErrorCode::AuthFailed);
+
+        assert_eq!(
+            classify(&credentials, 404).code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        assert_eq!(
+            classify(&credentials, 429).code,
+            PluginErrorCode::RateLimited
+        );
+    }
+
+    #[test]
+    fn an_html_page_is_not_the_web_api() {
+        assert!(looks_like_html(b"  <!DOCTYPE html><html></html>"));
+        assert!(looks_like_html(b"<html><body>login</body></html>"));
+        assert!(!looks_like_html(b"[]"));
+    }
+
+    #[test]
     fn successful_add_leaves_hash_resolution_to_the_listing() {
-        let disposition = add_disposition(200, "Ok.", Some(HELD_HASH), |_| {
+        let disposition = add_disposition(&test_config(), 200, "Ok.", Some(HELD_HASH), |_| {
             panic!("an accepted add does not probe for an existing torrent")
         })
         .expect("accepted");

@@ -51,6 +51,7 @@ fn qbittorrent_release_wasm_conforms_to_the_download_client_host_contract() {
     assert_test_connection_clears_the_session_through_state_delete(&suite);
     assert_a_refused_host_service_stays_in_band(&suite);
     assert_an_unsupported_control_action_is_in_band(&suite);
+    assert_a_rejected_login_names_the_credentials(&suite);
     suite.assert_another_family_is_an_invocation_error();
 }
 
@@ -266,6 +267,36 @@ fn assert_an_unsupported_control_action_is_in_band(suite: &DownloadClientConform
         panic!("force_start must report an in-band error: {result:?}");
     };
     assert_eq!(error.code, PluginErrorCode::Unsupported);
+}
+
+/// qBittorrent answers a wrong username or password with `200 Fails.` and no
+/// cookie; the operator must see that the credentials were refused, not a
+/// generic failure the host retries.
+fn assert_a_rejected_login_names_the_credentials(suite: &DownloadClientConformance) {
+    let mut script = authenticated_script();
+    let HttpScript::Routed(routes) = &mut script.http else {
+        unreachable!("the authenticated script is routed");
+    };
+    routes[0] = HttpRoute::exact(&format!("{API_ROOT}/auth/login"), HttpReply::ok("Fails."));
+    let (mut store, plugin) = instantiate(&suite.wasm_path(), script);
+
+    let result = call_download_client(
+        &mut store,
+        &plugin,
+        PluginDownloadClientCommand::TestConnection,
+    );
+    let PluginDownloadClientCommandResult::TestConnection(PluginResult::Err(error)) = result else {
+        panic!("a refused login must be a typed plugin error: {result:?}");
+    };
+    assert_eq!(
+        error.code,
+        PluginErrorCode::from("invalid_username_password"),
+        "{error:?}"
+    );
+    assert!(
+        !error.public_message.contains("secret"),
+        "the public message never carries the password: {error:?}"
+    );
 }
 
 fn sent_session_cookie(script: &Script) -> bool {
