@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-use scryer_plugin_pdk::component::{self, structured_plugin_error};
+use scryer_plugin_pdk::component;
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::command::{PluginActionRequest, PluginActionResponse};
 use scryer_plugin_sdk::current_sdk_constraint;
@@ -10,9 +10,9 @@ use scryer_plugin_sdk::{
     IndexerDescriptor, IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol,
     IndexerResponseFeatures, IndexerSearchIncompleteReason, IndexerSearchInput,
     IndexerSearchPluginError, IndexerSourceKind, IndexerTorrentCapabilities, PluginDescriptor,
-    PluginError, PluginErrorCode, PluginErrorDetails, PluginRssCatchUp,
-    PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
-    PluginSearchResult as SearchResult, ProviderDescriptor, SDK_VERSION,
+    PluginErrorCode, PluginErrorDetails, PluginRssCatchUp, PluginSearchRequest as SearchRequest,
+    PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult, ProviderDescriptor,
+    SDK_VERSION,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -42,9 +42,7 @@ async fn search(request: SearchRequest) -> FnResult<SearchResponse> {
     let response = match search_impl(&request).await {
         Ok(response) => response,
         Err(TsukihimeError::RateLimited(retry_after_seconds)) => {
-            return Err(structured_plugin_error(rate_limited_error(
-                retry_after_seconds,
-            )));
+            return Err(rate_limited_error(retry_after_seconds).into_error());
         }
         Err(TsukihimeError::Incomplete {
             response,
@@ -52,30 +50,39 @@ async fn search(request: SearchRequest) -> FnResult<SearchResponse> {
             retry_after_seconds,
             detail,
         }) => {
-            return Err(structured_plugin_error(partial_results_error(
-                response,
-                reason,
-                retry_after_seconds,
-                detail,
-            )));
+            return Err(
+                partial_results_error(response, reason, retry_after_seconds, detail).into_error(),
+            );
         }
-        Err(error) => return Err(Error::msg(error.to_string())),
+        Err(error) => return Err(error.into_plugin_error()),
     };
     Ok(response)
 }
 
-fn rate_limited_error(retry_after_seconds: Option<i64>) -> PluginError {
-    PluginError {
-        code: PluginErrorCode::UpstreamUnavailable,
-        public_message: "indexer search deferred by upstream rate limiting".to_string(),
-        debug_message: Some("Tsukihime quota or cooldown deferred the search".to_string()),
-        retry_after_seconds,
-        details: Some(PluginErrorDetails::IndexerSearch(
+fn rate_limited_error(retry_after_seconds: Option<i64>) -> PluginErrorBuilder {
+    with_retry_after(
+        plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "indexer search deferred by upstream rate limiting",
+        )
+        .debug("Tsukihime quota or cooldown deferred the search")
+        .details(PluginErrorDetails::IndexerSearch(
             IndexerSearchPluginError::Deferred {
                 reason: IndexerSearchIncompleteReason::RateLimited,
                 retry_after_seconds,
             },
         )),
+        retry_after_seconds,
+    )
+}
+
+fn with_retry_after(
+    builder: PluginErrorBuilder,
+    retry_after_seconds: Option<i64>,
+) -> PluginErrorBuilder {
+    match retry_after_seconds {
+        Some(seconds) => builder.retry_after_seconds(seconds),
+        None => builder,
     }
 }
 
@@ -84,25 +91,24 @@ fn partial_results_error(
     reason: IndexerSearchIncompleteReason,
     retry_after_seconds: Option<i64>,
     detail: String,
-) -> PluginError {
+) -> PluginErrorBuilder {
     let code = if reason == IndexerSearchIncompleteReason::RateLimited {
         PluginErrorCode::RateLimited
     } else {
         PluginErrorCode::UpstreamUnavailable
     };
-    PluginError {
-        code,
-        public_message: "indexer search did not complete".to_string(),
-        debug_message: Some(detail),
+    with_retry_after(
+        plugin_error(code, "indexer search did not complete")
+            .debug(detail)
+            .details(PluginErrorDetails::IndexerSearch(
+                IndexerSearchPluginError::PartialResults {
+                    response,
+                    reason,
+                    retry_after_seconds,
+                },
+            )),
         retry_after_seconds,
-        details: Some(PluginErrorDetails::IndexerSearch(
-            IndexerSearchPluginError::PartialResults {
-                response,
-                reason,
-                retry_after_seconds,
-            },
-        )),
-    }
+    )
 }
 
 fn build_descriptor() -> PluginDescriptor {
@@ -113,6 +119,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec!["tsukihime.org".to_string()],
@@ -124,6 +131,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Generic,
             capabilities: IndexerCapabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 supported_ids: HashMap::from([(
                     "anime".to_string(),
                     vec![
@@ -761,23 +771,24 @@ fn nzb_download_url(torrent: &Torrent) -> String {
 /// host keeps fetching them itself.
 async fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> {
     if request.action != "grab" {
-        return Err(structured_plugin_error(component::action_unsupported(
-            &request.action,
-        )));
+        return Err(component::structured_plugin_error(
+            component::action_unsupported(&request.action),
+        ));
     }
-    let url = grab_url(&request.payload).map_err(Error::msg)?;
+    let url = grab_url(&request.payload).or_plugin_error(
+        PluginErrorCode::Permanent,
+        "the grab action needs a download address",
+    )?;
     if !is_nzb_storage_url(&url) {
-        return Err(structured_plugin_error(PluginError {
-            code: PluginErrorCode::Unsupported,
-            public_message: "this indexer only resolves its own NZB downloads".to_string(),
-            debug_message: None,
-            retry_after_seconds: None,
-            details: None,
-        }));
+        return plugin_error(
+            PluginErrorCode::Unsupported,
+            "this indexer only resolves its own NZB downloads",
+        )
+        .err();
     }
     let payload = grab_nzb(&url)
         .await
-        .map_err(|error| Error::msg(error.to_string()))?;
+        .map_err(TsukihimeError::into_plugin_error)?;
     Ok(PluginActionResponse { payload })
 }
 
@@ -811,13 +822,30 @@ async fn grab_nzb(url: &str) -> Result<Value, TsukihimeError> {
                 retry_after_delay_ms(&response.headers).map(retry_after_seconds_from_ms),
             ));
         }
+        404 | 410 => {
+            return Err(TsukihimeError::failed(
+                PluginErrorCode::from(codes::ITEM_NOT_FOUND),
+                "the NZB is no longer available from Tsukihime",
+                format!(
+                    "Tsukihime NZB download returned HTTP {status}",
+                    status = response.status
+                ),
+            ));
+        }
         status => {
-            return Err(TsukihimeError::Message(format!(
-                "Tsukihime NZB download returned HTTP {status}"
-            )));
+            return Err(TsukihimeError::http_status(
+                status,
+                format!("Tsukihime NZB download returned HTTP {status}"),
+            ));
         }
     }
-    let nzb = decode_nzb_body(&response.body, MAX_NZB_BYTES).map_err(TsukihimeError::Message)?;
+    let nzb = decode_nzb_body(&response.body, MAX_NZB_BYTES).map_err(|detail| {
+        TsukihimeError::failed(
+            PluginErrorCode::from(codes::INVALID_RESPONSE),
+            "Tsukihime returned an NZB that could not be read",
+            detail,
+        )
+    })?;
     Ok(serde_json::json!({
         "url": url,
         "body": nzb,
@@ -944,7 +972,11 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
     defer_rate_limit_from_headers(path, &response.headers);
     match response.status {
         200..=299 => serde_json::from_slice(&response.body).map_err(|error| {
-            TsukihimeError::Message(format!("Tsukihime JSON parse error: {error}"))
+            TsukihimeError::failed(
+                PluginErrorCode::from(codes::INVALID_RESPONSE),
+                "Tsukihime returned a response that could not be read",
+                format!("Tsukihime JSON parse error: {error}"),
+            )
         }),
         404 => Err(TsukihimeError::NotFound),
         429 => {
@@ -954,10 +986,13 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
                 retry_after.map(retry_after_seconds_from_ms),
             ))
         }
-        status => Err(TsukihimeError::Message(format!(
-            "Tsukihime API returned HTTP {status}: {}",
-            compact_error_body(&response.body)
-        ))),
+        status => Err(TsukihimeError::http_status(
+            status,
+            format!(
+                "Tsukihime API returned HTTP {status}: {}",
+                compact_error_body(&response.body)
+            ),
+        )),
     }
 }
 
@@ -979,7 +1014,13 @@ async fn http_get_accepting(
         body: Vec::new(),
     })
     .await
-    .map_err(|error| TsukihimeError::Message(format!("Tsukihime request failed: {error:?}")))?;
+    .map_err(|error| {
+        TsukihimeError::failed(
+            PluginErrorCode::UpstreamUnavailable,
+            "Tsukihime could not be reached",
+            format!("Tsukihime request failed: {error:?}"),
+        )
+    })?;
     Ok(TsukihimeHttpResponse {
         status: response.status,
         headers: response.headers,
@@ -1115,7 +1156,13 @@ fn compact_error_body(body: &[u8]) -> String {
 
 #[derive(Debug)]
 enum TsukihimeError {
-    Message(String),
+    /// A classified failure: the code and neutral sentence the host shows,
+    /// plus the raw detail kept for the debug log.
+    Failed {
+        code: PluginErrorCode,
+        public: &'static str,
+        detail: String,
+    },
     NotFound,
     RateLimited(Option<i64>),
     /// Paging stopped before it finished; `response` holds what was read.
@@ -1130,7 +1177,7 @@ enum TsukihimeError {
 impl fmt::Display for TsukihimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Message(message) => formatter.write_str(message),
+            Self::Failed { detail, .. } => formatter.write_str(detail),
             Self::NotFound => formatter.write_str("Tsukihime API resource was not found"),
             Self::RateLimited(Some(seconds)) => {
                 write!(
@@ -1140,6 +1187,62 @@ impl fmt::Display for TsukihimeError {
             }
             Self::RateLimited(None) => formatter.write_str("Tsukihime API rate limited"),
             Self::Incomplete { detail, .. } => formatter.write_str(detail),
+        }
+    }
+}
+
+impl TsukihimeError {
+    fn failed(code: PluginErrorCode, public: &'static str, detail: impl Into<String>) -> Self {
+        Self::Failed {
+            code,
+            public,
+            detail: detail.into(),
+        }
+    }
+
+    /// An unexpected HTTP status: 401/403 is a refusal, 5xx an outage, and
+    /// anything else a failure the host may retry.
+    fn http_status(status: u16, detail: String) -> Self {
+        let (code, public) = match status {
+            401 | 403 => (PluginErrorCode::AuthFailed, "Tsukihime refused the request"),
+            500..=599 => (
+                PluginErrorCode::UpstreamUnavailable,
+                "Tsukihime is temporarily unavailable",
+            ),
+            _ => (
+                PluginErrorCode::Temporary,
+                "Tsukihime answered with an unexpected status",
+            ),
+        };
+        Self::failed(code, public, detail)
+    }
+
+    fn into_plugin_error(self) -> Error {
+        match self {
+            Self::Failed {
+                code,
+                public,
+                detail,
+            } => plugin_error(code, public).debug(detail).into_error(),
+            Self::NotFound => plugin_error(
+                codes::ENDPOINT_NOT_FOUND,
+                "the Tsukihime API endpoint was not found",
+            )
+            .into_error(),
+            Self::RateLimited(retry_after_seconds) => with_retry_after(
+                plugin_error(
+                    PluginErrorCode::RateLimited,
+                    "Tsukihime is rate limiting requests",
+                ),
+                retry_after_seconds,
+            )
+            .into_error(),
+            Self::Incomplete {
+                response,
+                reason,
+                retry_after_seconds,
+                detail,
+            } => partial_results_error(response, reason, retry_after_seconds, detail).into_error(),
         }
     }
 }
@@ -1628,7 +1731,7 @@ mod tests {
 
     #[test]
     fn rate_limited_searches_return_typed_deferred_error() {
-        let error = rate_limited_error(Some(17));
+        let error = rate_limited_error(Some(17)).build();
 
         assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
         assert_eq!(error.retry_after_seconds, Some(17));
@@ -1901,7 +2004,7 @@ mod tests {
         assert_eq!(response.results.len(), CATCH_UP_PAGE_SIZE);
 
         let TsukihimeError::Incomplete { reason, .. } =
-            pager.interrupted(TsukihimeError::Message("HTTP 502".to_string()))
+            pager.interrupted(TsukihimeError::http_status(502, "HTTP 502".to_string()))
         else {
             panic!("expected partial results");
         };
@@ -1919,7 +2022,8 @@ mod tests {
             IndexerSearchIncompleteReason::PageCeilingReached,
             None,
             "ceiling".to_string(),
-        );
+        )
+        .build();
         assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
         let Some(PluginErrorDetails::IndexerSearch(IndexerSearchPluginError::PartialResults {
             response,
@@ -1965,5 +2069,176 @@ mod tests {
         torrent.is_adult = Some(1);
         assert!(!include_torrent(&torrent, false));
         assert!(include_torrent(&torrent, true));
+    }
+
+    /// A host that answers every HTTP request on this thread with one canned
+    /// response, so a handler runs end to end without a network.
+    mod canned_host {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        use scryer_plugin_pdk::runtime::{
+            HostError, HostRuntime, PluginHttpFieldsResponse, PluginHttpRequest,
+            install_host_runtime,
+        };
+
+        #[derive(Default)]
+        struct Canned {
+            active: bool,
+            config: HashMap<String, String>,
+            status: u16,
+            body: String,
+            /// Monotonic time; a sleep advances it by exactly its duration.
+            now_ms: u64,
+        }
+
+        thread_local! {
+            static CANNED: RefCell<Canned> = RefCell::new(Canned::default());
+        }
+
+        struct CannedHost;
+
+        static HOST: CannedHost = CannedHost;
+
+        impl HostRuntime for CannedHost {
+            fn http_fields(
+                &self,
+                _request: PluginHttpRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<PluginHttpFieldsResponse, HostError>> + '_>>
+            {
+                Box::pin(async move {
+                    CANNED.with(|canned| {
+                        let canned = canned.borrow();
+                        if !canned.active {
+                            return Err(HostError::Transport);
+                        }
+                        Ok(PluginHttpFieldsResponse {
+                            status: canned.status,
+                            headers: Vec::new(),
+                            body: canned.body.clone().into_bytes(),
+                        })
+                    })
+                })
+            }
+
+            fn sleep(&self, duration_ms: u64) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+                CANNED.with(|canned| {
+                    let mut canned = canned.borrow_mut();
+                    canned.now_ms = canned.now_ms.saturating_add(duration_ms);
+                });
+                Box::pin(async {})
+            }
+
+            fn monotonic_now_ms(&self) -> u64 {
+                CANNED.with(|canned| canned.borrow().now_ms)
+            }
+
+            fn operation_deadline_monotonic_ms(&self) -> u64 {
+                u64::MAX
+            }
+
+            fn wall_now_ms(&self) -> u64 {
+                0
+            }
+
+            fn config_get(&self, key: &str) -> Option<String> {
+                CANNED.with(|canned| canned.borrow().config.get(key).cloned())
+            }
+
+            fn provider_profile_bytes(&self) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_get(&self, _key: &str) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_cas(
+                &self,
+                _key: &str,
+                _expected: Option<&[u8]>,
+                _replacement: Option<&[u8]>,
+            ) -> bool {
+                true
+            }
+
+            fn log(&self, _level: scryer_plugin_pdk::log::LogLevel, _message: &str) {}
+        }
+
+        /// Answer every request on this thread with `status` and `body`, and
+        /// serve `config` as the instance settings.
+        pub fn answer(config: &[(&str, &str)], status: u16, body: &str) {
+            install_host_runtime(&HOST);
+            CANNED.with(|canned| {
+                *canned.borrow_mut() = Canned {
+                    active: true,
+                    config: config
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                    status,
+                    body: body.to_string(),
+                    now_ms: 1_000_000,
+                }
+            });
+        }
+
+        /// Drive `future` to completion; the canned host never suspends.
+        pub fn run<T>(future: impl Future<Output = T>) -> T {
+            let mut future = std::pin::pin!(future);
+            match future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                Poll::Ready(output) => output,
+                Poll::Pending => panic!("the canned host never suspends"),
+            }
+        }
+    }
+
+    fn grab(url: &str) -> PluginError {
+        let request = PluginActionRequest {
+            action: "grab".to_string(),
+            payload: serde_json::json!({ "url": url }),
+        };
+        let error = canned_host::run(action(request)).expect_err("the grab fails");
+        scryer_plugin_pdk::error::plugin_error_from(&error)
+    }
+
+    #[test]
+    fn a_missing_nzb_is_item_not_found() {
+        canned_host::answer(&[], 404, "");
+        let error = grab("https://storage.tsukihime.org/nzbs/Synthetic.Title.S01E01.nzb.gz");
+        assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+    }
+
+    #[test]
+    fn an_unreadable_nzb_is_invalid_response() {
+        canned_host::answer(&[], 200, "synthetic garbage");
+        let error = grab("https://storage.tsukihime.org/nzbs/Synthetic.Title.S01E01.nzb.gz");
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
+        assert!(!error.public_message.contains("gzip"));
+    }
+
+    #[test]
+    fn a_refused_nzb_download_is_auth_failed() {
+        canned_host::answer(&[], 403, "");
+        let error = grab("https://storage.tsukihime.org/nzbs/Synthetic.Title.S01E01.nzb.gz");
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+    }
+
+    #[test]
+    fn an_unreadable_api_answer_is_invalid_response() {
+        canned_host::answer(&[], 200, "<html>synthetic</html>");
+        let request = SearchRequest {
+            query: "Synthetic Title".to_string(),
+            ..SearchRequest::default()
+        };
+        let error = canned_host::run(search(request)).expect_err("the body is not JSON");
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
     }
 }
