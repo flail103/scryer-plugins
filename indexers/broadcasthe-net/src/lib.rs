@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 
 use chrono::DateTime;
-use scryer_plugin_pdk::component::{StructuredPluginError, structured_plugin_error};
+use scryer_plugin_pdk::component::StructuredPluginError;
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
@@ -10,7 +10,7 @@ use scryer_plugin_sdk::{
     IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor, IndexerFeedMode,
     IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchIncompleteReason, IndexerSearchInput, IndexerSearchPluginError, IndexerSourceKind,
-    IndexerTorrentCapabilities, PluginDescriptor, PluginError, PluginErrorCode, PluginErrorDetails,
+    IndexerTorrentCapabilities, PluginDescriptor, PluginErrorCode, PluginErrorDetails,
     PluginRssCatchUp, PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
     PluginSearchResult as SearchResult, ProviderDescriptor, SDK_VERSION,
 };
@@ -35,6 +35,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "broadcasthe_net".to_string(),
             provider_aliases: vec!["btn".to_string(), "broadcasthe.net".to_string()],
@@ -46,6 +47,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 supported_ids: HashMap::from([
                     (
                         "series".to_string(),
@@ -362,19 +366,20 @@ fn incomplete_search_error(
     } else {
         PluginErrorCode::UpstreamUnavailable
     };
-    structured_plugin_error(PluginError {
-        code,
-        public_message: "indexer search did not complete".to_string(),
-        debug_message: Some(detail),
-        retry_after_seconds,
-        details: Some(PluginErrorDetails::IndexerSearch(
+    let error = plugin_error(code, "indexer search did not complete")
+        .debug(detail)
+        .details(PluginErrorDetails::IndexerSearch(
             IndexerSearchPluginError::PartialResults {
                 response: Box::new(response),
                 reason,
                 retry_after_seconds,
             },
-        )),
-    })
+        ));
+    match retry_after_seconds {
+        Some(seconds) => error.retry_after_seconds(seconds),
+        None => error,
+    }
+    .into_error()
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -559,44 +564,104 @@ async fn execute_query(
         body: serde_json::to_vec(&body)?,
     })
     .await
-    .map_err(|error| Error::msg(format!("BTN request failed: {error:?}")))?;
+    .map_err(|error| Error::new(error).context("BTN request failed"))?;
     let status = response.status;
     let body_text = String::from_utf8_lossy(&response.body).to_string();
     match status {
         200 => {}
-        401 => return Err(Error::msg("API Key invalid or not authorized")),
+        401 => {
+            return plugin_error(codes::INVALID_API_KEY, "BTN rejected the API key")
+                .debug("BTN API returned HTTP 401")
+                .err();
+        }
         404 => {
-            return Err(Error::msg(
-                "BTN API returned NotFound; the API may have changed",
-            ));
+            return plugin_error(
+                codes::ENDPOINT_NOT_FOUND,
+                "the BTN API endpoint was not found",
+            )
+            .debug("BTN API returned NotFound; the API may have changed")
+            .err();
         }
-        503 => {
-            return Err(Error::msg(
-                "Cannot do more than 150 BTN API requests per hour",
-            ));
-        }
+        503 => return quota_exceeded("BTN API returned HTTP 503"),
         _ => {
-            return Err(Error::msg(format!(
-                "BTN API returned HTTP {status}: {body_text}"
-            )));
+            check_http_status(status, retry_after_header(&response.headers))?;
+            return plugin_error(
+                PluginErrorCode::Temporary,
+                "BTN answered with an unexpected status",
+            )
+            .debug(format!("BTN API returned HTTP {status}: {body_text}"))
+            .err();
         }
     }
     if body_text.contains("Call Limit Exceeded") {
-        return Err(Error::msg(
-            "Cannot do more than 150 BTN API requests per hour",
-        ));
+        return quota_exceeded("BTN API answered Call Limit Exceeded");
     }
     if body_text == "Query execution was interrupted" {
-        return Err(Error::msg("BTN API returned an internal server error"));
+        return plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "BTN is temporarily unavailable",
+        )
+        .debug("BTN API returned an internal server error")
+        .err();
     }
 
-    let rpc: JsonRpcResponse<BtnTorrents> = serde_json::from_str(&body_text)
-        .map_err(|error| Error::msg(format!("BTN JSON parse failed: {error}")))?;
+    let rpc: JsonRpcResponse<BtnTorrents> = serde_json::from_str(&body_text).or_plugin_error(
+        codes::INVALID_RESPONSE,
+        "BTN returned a response that could not be read",
+    )?;
     if let Some(error) = rpc.error {
-        return Err(Error::msg(format!("BTN API returned an error: {error}")));
+        return rpc_error(&error);
     }
-    rpc.result
-        .ok_or_else(|| Error::msg("BTN API response missing result"))
+    rpc.result.ok_or_else(|| {
+        plugin_error(
+            codes::INVALID_RESPONSE,
+            "BTN returned a response that could not be read",
+        )
+        .debug("BTN API response missing result")
+        .into_error()
+    })
+}
+
+/// BTN's hourly call limit: 150 API requests per hour.
+fn quota_exceeded<T>(detail: &str) -> Result<T, Error> {
+    plugin_error(
+        codes::QUOTA_EXCEEDED,
+        "BTN allows no more than 150 API requests per hour",
+    )
+    .debug(detail)
+    .err()
+}
+
+/// A JSON-RPC `error` member. BTN answers a bad key with code -32001
+/// ("Invalid API Key") and its hourly limit with -32002 ("Call Limit
+/// Exceeded").
+fn rpc_error<T>(error: &serde_json::Value) -> Result<T, Error> {
+    let code = error.get("code").and_then(serde_json::Value::as_i64);
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let lowered = message.to_ascii_lowercase();
+    let detail = format!("BTN API returned an error: {error}");
+    if code == Some(-32001) || lowered.contains("api key") {
+        return plugin_error(codes::INVALID_API_KEY, "BTN rejected the API key")
+            .debug(detail)
+            .err();
+    }
+    if code == Some(-32002) || lowered.contains("call limit") {
+        return quota_exceeded(&detail);
+    }
+    plugin_error(PluginErrorCode::Temporary, "BTN answered with an error")
+        .debug(detail)
+        .err()
+}
+
+fn retry_after_header(headers: &BTreeMap<String, String>) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.as_str())
 }
 
 fn parse_response(base_url: &str, response: BtnTorrents) -> Result<Vec<SearchResult>, Error> {
@@ -728,7 +793,13 @@ fn config_value(key: &str) -> Option<String> {
 }
 
 fn required_config(key: &str) -> Result<String, Error> {
-    config_value(key).ok_or_else(|| Error::msg(format!("{key} is not configured")))
+    config_value(key).ok_or_else(|| {
+        plugin_error(
+            PluginErrorCode::InvalidConfig,
+            format!("the {key} setting is required"),
+        )
+        .into_error()
+    })
 }
 
 fn field(
@@ -1391,5 +1462,191 @@ mod tests {
 
         assert_eq!(outcome.expect("complete").results.len(), PAGE_SIZE);
         assert_eq!(calls.len(), 1);
+    }
+
+    /// A host that answers every HTTP request on this thread with one canned
+    /// response, so a handler runs end to end without a network.
+    mod canned_host {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        use scryer_plugin_pdk::runtime::{
+            HostError, HostRuntime, PluginHttpFieldsResponse, PluginHttpRequest,
+            install_host_runtime,
+        };
+
+        #[derive(Default)]
+        struct Canned {
+            active: bool,
+            config: HashMap<String, String>,
+            status: u16,
+            body: String,
+            /// Monotonic time; a sleep advances it by exactly its duration.
+            now_ms: u64,
+        }
+
+        thread_local! {
+            static CANNED: RefCell<Canned> = RefCell::new(Canned::default());
+        }
+
+        struct CannedHost;
+
+        static HOST: CannedHost = CannedHost;
+
+        impl HostRuntime for CannedHost {
+            fn http_fields(
+                &self,
+                _request: PluginHttpRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<PluginHttpFieldsResponse, HostError>> + '_>>
+            {
+                Box::pin(async move {
+                    CANNED.with(|canned| {
+                        let canned = canned.borrow();
+                        if !canned.active {
+                            return Err(HostError::Transport);
+                        }
+                        Ok(PluginHttpFieldsResponse {
+                            status: canned.status,
+                            headers: Vec::new(),
+                            body: canned.body.clone().into_bytes(),
+                        })
+                    })
+                })
+            }
+
+            fn sleep(&self, duration_ms: u64) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+                CANNED.with(|canned| {
+                    let mut canned = canned.borrow_mut();
+                    canned.now_ms = canned.now_ms.saturating_add(duration_ms);
+                });
+                Box::pin(async {})
+            }
+
+            fn monotonic_now_ms(&self) -> u64 {
+                CANNED.with(|canned| canned.borrow().now_ms)
+            }
+
+            fn operation_deadline_monotonic_ms(&self) -> u64 {
+                u64::MAX
+            }
+
+            fn wall_now_ms(&self) -> u64 {
+                0
+            }
+
+            fn config_get(&self, key: &str) -> Option<String> {
+                CANNED.with(|canned| canned.borrow().config.get(key).cloned())
+            }
+
+            fn provider_profile_bytes(&self) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_get(&self, _key: &str) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_cas(
+                &self,
+                _key: &str,
+                _expected: Option<&[u8]>,
+                _replacement: Option<&[u8]>,
+            ) -> bool {
+                true
+            }
+
+            fn log(&self, _level: scryer_plugin_pdk::log::LogLevel, _message: &str) {}
+        }
+
+        /// Answer every request on this thread with `status` and `body`, and
+        /// serve `config` as the instance settings.
+        pub fn answer(config: &[(&str, &str)], status: u16, body: &str) {
+            install_host_runtime(&HOST);
+            CANNED.with(|canned| {
+                *canned.borrow_mut() = Canned {
+                    active: true,
+                    config: config
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                    status,
+                    body: body.to_string(),
+                    now_ms: 1_000_000,
+                }
+            });
+        }
+
+        /// Drive `future` to completion; the canned host never suspends.
+        pub fn run<T>(future: impl Future<Output = T>) -> T {
+            let mut future = std::pin::pin!(future);
+            match future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                Poll::Ready(output) => output,
+                Poll::Pending => panic!("the canned host never suspends"),
+            }
+        }
+    }
+
+    fn query_error(status: u16, body: &str) -> PluginError {
+        canned_host::answer(&[], status, body);
+        let error = canned_host::run(execute_query(
+            "https://btn.example.invalid/",
+            "synthetic-key",
+            &recent_query(),
+            0,
+        ))
+        .err()
+        .expect("the query fails");
+        scryer_plugin_pdk::error::plugin_error_from(&error)
+    }
+
+    #[test]
+    fn a_rejected_api_key_reaches_the_host_as_invalid_api_key() {
+        let error = query_error(
+            200,
+            r#"{"jsonrpc":"2.0","id":"scryer","error":{"code":-32001,"message":"Invalid API Key"}}"#,
+        );
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+        assert!(!error.public_message.contains("Invalid API Key"));
+
+        let error = query_error(401, "");
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+    }
+
+    #[test]
+    fn the_hourly_call_limit_is_quota_exceeded() {
+        let error = query_error(503, "");
+        assert_eq!(error.code, PluginErrorCode::from(codes::QUOTA_EXCEEDED));
+        let error = query_error(
+            200,
+            r#"{"jsonrpc":"2.0","id":"scryer","error":{"code":-32002,"message":"Call Limit Exceeded"}}"#,
+        );
+        assert_eq!(error.code, PluginErrorCode::from(codes::QUOTA_EXCEEDED));
+    }
+
+    #[test]
+    fn other_failures_carry_their_codes() {
+        assert_eq!(
+            query_error(404, "").code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        assert_eq!(query_error(429, "").code, PluginErrorCode::RateLimited);
+        assert_eq!(
+            query_error(200, "<html>synthetic</html>").code,
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
+    }
+
+    #[test]
+    fn a_missing_api_key_is_invalid_config() {
+        let error = required_config("api_key").expect_err("nothing is configured");
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert!(error.public_message.contains("api_key"));
     }
 }
