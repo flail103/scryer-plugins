@@ -270,7 +270,8 @@ pub fn structured_plugin_error(error: PluginError) -> crate::Error {
 
 /// A non-success HTTP status from the service, as an error the fallback
 /// classifies: 429 becomes `RateLimited` (with the `Retry-After` delay when
-/// the service sent one in seconds) and 5xx becomes `UpstreamUnavailable`.
+/// the service sent one in seconds), 401 becomes `AuthFailed` and 5xx becomes
+/// `UpstreamUnavailable`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpStatusError {
     pub status: u16,
@@ -316,6 +317,7 @@ const TIMED_OUT: &str = "the request to the service timed out";
 const TLS_FAILED: &str = "a secure connection to the service could not be established";
 const RATE_LIMITED: &str = "the service is rate limiting requests";
 const SERVER_ERROR: &str = "the service answered with a server error";
+const AUTH_REJECTED: &str = "the service rejected the credentials";
 const UNCLASSIFIED: &str = "the plugin could not complete the request";
 
 /// Classify an error a handler returned without a [`PluginError`] of its own.
@@ -326,6 +328,7 @@ const UNCLASSIFIED: &str = "the plugin could not complete the request";
 /// |---|---|---|
 /// | [`StructuredPluginError`] (from [`plugin_error`]) | its own | its own |
 /// | [`HttpStatusError`] 429 | `RateLimited`, with `Retry-After` | rate limiting |
+/// | [`HttpStatusError`] 401 | `AuthFailed` | rejected the credentials |
 /// | [`HttpStatusError`] 5xx | `UpstreamUnavailable` | server error |
 /// | [`HttpStatusError`] other | `Temporary` | request failed |
 /// | [`HostError::Transport`] | `UpstreamUnavailable` | could not be reached |
@@ -392,6 +395,7 @@ fn from_http_status(status: &HttpStatusError) -> PluginErrorBuilder {
                 None => builder,
             }
         }
+        401 => plugin_error(PluginErrorCode::AuthFailed, AUTH_REJECTED),
         500..=599 => plugin_error(PluginErrorCode::UpstreamUnavailable, SERVER_ERROR),
         _ => plugin_error(PluginErrorCode::Temporary, REQUEST_FAILED),
     }
@@ -591,6 +595,13 @@ mod tests {
             assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable, "{status}");
             assert_eq!(error.public_message, SERVER_ERROR);
         }
+    }
+
+    #[test]
+    fn http_401_is_auth_failed() {
+        let error = classify(check_http_status(401, None).unwrap_err());
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.public_message, AUTH_REJECTED);
     }
 
     #[test]
