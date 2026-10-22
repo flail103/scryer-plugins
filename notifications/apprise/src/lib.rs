@@ -39,8 +39,8 @@
 //!   `error_response`, which told the operator "a notification failed to send"
 //!   when the truth was "you set both a key and stateless URLs";
 //! * the API's own status table is mapped lane by lane, including the `204` and
-//!   `424` Sonarr cannot see, and the server's `{"error", "details"}` body is
-//!   parsed so its own words reach the operator;
+//!   `424` Sonarr cannot see, each with its own error code, and the server's
+//!   `{"error", "details"}` body is parsed so its own words reach the host log;
 //! * `notification_type` gains an `auto` option that derives Apprise's type from
 //!   the event's severity, so failures arrive as `failure`;
 //! * the body is enriched per event from the structured blocks the contract
@@ -228,6 +228,7 @@ fn build_descriptor() -> PluginDescriptor {
             },
             config_fields: config_fields(),
         }),
+        settings: Vec::new(),
     }
 }
 
@@ -533,10 +534,11 @@ fn validated_configuration_key(raw: &str) -> Result<String, PluginError> {
     {
         return Err(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "configuration_key may only contain letters, digits, underscores and hyphens; got {key:?}"
-            ),
-            Some("the Apprise API routes /notify/<key> as [\\w_-]{1,128}".to_string()),
+            "configuration_key may only contain letters, digits, underscores and hyphens"
+                .to_string(),
+            Some(format!(
+                "got {key:?}; the Apprise API routes /notify/<key> as [\\w_-]{{1,128}}"
+            )),
         ));
     }
     Ok(key.to_string())
@@ -575,10 +577,8 @@ fn validated_stateless_urls(
         if strict {
             return Err(plugin_error(
                 PluginErrorCode::InvalidConfig,
-                format!(
-                    "stateless_urls contains entries that are not Apprise URLs (every Apprise URL has a scheme, for example discord://…): {listed}"
-                ),
-                None,
+                "stateless_urls contains entries that are not Apprise URLs (every Apprise URL has a scheme, for example discord://…)".to_string(),
+                Some(format!("entries without a scheme: {listed}")),
             ));
         }
         // A live send keeps going: Apprise drops what it cannot parse and
@@ -851,7 +851,8 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<(&'static str, String)> 
         }
         // Not in `supported_events`, so the host never routes them here; the
         // summary lines are all such a notification would carry.
-        NotificationEventType::ListTitleAdded
+        NotificationEventType::FileRestored
+        | NotificationEventType::ListTitleAdded
         | NotificationEventType::ListRequestSubmitted
         | NotificationEventType::ListItemHeld
         | NotificationEventType::ListTitleLeft
@@ -1314,19 +1315,9 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
             &settings.route,
             warnings,
         ),
-        Err(error) => {
-            // The host answers a refused or failed egress in-band; that is the
-            // server being unreachable, not a misconfigured channel.
-            let mut failure = error_response(format!("request failed: {error}"), None);
-            failure.warnings = warnings;
-            failure.target_results = vec![PluginNotificationTargetResult {
-                target: settings.route.target(),
-                success: false,
-                status: None,
-                error: Some(format!("request failed: {error}")),
-            }];
-            PluginResult::Ok(failure)
-        }
+        // A refused egress, DNS, connection or TLS failure, or a timeout: the
+        // PDK classifies it from the host's own error.
+        Err(error) => PluginResult::Err(request_failure(&error)),
     }
 }
 
@@ -1456,13 +1447,14 @@ fn classify_response(
         return PluginResult::Err(plugin_error(
             PluginErrorCode::InvalidConfig,
             match route {
-                Route::Stateful { key } => format!(
-                    "the Apprise server has no configuration stored under configuration_key '{key}', so nothing was notified: {detail}. Add it with POST /add/{key}, or switch to stateless_urls."
-                ),
-                Route::Stateless { .. } => format!(
-                    "the Apprise server found no usable URL in stateless_urls, so nothing was notified: {detail}"
-                ),
-            },
+                Route::Stateful { .. } => {
+                    "the Apprise server has no configuration stored under configuration_key, so nothing was notified"
+                }
+                Route::Stateless { .. } => {
+                    "the Apprise server found no usable URL in stateless_urls, so nothing was notified"
+                }
+            }
+            .to_string(),
             Some(debug),
         ));
     }
@@ -1496,45 +1488,31 @@ fn classify_response(
     // the operator to the wrong setting.
     if !answer.is_json && !(500..600).contains(&status) && status != 429 && status != 401 {
         return PluginResult::Err(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "server_url did not answer like an Apprise API server (HTTP {status}): {detail}. Check the URL and anything proxying it."
-            ),
+            codes::ENDPOINT_NOT_FOUND,
+            "server_url did not answer like an Apprise API server".to_string(),
             Some(debug),
         ));
     }
 
+    let retry_after = header(headers, "retry-after")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|seconds| *seconds >= 0)
+        .map(|seconds| seconds.max(1));
     match status {
         // Apprise itself has no authentication, so credentials only ever belong
-        // to whatever fronts it. `AppriseProxy.cs:102-106` names `AuthUsername`
-        // for a 401; 403 is the same pair from the other side.
-        401 | 403 => PluginResult::Err(plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!(
-                "the HTTP Basic credentials were rejected (HTTP {status}): {detail}. The Apprise API has no authentication of its own, so auth_username and auth_password belong to the reverse proxy in front of it."
-            ),
-            Some(debug),
-        )),
-        // Every version of the API serves `/notify` and `/notify/{key}`, so a
-        // 404 means the base URL is wrong or points somewhere else.
-        404 => PluginResult::Err(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "server_url does not expose the Apprise API's {} endpoint (HTTP 404): {detail}. Check the URL, including any path prefix.",
-                route.path()
-            ),
-            Some(debug),
-        )),
+        // to whatever fronts it: auth_username and auth_password are the
+        // reverse proxy's. `AppriseProxy.cs:102-106` names `AuthUsername` for a
+        // 401; 403 is the same pair from the other side.
+        401 | 403 => PluginResult::Err(rejected_credential(Credential::UsernamePassword, debug)),
         // "At least one notification could not be sent" — the destination
         // services behind the key or the URL list refused, which is a delivery
         // outcome and not something the operator can fix in this channel's
         // settings. It may be partial: the API returns one status for the whole
-        // fan-out.
+        // fan-out, so it stays a per-target delivery result rather than one
+        // typed error for the channel.
         424 => {
             let mut failure = error_response(
-                format!(
-                    "the Apprise server could not deliver to at least one of its targets: {detail}"
-                ),
+                "the Apprise server could not deliver to at least one of its targets",
                 Some("http_424".to_string()),
             );
             failure.warnings = warnings;
@@ -1552,33 +1530,21 @@ fn classify_response(
         // plugin's fault.
         400 | 405 | 406 | 431 => PluginResult::Err(plugin_error(
             PluginErrorCode::Permanent,
-            format!(
-                "the Apprise server rejected the request this plugin built (HTTP {status}): {detail}"
-            ),
+            "the Apprise server rejected the request this plugin built".to_string(),
             Some(debug),
         )),
-        // Apprise does not rate-limit, but a reverse proxy in front of it does,
-        // and `Retry-After` is the one thing the core can act on.
-        // Everything else — including the `500` the API returns when it cannot
-        // read or write its own configuration store — is the provider saying
-        // "not now": the delivery lane, not the configuration lane.
+        // Every version of the API serves `/notify` and `/notify/{key}`, so a
+        // 404 means the base URL is wrong or points somewhere else
+        // (`endpoint_not_found`). Apprise does not rate-limit, but a reverse
+        // proxy in front of it does, and `Retry-After` is the one thing the core
+        // can act on. A 5xx — including the `500` the API returns when it cannot
+        // read or write its own configuration store — is `UpstreamUnavailable`.
         _ => {
-            let mut failure = error_response(
-                format!("HTTP {status}: {detail}"),
-                Some(format!("http_{status}")),
-            );
-            failure.retry_after_seconds = header(headers, "retry-after")
-                .and_then(|value| value.parse::<i64>().ok())
-                .filter(|seconds| *seconds >= 0)
-                .map(|seconds| seconds.max(1));
-            failure.warnings = warnings;
-            failure.target_results = vec![PluginNotificationTargetResult {
-                target: route.target(),
-                success: false,
-                status: Some(format!("http_{status}")),
-                error: Some(detail),
-            }];
-            PluginResult::Ok(failure)
+            let mut error = http_failure(status, retry_after, Credential::UsernamePassword, debug);
+            if (500..600).contains(&status) {
+                error.retry_after_seconds = retry_after;
+            }
+            PluginResult::Err(error)
         }
     }
 }
@@ -1738,16 +1704,14 @@ fn tag_warnings(status: u16, body: &[u8], tags: &[String]) -> Vec<String> {
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let builder = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug) => builder.debug(debug).build(),
+        None => builder.build(),
     }
 }
 
@@ -2189,7 +2153,8 @@ mod tests {
         let strict = validated_stateless_urls("discord://a/b, notaurl", true, &mut warnings)
             .expect_err("strict");
         assert_eq!(strict.code, PluginErrorCode::InvalidConfig);
-        assert!(strict.public_message.contains("notaurl"));
+        assert!(!strict.public_message.contains("notaurl"));
+        assert!(strict.debug_message.unwrap().contains("notaurl"));
 
         let mut warnings = Vec::new();
         let lenient = validated_stateless_urls("discord://a/b, notaurl", false, &mut warnings)
@@ -2307,7 +2272,13 @@ mod tests {
         ));
         assert_eq!(error.code, PluginErrorCode::InvalidConfig);
         assert!(error.public_message.contains("configuration_key"));
-        assert!(error.public_message.contains("scryer"));
+        assert!(!error.public_message.contains("scryer"));
+        assert!(
+            error
+                .debug_message
+                .unwrap()
+                .contains("There was no configuration found")
+        );
 
         let error = expect_error(classify(
             204,
@@ -2333,7 +2304,17 @@ mod tests {
         ));
         assert!(!response.success);
         assert_eq!(response.provider_status.as_deref(), Some("http_424"));
-        let error = response.error.expect("an error message");
+        assert!(
+            !response
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Failed to send Discord notification.")
+        );
+        let error = response.target_results[0]
+            .error
+            .clone()
+            .expect("the target carries the server's words");
         assert!(
             error.contains("Failed to send Discord notification."),
             "{error}"
@@ -2356,8 +2337,11 @@ mod tests {
                     key: "scryer".to_string(),
                 },
             ));
-            assert_eq!(error.code, PluginErrorCode::AuthFailed);
-            assert!(error.public_message.contains("auth_username"));
+            assert_eq!(
+                error.code,
+                PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+            );
+            assert!(error.debug_message.unwrap().contains("denied"));
         }
         // A proxy's HTML 401 is still an auth failure, not "this is not Apprise".
         let error = expect_error(classify(
@@ -2367,11 +2351,14 @@ mod tests {
                 key: "scryer".to_string(),
             },
         ));
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
     }
 
     #[test]
-    fn a_404_names_the_server_url_and_the_endpoint() {
+    fn a_404_is_an_endpoint_not_found_with_the_endpoint_in_debug() {
         let error = expect_error(classify(
             404,
             r#"{"error": "not found"}"#,
@@ -2379,9 +2366,8 @@ mod tests {
                 key: "scryer".to_string(),
             },
         ));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
-        assert!(error.public_message.contains("server_url"));
-        assert!(error.public_message.contains("/notify/scryer"));
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
+        assert!(error.debug_message.unwrap().contains("not found"));
     }
 
     #[test]
@@ -2395,15 +2381,16 @@ mod tests {
                 },
             ));
             assert_eq!(error.code, PluginErrorCode::Permanent, "HTTP {status}");
-            assert!(error.public_message.contains("Invalid payload"));
+            assert!(!error.public_message.contains("Invalid payload"));
+            assert!(error.debug_message.unwrap().contains("Invalid payload"));
         }
     }
 
     #[test]
-    fn a_5xx_is_the_delivery_lane_and_honours_retry_after() {
+    fn a_5xx_is_upstream_unavailable_and_honours_retry_after() {
         let mut headers = BTreeMap::new();
         headers.insert("Retry-After".to_string(), "30".to_string());
-        let response = expect_ok(classify_response(
+        let error = expect_error(classify_response(
             503,
             &headers,
             br#"{"error": "unavailable"}"#,
@@ -2412,16 +2399,15 @@ mod tests {
             },
             Vec::new(),
         ));
-        assert!(!response.success);
-        assert_eq!(response.retry_after_seconds, Some(30));
-        assert_eq!(response.provider_status.as_deref(), Some("http_503"));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert_eq!(error.retry_after_seconds, Some(30));
     }
 
     #[test]
-    fn a_429_from_a_proxy_is_a_delivery_failure_with_a_retry_window() {
+    fn a_429_from_a_proxy_is_rate_limited_with_a_retry_window() {
         let mut headers = BTreeMap::new();
         headers.insert("retry-after".to_string(), "0".to_string());
-        let response = expect_ok(classify_response(
+        let error = expect_error(classify_response(
             429,
             &headers,
             b"<html>slow down</html>",
@@ -2430,28 +2416,27 @@ mod tests {
             },
             Vec::new(),
         ));
-        assert!(!response.success);
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
         // A `Retry-After: 0` still means "wait", so it is floored at one second.
-        assert_eq!(response.retry_after_seconds, Some(1));
+        assert_eq!(error.retry_after_seconds, Some(1));
     }
 
-    /// A gateway's HTML `502` stays in the delivery lane: it is a transient
-    /// upstream, not evidence that `server_url` is wrong.
+    /// A gateway's HTML `502` is a transient upstream, not evidence that
+    /// `server_url` is wrong.
     #[test]
-    fn a_non_json_5xx_stays_in_the_delivery_lane() {
-        let response = expect_ok(classify(
+    fn a_non_json_5xx_is_upstream_unavailable() {
+        let error = expect_error(classify(
             502,
             "<html>Bad Gateway</html>",
             &Route::Stateful {
                 key: "scryer".to_string(),
             },
         ));
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_502"));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
     }
 
     #[test]
-    fn a_non_json_4xx_is_a_wrong_server_url() {
+    fn a_non_json_4xx_is_an_endpoint_not_found_naming_server_url() {
         let error = expect_error(classify(
             418,
             "<html>I am a teapot</html>",
@@ -2459,7 +2444,7 @@ mod tests {
                 key: "scryer".to_string(),
             },
         ));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
         assert!(error.public_message.contains("server_url"));
     }
 
@@ -2501,8 +2486,10 @@ mod tests {
                 key: "scryer".to_string(),
             },
         ));
-        assert!(error.public_message.chars().count() < 400);
-        assert!(error.public_message.ends_with('…'));
+        assert!(!error.public_message.contains("xxxx"));
+        let debug = error.debug_message.unwrap();
+        assert!(debug.chars().count() < 400);
+        assert!(debug.ends_with('…'));
     }
 
     #[test]

@@ -44,10 +44,12 @@
 //! # Why the delivery path is local rather than `notify_common::send_form`
 //!
 //! The shared helper collapses every non-2xx into `error_response("HTTP N:
-//! body", "http_N")`. Mailgun's failures are three different lanes in Scryer's
-//! contract: a 401/403/404 names a setting the operator has to fix, a 429 or a
-//! 402 is the account saying "not now", and a 5xx is Mailgun being briefly
-//! unavailable. The helper also cannot read `Retry-After`.
+//! body", "http_N")`. Mailgun's failures each carry their own code: a 401/403
+//! is the API key (`invalid_api_key`), a 404 is a sender domain this region does
+//! not have (`endpoint_not_found`), a 400 names the setting Mailgun disliked, a
+//! 402 is the account, a 429 is the account saying "not now" (`RateLimited`),
+//! and a 5xx is Mailgun being briefly unavailable. The helper also cannot read
+//! `Retry-After`.
 //!
 //! # Upstream reference
 //!
@@ -193,6 +195,7 @@ fn build_descriptor() -> PluginDescriptor {
             },
             config_fields: config_fields(),
         }),
+        settings: Vec::new(),
     }
 }
 
@@ -834,7 +837,8 @@ fn detail_lines(
         }
         // Not in `supported_events`, so the host never routes them here; the
         // summary lines are all such a notification would carry.
-        NotificationEventType::ListTitleAdded
+        NotificationEventType::FileRestored
+        | NotificationEventType::ListTitleAdded
         | NotificationEventType::ListRequestSubmitted
         | NotificationEventType::ListItemHeld
         | NotificationEventType::ListTitleLeft
@@ -1388,15 +1392,9 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
             &settings,
             warnings,
         ),
-        Err(error) => {
-            // The host answers a refused or failed egress in-band; that is
-            // Mailgun being unreachable, not a misconfigured channel.
-            let detail = format!("request failed: {error}");
-            let mut failure = error_response(detail.clone(), None);
-            failure.target_results = target_results(&settings, false, None, Some(&detail));
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        // A refused egress, DNS, connection or TLS failure, or a timeout: the
+        // PDK classifies it from the host's own error.
+        Err(error) => PluginResult::Err(request_failure(&error)),
     }
 }
 
@@ -1526,14 +1524,8 @@ fn classify_response(
     match status {
         // "Unauthorised - ApiKey is invalid" (`MailgunProxy.cs:35-38`). Also the
         // answer when a *domain sending key* is used against a different domain,
-        // or against the wrong region, so both are named.
-        401 => PluginResult::Err(plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!(
-                "api_key was rejected by Mailgun (HTTP 401): {detail}. Check the key, that a domain sending key belongs to sender_domain, and that use_eu_endpoint matches the region the key was created in."
-            ),
-            Some(debug),
-        )),
+        // or against the wrong region.
+        401 => PluginResult::Err(rejected_credential(Credential::ApiKey, debug)),
         // A sandbox domain refuses anyone who is not a verified authorized
         // recipient — the single most common failure on a new Mailgun account.
         403 if answer.mentions(&["sandbox", "authorized recipient"])
@@ -1541,84 +1533,48 @@ fn classify_response(
         {
             PluginResult::Err(plugin_error(
                 PluginErrorCode::InvalidConfig,
-                format!(
-                    "Mailgun refused the message because {} is a sandbox domain (HTTP 403): {detail}. A sandbox domain delivers only to addresses added and verified as Authorized Recipients; add every entry in recipients, or use a verified sending domain.",
-                    settings.domain
-                ),
-                Some(debug),
+                "sender_domain is a Mailgun sandbox domain, which delivers only to verified Authorized Recipients; verify every entry in recipients or use a verified sending domain".to_string(),
+                Some(format!("{debug} (sender_domain {})", settings.domain)),
             ))
         }
-        403 => PluginResult::Err(plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!(
-                "Mailgun refused the request (HTTP 403): {detail}. The key in api_key is valid but not permitted to send for sender_domain."
-            ),
-            Some(debug),
-        )),
-        // The domain is not in this region's namespace.
+        // The key in api_key is valid but not permitted to send for
+        // sender_domain.
+        403 => PluginResult::Err(rejected_credential(Credential::ApiKey, debug)),
+        // The domain is not in this region's namespace: `/v3/{domain}/messages`
+        // does not exist there.
         404 => PluginResult::Err(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "Mailgun has no domain named {} in this region (HTTP 404): {detail}. Check sender_domain, and use_eu_endpoint if the domain was created in the EU region.",
-                settings.domain
-            ),
-            Some(debug),
+            codes::ENDPOINT_NOT_FOUND,
+            "Mailgun has no domain named in sender_domain in the selected region; check sender_domain and use_eu_endpoint".to_string(),
+            Some(format!("{debug} (sender_domain {})", settings.domain)),
         )),
-        400 => PluginResult::Err(classify_bad_request(&answer, &detail, debug)),
+        400 => PluginResult::Err(classify_bad_request(&answer, debug)),
         // The account cannot send: an unpaid invoice, a disabled account, or a
         // plan that does not allow this. Nothing in Scryer's configuration fixes
-        // it, so it is a delivery outcome rather than a settings error.
-        402 => {
-            let mut failure = error_response(
-                format!(
-                    "Mailgun refused the message for an account or plan reason (HTTP 402): {detail}"
-                ),
-                Some("http_402".to_string()),
-            );
-            failure.target_results =
-                target_results(settings, false, Some("http_402".to_string()), Some(&detail));
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        // it and a retry does not clear it.
+        402 => PluginResult::Err(plugin_error(
+            PluginErrorCode::Permanent,
+            "Mailgun refused the message for an account or plan reason".to_string(),
+            Some(debug),
+        )),
         // The message this plugin built is too large for Mailgun's 25 MB limit.
         // The operator has nothing to fix; this is a plugin bug and is reported
         // as one.
         413 => PluginResult::Err(plugin_error(
             PluginErrorCode::Permanent,
-            format!(
-                "Mailgun rejected the message this plugin built as too large (HTTP 413): {detail}"
-            ),
+            "Mailgun rejected the message this plugin built as too large".to_string(),
             Some(debug),
         )),
-        429 => {
-            let mut failure = error_response(
-                format!("Mailgun rate-limited this channel (HTTP 429): {detail}"),
-                Some("http_429".to_string()),
-            );
-            failure.retry_after_seconds = retry_after_seconds(headers);
-            failure.target_results =
-                target_results(settings, false, Some("http_429".to_string()), Some(&detail));
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
-        500..=599 => {
-            let mut failure = error_response(
-                format!("Mailgun is unavailable (HTTP {status}): {detail}"),
-                Some(format!("http_{status}")),
-            );
-            failure.retry_after_seconds = retry_after_seconds(headers);
-            failure.target_results = target_results(
-                settings,
-                false,
-                Some(format!("http_{status}")),
-                Some(&detail),
-            );
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
+        // `RateLimited` / `UpstreamUnavailable`, both carrying the delay
+        // Mailgun (or a proxy) asked for.
+        429 | 500..=599 => {
+            let retry_after = retry_after_seconds(headers);
+            let mut error = http_failure(status, retry_after, Credential::ApiKey, debug);
+            error.retry_after_seconds = retry_after;
+            PluginResult::Err(error)
         }
         _ => PluginResult::Err(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!("Mailgun rejected the request (HTTP {status}): {detail}"),
+            "Mailgun rejected the request".to_string(),
             Some(debug),
         )),
     }
@@ -1626,11 +1582,11 @@ fn classify_response(
 
 /// Mailgun answers a 400 with a human-readable `{"message": …}`; the setting to
 /// blame is in that sentence.
-fn classify_bad_request(answer: &MailgunBody, detail: &str, debug: String) -> PluginError {
+fn classify_bad_request(answer: &MailgunBody, debug: String) -> PluginError {
     if answer.mentions(&["'from'", "from parameter", "from address", "sender address"]) {
         return plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!("from was rejected by Mailgun: {detail}"),
+            "from was rejected by Mailgun".to_string(),
             Some(debug),
         );
     }
@@ -1643,21 +1599,21 @@ fn classify_bad_request(answer: &MailgunBody, detail: &str, debug: String) -> Pl
     ]) {
         return plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!("recipients was rejected by Mailgun: {detail}"),
+            "recipients was rejected by Mailgun".to_string(),
             Some(debug),
         );
     }
     if answer.mentions(&["tag"]) {
         return plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!("tags was rejected by Mailgun: {detail}"),
+            "tags was rejected by Mailgun".to_string(),
             Some(debug),
         );
     }
     if answer.mentions(&["domain"]) {
         return plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!("sender_domain was rejected by Mailgun: {detail}"),
+            "sender_domain was rejected by Mailgun".to_string(),
             Some(debug),
         );
     }
@@ -1665,7 +1621,7 @@ fn classify_bad_request(answer: &MailgunBody, detail: &str, debug: String) -> Pl
     // is what Mailgun disliked.
     plugin_error(
         PluginErrorCode::Permanent,
-        format!("Mailgun rejected the message this plugin built (HTTP 400): {detail}"),
+        "Mailgun rejected the message this plugin built".to_string(),
         Some(debug),
     )
 }
@@ -1782,16 +1738,14 @@ fn probe_domain(settings: &Settings) -> Vec<String> {
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let builder = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug) => builder.debug(debug).build(),
+        None => builder.build(),
     }
 }
 
@@ -2569,14 +2523,13 @@ mod tests {
     }
 
     #[test]
-    fn a_401_names_the_api_key() {
+    fn a_401_is_an_invalid_api_key() {
         // `MailgunProxy.cs:35-38`: "Unauthorised - ApiKey is invalid".
         let PluginResult::Err(error) = classify(401, r#"{"message":"Invalid private key"}"#) else {
             panic!("a 401 is a configuration problem, not a delivery outcome");
         };
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
-        assert!(error.public_message.contains("api_key"));
-        assert!(error.public_message.contains("use_eu_endpoint"));
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+        assert!(!error.public_message.contains("Invalid private key"));
         assert_eq!(
             error.debug_message.as_deref(),
             Some("HTTP 401: Invalid private key")
@@ -2601,21 +2554,21 @@ mod tests {
         let PluginResult::Err(error) = classify(403, r#"{"message":"Forbidden"}"#) else {
             panic!("a 403 is a configuration problem");
         };
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
-        assert!(error.public_message.contains("api_key"));
-        assert!(error.public_message.contains("sender_domain"));
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+        assert!(error.debug_message.unwrap().contains("Forbidden"));
     }
 
     #[test]
-    fn a_404_names_the_domain_and_the_region() {
+    fn a_404_is_an_endpoint_not_found_naming_the_domain_and_the_region() {
         let PluginResult::Err(error) =
             classify(404, r#"{"message":"Domain not found: mg.example.com"}"#)
         else {
             panic!("a 404 is a configuration problem");
         };
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
         assert!(error.public_message.contains("sender_domain"));
         assert!(error.public_message.contains("use_eu_endpoint"));
+        assert!(!error.public_message.contains("mg.example.com"));
     }
 
     #[test]
@@ -2662,18 +2615,18 @@ mod tests {
     }
 
     #[test]
-    fn a_402_and_a_5xx_are_delivery_failures_not_settings_errors() {
-        for status in [402u16, 500, 502, 503] {
-            let PluginResult::Ok(response) = classify(status, r#"{"message":"nope"}"#) else {
-                panic!("HTTP {status} is a delivery outcome");
+    fn a_402_is_permanent_and_a_5xx_is_upstream_unavailable() {
+        let PluginResult::Err(error) = classify(402, r#"{"message":"nope"}"#) else {
+            panic!("HTTP 402 is a typed error");
+        };
+        assert_eq!(error.code, PluginErrorCode::Permanent);
+        assert!(error.debug_message.unwrap().contains("nope"));
+        for status in [500u16, 502, 503] {
+            let PluginResult::Err(error) = classify(status, r#"{"message":"nope"}"#) else {
+                panic!("HTTP {status} is a typed error");
             };
-            assert!(!response.success);
-            assert_eq!(
-                response.provider_status.as_deref(),
-                Some(format!("http_{status}").as_str())
-            );
-            assert_eq!(response.target_results.len(), 1);
-            assert!(!response.target_results[0].success);
+            assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+            assert!(!error.public_message.contains("nope"));
         }
     }
 
@@ -2694,12 +2647,11 @@ mod tests {
             &settings(),
             no_warnings(),
         );
-        let PluginResult::Ok(response) = result else {
-            panic!("a 429 is a delivery outcome");
+        let PluginResult::Err(error) = result else {
+            panic!("a 429 is a typed error");
         };
-        assert!(!response.success);
-        assert_eq!(response.retry_after_seconds, Some(45));
-        assert_eq!(response.provider_status.as_deref(), Some("http_429"));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(45));
 
         // `X-RateLimit-Reset` is Unix *milliseconds*, so it has to become a
         // delay rather than being passed through.
@@ -2716,10 +2668,10 @@ mod tests {
             &settings(),
             no_warnings(),
         );
-        let PluginResult::Ok(response) = result else {
-            panic!("a 429 is a delivery outcome");
+        let PluginResult::Err(error) = result else {
+            panic!("a 429 is a typed error");
         };
-        let seconds = response.retry_after_seconds.expect("a retry delay");
+        let seconds = error.retry_after_seconds.expect("a retry delay");
         assert!((115..=120).contains(&seconds), "got {seconds}");
     }
 
@@ -2729,7 +2681,8 @@ mod tests {
             panic!("an unrecognised 4xx is a configuration problem");
         };
         assert_eq!(error.code, PluginErrorCode::InvalidConfig);
-        assert!(error.public_message.contains("418"));
+        assert!(!error.public_message.contains("418"));
+        assert!(error.debug_message.unwrap().contains("HTTP 418"));
     }
 
     #[test]

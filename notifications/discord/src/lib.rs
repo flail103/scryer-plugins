@@ -33,9 +33,10 @@
 //! Discord answers `204` on success (`200` with the message body when
 //! `wait=true`), `400` for a payload this plugin built wrong, `401`/`403`/`404`
 //! for a webhook URL that is no longer usable, and `429` with a `retry_after`
-//! the core can act on. Those are three different lanes in Scryer's contract —
-//! typed `PluginError`, delivery failure with `retry_after_seconds`, and plain
-//! delivery failure — so the send lives here.
+//! the core can act on. Each of those is a different typed `PluginError` —
+//! `Permanent`, `invalid_api_key` for the webhook token, `endpoint_not_found`
+//! for a deleted webhook, `RateLimited` carrying the retry delay — so the send
+//! lives here.
 
 use std::collections::BTreeMap;
 
@@ -251,6 +252,7 @@ fn build_descriptor() -> PluginDescriptor {
             },
             config_fields: config_fields(),
         }),
+        settings: Vec::new(),
     }
 }
 
@@ -893,6 +895,7 @@ fn event_label(req: &PluginNotificationRequest) -> String {
         NotificationEventType::HealthRestored => "Health Issue Resolved".to_string(),
         NotificationEventType::ApplicationUpdate => "Application Updated".to_string(),
         NotificationEventType::TitleMoved => episodic_label(episodic, "Series Moved", "Moved"),
+        NotificationEventType::FileRestored => "File Restored".to_string(),
         // Not in `supported_events`, so the host never routes them here.
         NotificationEventType::ListTitleAdded
         | NotificationEventType::ListRequestSubmitted
@@ -993,6 +996,7 @@ fn embed_color(req: &PluginNotificationRequest) -> i64 {
         NotificationEventType::ImportComplete
         | NotificationEventType::TitleAdded
         | NotificationEventType::HealthRestored
+        | NotificationEventType::FileRestored
         | NotificationEventType::PostProcessingCompleted
         | NotificationEventType::SubtitleDownloaded
         | NotificationEventType::MediaRequestApproved => COLOR_SUCCESS,
@@ -1563,13 +1567,9 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
             &response.body(),
             warnings,
         ),
-        Err(error) => {
-            // The host answers a refused or failed egress in-band; report it as
-            // a delivery failure rather than a channel misconfiguration.
-            let mut failure = error_response(format!("request failed: {error}"), None);
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        // A refused egress, DNS, connection or TLS failure, or a timeout: the
+        // PDK classifies it from the host's own error.
+        Err(error) => PluginResult::Err(request_failure(&error)),
     }
 }
 
@@ -1616,40 +1616,20 @@ fn classify_response(
         // The payload this plugin built is wrong; retrying it changes nothing.
         400 => PluginResult::Err(plugin_error(
             PluginErrorCode::Permanent,
-            format!("Discord rejected the notification payload: {detail}"),
+            "Discord rejected the notification payload".to_string(),
             Some(format!("HTTP 400: {detail}")),
         )),
-        // 401/403 = the token in the URL is not accepted; 404 = the webhook was
-        // deleted (`Unknown Webhook`, error code 10015). All three are the
-        // operator's `webhook_url`, and Discord's rate-limit guidance is
-        // explicit that a 404 webhook must not be retried.
-        401 | 403 => PluginResult::Err(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!("webhook_url was rejected by Discord (HTTP {status}): {detail}"),
-            Some(format!("HTTP {status}: {detail}")),
+        // 401/403 = the token in the webhook URL is not accepted
+        // (`invalid_api_key`); 404 = the webhook was deleted (`Unknown
+        // Webhook`, error code 10015, `endpoint_not_found`), which Discord's
+        // rate-limit guidance says must not be retried; 429 carries the delay
+        // from the body or headers; 5xx is `UpstreamUnavailable`.
+        _ => PluginResult::Err(http_failure(
+            status,
+            retry_after_seconds(headers, body),
+            Credential::ApiKey,
+            format!("HTTP {status}: {detail}"),
         )),
-        404 => PluginResult::Err(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "webhook_url no longer exists on Discord (HTTP 404): {detail}. Recreate the webhook and paste the new URL."
-            ),
-            Some(format!("HTTP 404: {detail}")),
-        )),
-        429 => {
-            let mut failure =
-                error_response(format!("HTTP 429: {detail}"), Some("http_429".to_string()));
-            failure.retry_after_seconds = retry_after_seconds(headers, body);
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
-        _ => {
-            let mut failure = error_response(
-                format!("HTTP {status}: {detail}"),
-                Some(format!("http_{status}")),
-            );
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
     }
 }
 
@@ -1715,12 +1695,10 @@ fn plugin_error(
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let builder = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug) => builder.debug(debug).build(),
+        None => builder.build(),
     }
 }
 
@@ -2669,7 +2647,7 @@ mod tests {
     }
 
     #[test]
-    fn a_400_is_a_permanent_typed_error_carrying_discords_own_message() {
+    fn a_400_is_a_permanent_typed_error_carrying_discords_own_message_in_debug() {
         let result = classify_response(
             400,
             &BTreeMap::new(),
@@ -2680,46 +2658,69 @@ mod tests {
             panic!("400 must be a typed error");
         };
         assert_eq!(error.code, PluginErrorCode::Permanent);
-        assert!(error.public_message.contains("Invalid Form Body"));
-        assert!(error.public_message.contains("50035"));
+        assert!(!error.public_message.contains("Invalid Form Body"));
+        let debug = error.debug_message.expect("debug carries Discord's answer");
+        assert!(debug.contains("Invalid Form Body"));
+        assert!(debug.contains("50035"));
     }
 
     #[test]
-    fn an_unusable_webhook_is_an_invalid_config_naming_the_field() {
-        for status in [401u16, 403, 404] {
+    fn a_rejected_webhook_token_is_an_invalid_api_key() {
+        for status in [401u16, 403] {
             let result = classify_response(
                 status,
                 &BTreeMap::new(),
-                br#"{"message":"Unknown Webhook","code":10015}"#,
+                br#"{"message":"Invalid Webhook Token","code":50027}"#,
                 Vec::new(),
             );
             let PluginResult::Err(error) = result else {
                 panic!("HTTP {status} must be a typed error");
             };
-            assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+            assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+            assert!(!error.public_message.contains("Invalid Webhook Token"));
             assert!(
-                error.public_message.contains("webhook_url"),
-                "HTTP {status}: {}",
-                error.public_message
+                error
+                    .debug_message
+                    .as_deref()
+                    .is_some_and(|debug| debug.contains("Invalid Webhook Token"))
             );
         }
     }
 
     #[test]
-    fn a_429_is_a_delivery_failure_carrying_discords_retry_after() {
+    fn a_deleted_webhook_is_an_endpoint_not_found() {
+        let result = classify_response(
+            404,
+            &BTreeMap::new(),
+            br#"{"message":"Unknown Webhook","code":10015}"#,
+            Vec::new(),
+        );
+        let PluginResult::Err(error) = result else {
+            panic!("HTTP 404 must be a typed error");
+        };
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("10015"))
+        );
+    }
+
+    #[test]
+    fn a_429_is_rate_limited_carrying_discords_retry_after() {
         let result = classify_response(
             429,
             &headers(&[("retry-after", "9")]),
             br#"{"message":"You are being rate limited.","retry_after":1.483,"global":false}"#,
             Vec::new(),
         );
-        let PluginResult::Ok(response) = result else {
-            panic!("429 must stay a delivery failure");
+        let PluginResult::Err(error) = result else {
+            panic!("429 must be a typed error");
         };
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_429"));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
         // The body's float wins over the header, rounded up to whole seconds.
-        assert_eq!(response.retry_after_seconds, Some(2));
+        assert_eq!(error.retry_after_seconds, Some(2));
     }
 
     #[test]
@@ -2730,21 +2731,21 @@ mod tests {
             b"",
             Vec::new(),
         );
-        let PluginResult::Ok(response) = result else {
-            panic!("429 must stay a delivery failure");
+        let PluginResult::Err(error) = result else {
+            panic!("429 must be a typed error");
         };
-        assert_eq!(response.retry_after_seconds, Some(1));
+        assert_eq!(error.retry_after_seconds, Some(1));
     }
 
     #[test]
-    fn a_5xx_is_a_reported_delivery_failure_not_a_typed_error() {
+    fn a_5xx_is_upstream_unavailable_with_the_body_in_debug_only() {
         let result = classify_response(503, &BTreeMap::new(), b"upstream exploded", Vec::new());
-        let PluginResult::Ok(response) = result else {
-            panic!("a 5xx must stay in-band as a delivery failure");
+        let PluginResult::Err(error) = result else {
+            panic!("a 5xx must be a typed error");
         };
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_503"));
-        assert!(response.error.unwrap().contains("upstream exploded"));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert!(!error.public_message.contains("upstream exploded"));
+        assert!(error.debug_message.unwrap().contains("upstream exploded"));
     }
 
     #[test]

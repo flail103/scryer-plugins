@@ -1,4 +1,5 @@
 use notify_common::*;
+use scryer_plugin_pdk::error::structured_plugin_error;
 
 wit_bindgen::generate!({
     // Fully qualified: `path` resolves two packages, so a bare world name is
@@ -143,19 +144,14 @@ fn config_fields() -> Vec<ConfigFieldDef> {
     ]
 }
 
-fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotificationResponse> {
-    if let Err(message) = validate_plex_config() {
-        return Ok(error_response(message, Some("invalid_config".to_string())));
-    }
+fn send_notification(
+    req: &PluginNotificationRequest,
+) -> Result<PluginNotificationResponse, PluginError> {
+    validate_plex_config().map_err(config_error)?;
     if !config_bool("update_library") || !should_update_library(req) {
         return Ok(ok_response());
     }
-    let path_mappings = match configured_path_mappings() {
-        Ok(mappings) => mappings,
-        Err(message) => {
-            return Ok(error_response(message, Some("invalid_config".to_string())));
-        }
-    };
+    let path_mappings = configured_path_mappings().map_err(config_error)?;
     let paths: Vec<String> = refresh_paths(req)
         .iter()
         .map(|path| map_path(path, &path_mappings))
@@ -184,9 +180,9 @@ fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotifica
                     }
                 }
             }
-            Err(error) => {
-                return Ok(error_response(error.to_string(), None));
-            }
+            // The section lookup is one request: its failure is the send's
+            // failure, classified (credential, endpoint, transport, body).
+            Err(error) => return Err(request_failure(&error)),
         }
     }
     if targets.iter().any(|target| target.path.is_some()) && !supports_partial_refresh() {
@@ -196,7 +192,7 @@ fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotifica
         }
         targets.retain(|target| sections.insert(target.section_id.clone()));
     }
-    let mut responses = Vec::new();
+    let mut outcomes = Vec::new();
     let mut full_sections: std::collections::BTreeSet<_> = targets
         .iter()
         .filter(|target| target.path.is_none())
@@ -204,7 +200,7 @@ fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotifica
         .collect();
     let mut fallback_sections = Vec::new();
     for target in targets {
-        responses.push(refresh_section(&target.section_id, target.path.as_deref()));
+        outcomes.push(refresh_section(&target.section_id, target.path.as_deref()));
         // Plex can accept a folder refresh without discovering a new directory.
         // Keep the section scan fallback, once per affected section.
         if target.path.is_some() && full_sections.insert(target.section_id.clone()) {
@@ -212,9 +208,25 @@ fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotifica
         }
     }
     for section_id in fallback_sections {
-        responses.push(refresh_section(&section_id, None));
+        outcomes.push(refresh_section(&section_id, None));
     }
-    Ok(merge_responses(responses))
+    // A single refresh is a single request: its failure is the send's failure
+    // and carries its code. Several refreshes keep the merged per-request
+    // delivery report.
+    if outcomes.len() == 1
+        && let Some(Err(failure)) = outcomes.pop()
+    {
+        return Err(failure.error);
+    }
+    Ok(merge_responses(
+        outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                Ok(()) => ok_response(),
+                Err(failure) => failure.response,
+            })
+            .collect(),
+    ))
 }
 
 fn handle_action(action: &PluginActionRequest) -> FnResult<serde_json::Value> {
@@ -297,12 +309,18 @@ fn servers() -> Result<serde_json::Value, Error> {
     let status = response.status_code();
     if !(200..300).contains(&status) {
         let body = String::from_utf8_lossy(&response.body()).to_string();
-        return Err(Error::msg(format!(
-            "Plex server discovery failed: HTTP {status}: {body}"
+        return Err(structured_plugin_error(http_failure(
+            status,
+            retry_after_header(response.headers()),
+            Credential::ApiKey,
+            format!("Plex server discovery failed: HTTP {status}: {body}"),
         )));
     }
 
-    let resources: serde_json::Value = serde_json::from_slice(&response.body())?;
+    let resources: serde_json::Value = serde_json::from_slice(&response.body()).or_plugin_error(
+        codes::INVALID_RESPONSE,
+        "plex.tv answered the server discovery with something unreadable",
+    )?;
     let options = resources
         .as_array()
         .into_iter()
@@ -334,16 +352,51 @@ fn plex_auth_token(pin_id: i64) -> Result<String, Error> {
     let status = response.status_code();
     if !(200..300).contains(&status) {
         let body = String::from_utf8_lossy(&response.body()).to_string();
-        return Err(Error::msg(format!(
-            "Plex pin lookup failed: HTTP {status}: {body}"
-        )));
+        let debug = format!("Plex pin lookup failed: HTTP {status}: {body}");
+        // plex.tv answers 404 for a sign-in PIN it no longer knows.
+        let error = if status == 404 {
+            scryer_plugin_pdk::plugin_error(
+                codes::ITEM_NOT_FOUND,
+                "the Plex sign-in request has expired; start the sign-in again",
+            )
+            .debug(debug)
+            .build()
+        } else {
+            http_failure(
+                status,
+                retry_after_header(response.headers()),
+                Credential::Unknown,
+                debug,
+            )
+        };
+        return Err(structured_plugin_error(error));
     }
 
-    let value: serde_json::Value = serde_json::from_slice(&response.body())?;
+    let value: serde_json::Value = serde_json::from_slice(&response.body()).or_plugin_error(
+        codes::INVALID_RESPONSE,
+        "plex.tv answered the sign-in lookup with something unreadable",
+    )?;
     Ok(string_member(&value, &["authToken", "auth_token"]).unwrap_or_default())
 }
 
-fn refresh_section(section_id: &str, path: Option<&str>) -> PluginNotificationResponse {
+/// One failed library refresh: the typed error a single-refresh send reports,
+/// and the delivery entry a multi-refresh send merges.
+struct RefreshFailure {
+    error: PluginError,
+    response: PluginNotificationResponse,
+}
+
+/// The credential a Plex Media Server rejection points at: the configured
+/// token, or nothing when none is configured.
+fn plex_credential() -> Credential {
+    if plex_token().is_some() {
+        Credential::ApiKey
+    } else {
+        Credential::Unknown
+    }
+}
+
+fn refresh_section(section_id: &str, path: Option<&str>) -> Result<(), Box<RefreshFailure>> {
     let mut params = vec![
         ("X-Plex-Client-Identifier", "scryer".to_string()),
         ("X-Plex-Product", "Scryer".to_string()),
@@ -361,7 +414,34 @@ fn refresh_section(section_id: &str, path: Option<&str>) -> PluginNotificationRe
         &format!("{}/library/sections/{section_id}/refresh", base_url()),
         &params,
     );
-    send_bytes(&url, "POST", &[], Vec::new())
+    let request = HttpRequest::new(&url)
+        .with_method("POST")
+        .with_header("User-Agent", "scryer-notification-plugin/0.1");
+    match http::request::<Vec<u8>>(&request, Some(Vec::new())) {
+        Ok(response) => {
+            let status = response.status_code();
+            if (200..300).contains(&status) {
+                return Ok(());
+            }
+            let body_text = String::from_utf8_lossy(&response.body()).to_string();
+            Err(Box::new(RefreshFailure {
+                error: http_failure(
+                    status,
+                    retry_after_header(response.headers()),
+                    plex_credential(),
+                    format!("Plex library refresh failed: HTTP {status}: {body_text}"),
+                ),
+                response: error_response(
+                    format!("HTTP {}: {}", status, body_text),
+                    Some(format!("http_{status}")),
+                ),
+            }))
+        }
+        Err(error) => Err(Box::new(RefreshFailure {
+            error: request_failure(&error),
+            response: error_response(format!("request failed: {error}"), None),
+        })),
+    }
 }
 
 fn base_url() -> String {
@@ -512,12 +592,18 @@ fn plex_sections(section_types: &[&str]) -> Result<Vec<PlexSection>, Error> {
     let status = response.status_code();
     if !(200..300).contains(&status) {
         let body = String::from_utf8_lossy(&response.body()).to_string();
-        return Err(Error::msg(format!(
-            "Plex library section lookup failed: HTTP {status}: {body}"
+        return Err(structured_plugin_error(http_failure(
+            status,
+            retry_after_header(response.headers()),
+            plex_credential(),
+            format!("Plex library section lookup failed: HTTP {status}: {body}"),
         )));
     }
 
-    let value: serde_json::Value = serde_json::from_slice(&response.body())?;
+    let value: serde_json::Value = serde_json::from_slice(&response.body()).or_plugin_error(
+        codes::INVALID_RESPONSE,
+        "Plex answered the library section lookup with something unreadable",
+    )?;
     Ok(parse_plex_sections(&value, section_types))
 }
 
@@ -890,7 +976,7 @@ fn action_name(request: &serde_json::Value) -> Option<String> {
 fn required_action_param(request: &serde_json::Value, key: &str) -> Result<String, Error> {
     action_param(request, key)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::msg(format!("QueryParam {key} invalid.")))
+        .ok_or_else(|| structured_plugin_error(config_error(format!("QueryParam {key} invalid."))))
 }
 
 fn action_param(request: &serde_json::Value, key: &str) -> Option<String> {
@@ -939,7 +1025,7 @@ fn bool_member(value: &serde_json::Value, key: &str) -> bool {
 fn parse_i64(value: &str) -> Result<i64, Error> {
     value
         .parse::<i64>()
-        .map_err(|_| Error::msg("QueryParam id invalid."))
+        .map_err(|_| structured_plugin_error(config_error("QueryParam id invalid.")))
 }
 
 fn host_from_uri(uri: &str) -> Option<String> {
@@ -998,13 +1084,16 @@ fn handle_notification_command(
         PluginNotificationCommand::Send(request) => {
             PluginNotificationCommandResult::Send(match send_notification(&request) {
                 Ok(response) => PluginResult::Ok(response),
-                Err(error) => PluginResult::Err(config_error(error)),
+                Err(error) => PluginResult::Err(error),
             })
         }
+        // Every action failure is already typed (a bad parameter is
+        // `InvalidConfig`, a plex.tv answer carries its code); a transport
+        // failure is classified by the PDK.
         PluginNotificationCommand::Action(request) => {
             PluginNotificationCommandResult::Action(match handle_action(&request) {
                 Ok(payload) => PluginResult::Ok(PluginActionResponse { payload }),
-                Err(error) => PluginResult::Err(config_error(error)),
+                Err(error) => PluginResult::Err(request_failure(&error)),
             })
         }
     }

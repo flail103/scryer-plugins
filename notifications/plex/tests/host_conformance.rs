@@ -11,6 +11,7 @@ use scryer_plugin_conformance::notification::{
     Check, NotificationConformance, call_notification, instantiate,
 };
 use scryer_plugin_sdk::NotificationEventType;
+use scryer_plugin_sdk::PluginErrorCode;
 use scryer_plugin_sdk::PluginResult;
 use scryer_plugin_sdk::command::{
     PluginActionRequest, PluginNotificationCommand, PluginNotificationCommandResult,
@@ -19,11 +20,13 @@ use scryer_plugin_sdk::command::{
 #[test]
 fn plex_release_wasm_conforms_to_the_notification_host_contract() {
     // The delivery is a library refresh, so the notification carries a
-    // `Download` rather than the family's `Test`. The channel tolerates an
-    // unset setting rather than reporting a typed configuration error, so the
-    // family's missing-required-setting check does not apply; and its action
-    // arm is wired rather than unsupported, so that check is replaced by the
-    // stronger one below rather than dropped.
+    // `Download` rather than the family's `Test`. An unset `base_url` (with no
+    // legacy `host` either) is a typed configuration error naming both. The
+    // action arm is wired rather than unsupported, so that check is replaced
+    // by the stronger one below rather than dropped. A single refresh is a
+    // single request, so its server error is a typed plugin error rather than
+    // an unsuccessful delivery; the suite's in-band-delivery-failure check is
+    // replaced by the typed one below.
     let conformance = NotificationConformance::new(env!("CARGO_MANIFEST_DIR"), "plex")
         .wasm("plex_notification.wasm")
         .config("base_url", "http://plex.test.invalid:32400")
@@ -34,11 +37,42 @@ fn plex_release_wasm_conforms_to_the_notification_host_contract() {
             "http://plex.test.invalid:32400/library/sections/3/refresh?X-Plex-Client-Identifier=scryer",
         )
         .event_type(NotificationEventType::Download)
-        .without(Check::MissingRequiredSetting)
+        .required_setting("base_url")
+        .required_setting_mentions("host")
+        .without(Check::UpstreamFailureIsReported)
         .without(Check::ActionIsUnsupported);
     conformance.run();
 
     assert_an_unknown_action_answers_empty_rather_than_trapping(&conformance);
+    assert_a_single_refresh_failure_is_a_typed_error(&conformance);
+}
+
+fn assert_a_single_refresh_failure_is_a_typed_error(conformance: &NotificationConformance) {
+    use scryer_plugin_conformance::notification::test_request;
+    use scryer_plugin_conformance::{HttpScript, Script};
+
+    for (status, code) in [
+        (500, PluginErrorCode::UpstreamUnavailable),
+        // A token is configured, so Plex refusing it is the token's fault.
+        (401, PluginErrorCode::from("invalid_api_key")),
+    ] {
+        let script = Script {
+            http: HttpScript::status(status, b"synthetic upstream answer".to_vec()),
+            ..conformance.script()
+        };
+        let (mut store, plugin) = instantiate(&conformance.wasm_path(), script);
+        let result = call_notification(
+            &mut store,
+            &plugin,
+            PluginNotificationCommand::Send(test_request(NotificationEventType::Download)),
+        );
+        let PluginNotificationCommandResult::Send(PluginResult::Err(error)) = result else {
+            panic!("HTTP {status} must be a typed plugin error: {result:?}");
+        };
+        assert_eq!(error.code, code, "HTTP {status}");
+        assert!(!error.public_message.contains("synthetic upstream answer"));
+        assert!(!error.public_message.contains("plextoken"));
+    }
 }
 
 /// This channel *implements* actions, so the assertion is the opposite of the

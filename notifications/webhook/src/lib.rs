@@ -12,7 +12,7 @@
 //! host ABI.
 
 use scryer_plugin_pdk::sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
-use scryer_plugin_pdk::{FnResult, HttpRequest, config, http};
+use scryer_plugin_pdk::{HttpRequest, codes, config, http};
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldOption, ConfigFieldType, NotificationCapabilities,
@@ -62,29 +62,72 @@ fn handle_notification_command(
         PluginNotificationCommand::Send(request) => {
             PluginNotificationCommandResult::Send(match send_notification(&request) {
                 Ok(response) => PluginResult::Ok(response),
-                Err(error) => PluginResult::Err(plugin_error(
-                    PluginErrorCode::InvalidConfig,
-                    error.to_string(),
-                )),
+                Err(error) => PluginResult::Err(error),
             })
         }
         PluginNotificationCommand::Action(_) => {
-            PluginNotificationCommandResult::Action(PluginResult::Err(plugin_error(
-                PluginErrorCode::Unsupported,
-                format!("{PROVIDER_TYPE} does not implement notification actions"),
-            )))
+            PluginNotificationCommandResult::Action(PluginResult::Err(
+                plugin_error(
+                    PluginErrorCode::Unsupported,
+                    format!("{PROVIDER_TYPE} does not implement notification actions"),
+                )
+                .build(),
+            ))
         }
     }
 }
 
-fn plugin_error(code: PluginErrorCode, public_message: String) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+fn plugin_error(
+    code: impl Into<PluginErrorCode>,
+    public_message: impl Into<String>,
+) -> scryer_plugin_pdk::PluginErrorBuilder {
+    scryer_plugin_pdk::plugin_error(code, public_message)
+}
+
+/// The typed error for a non-success answer from the webhook endpoint.
+///
+/// A generic webhook carries no credential setting of its own (any secret
+/// lives in the configured URL), so a 401/403 cannot name which credential
+/// was wrong and is `AuthFailed`. The public sentence never carries the
+/// status or the endpoint's text; both go to the host log.
+fn http_failure(status: u16, retry_after: Option<&str>, body: &str) -> PluginError {
+    let builder = match status {
+        401 | 403 => plugin_error(
+            PluginErrorCode::AuthFailed,
+            "the webhook endpoint rejected the request as unauthorized",
+        ),
+        404 => plugin_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "the configured webhook URL does not exist",
+        ),
+        429 => {
+            let builder = plugin_error(
+                PluginErrorCode::RateLimited,
+                "the webhook endpoint is rate limiting requests",
+            );
+            match retry_after_seconds(retry_after) {
+                Some(seconds) => builder.retry_after_seconds(seconds),
+                None => builder,
+            }
+        }
+        500..=599 => plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "the webhook endpoint answered with a server error",
+        ),
+        _ => plugin_error(
+            PluginErrorCode::Permanent,
+            "the webhook endpoint refused the notification",
+        ),
+    };
+    builder.debug(format_args!("HTTP {status}: {body}")).build()
+}
+
+/// A `Retry-After` value in delta-seconds, rounded up to at least one second.
+fn retry_after_seconds(value: Option<&str>) -> Option<i64> {
+    value
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (seconds.ceil() as i64).max(1))
 }
 
 fn build_descriptor() -> PluginDescriptor {
@@ -95,6 +138,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(NotificationDescriptor {
             provider_type: "webhook".to_string(),
             provider_aliases: vec![],
@@ -218,23 +262,20 @@ fn general_notification_events() -> Vec<NotificationEventType> {
     ]
 }
 
-fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotificationResponse> {
+fn send_notification(
+    req: &PluginNotificationRequest,
+) -> Result<PluginNotificationResponse, PluginError> {
     // Read config values injected by the host
     let webhook_url = config::get("webhook_url")
         .ok()
         .flatten()
         .unwrap_or_default();
     if webhook_url.is_empty() {
-        let resp = PluginNotificationResponse {
-            success: false,
-            error: Some("webhook_url is not configured".to_string()),
-            delivery_id: None,
-            provider_status: None,
-            retry_after_seconds: None,
-            warnings: Vec::new(),
-            target_results: Vec::new(),
-        };
-        return Ok(resp);
+        return Err(plugin_error(
+            PluginErrorCode::InvalidConfig,
+            "the webhook_url setting is not configured",
+        )
+        .build());
     }
 
     let method = config::get("method")
@@ -254,7 +295,14 @@ fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotifica
             req.summary_message
         )
     } else {
-        serde_json::to_string(&to_webhook_json(req))?
+        serde_json::to_string(&to_webhook_json(req)).map_err(|error| {
+            plugin_error(
+                PluginErrorCode::InvalidConfig,
+                "the webhook payload could not be built",
+            )
+            .debug(error)
+            .build()
+        })?
     };
 
     // Make the HTTP request through the host-services import
@@ -279,36 +327,54 @@ fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotifica
                 Ok(resp)
             } else {
                 let body_text = String::from_utf8_lossy(&res.body()).to_string();
-                let resp = PluginNotificationResponse {
-                    success: false,
-                    error: Some(format!("HTTP {}: {}", status, body_text)),
-                    delivery_id: None,
-                    provider_status: Some(format!("http_{status}")),
-                    retry_after_seconds: None,
-                    warnings: Vec::new(),
-                    target_results: Vec::new(),
-                };
-                Ok(resp)
+                Err(http_failure(status, res.header("Retry-After"), &body_text))
             }
         }
-        Err(e) => {
-            let resp = PluginNotificationResponse {
-                success: false,
-                error: Some(format!("request failed: {}", e)),
-                delivery_id: None,
-                provider_status: None,
-                retry_after_seconds: None,
-                warnings: Vec::new(),
-                target_results: Vec::new(),
-            };
-            Ok(resp)
-        }
+        // A request that never got an HTTP answer: the PDK reads the host's
+        // transport detail (TLS, timeout, DNS/connect) into the right code.
+        Err(error) => Err(scryer_plugin_pdk::error::plugin_error_from(&error)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unauthorized_answer_is_auth_failed_with_the_detail_in_debug_only() {
+        for status in [401, 403] {
+            let error = http_failure(status, None, "signature mismatch for hook-synthetic");
+            assert_eq!(error.code, PluginErrorCode::AuthFailed, "{status}");
+            assert!(!error.public_message.contains("hook-synthetic"));
+            assert!(!error.public_message.contains(&status.to_string()));
+            assert_eq!(
+                error.debug_message.as_deref(),
+                Some(format!("HTTP {status}: signature mismatch for hook-synthetic").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn http_failures_map_to_their_codes() {
+        assert_eq!(
+            http_failure(404, None, "").code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        let limited = http_failure(429, Some(" 12 "), "slow down");
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(12));
+        assert_eq!(http_failure(429, None, "").retry_after_seconds, None);
+        for status in [500, 502, 503] {
+            assert_eq!(
+                http_failure(status, None, "").code,
+                PluginErrorCode::UpstreamUnavailable
+            );
+        }
+        assert_eq!(
+            http_failure(400, None, "bad payload").code,
+            PluginErrorCode::Permanent
+        );
+    }
 
     #[test]
     fn describe_produces_valid_json() {

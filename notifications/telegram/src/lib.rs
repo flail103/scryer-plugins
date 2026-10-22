@@ -35,8 +35,9 @@
 //! token, a `400` carrying `"chat not found"` is the chat id, a `400` carrying
 //! `"message thread not found"` is the topic id, a `429` carries
 //! `parameters.retry_after` the core can act on, and a `400` carrying
-//! `"can't parse entities"` is a bug in the markup *this plugin* built. Those
-//! are three different lanes in Scryer's contract, so the send lives here.
+//! `"can't parse entities"` is a bug in the markup *this plugin* built. Each
+//! carries its own typed error code in Scryer's contract, so the send lives
+//! here.
 //!
 //! # Upstream reference
 //!
@@ -147,6 +148,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(NotificationDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec![],
@@ -714,6 +716,7 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<Line> {
         | NotificationEventType::ListTitleLeft
         | NotificationEventType::ListSyncFailed
         | NotificationEventType::ListUnfollowed
+        | NotificationEventType::FileRestored
         | NotificationEventType::Test => {}
     }
     lines
@@ -1261,14 +1264,32 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
             &response.body(),
             warnings,
         ),
-        Err(error) => {
-            // The host answers a refused or failed egress in-band; that is the
-            // provider being unreachable, not a misconfigured channel.
-            let mut failure = error_response(format!("request failed: {error}"), None);
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        // The send is one request, so a request that got no answer at all is
+        // the send's failure, typed from the host's transport detail
+        // (unreachable, timeout, TLS). The request URL carries the bot token,
+        // so it is scrubbed from the detail before the host logs it.
+        Err(error) => PluginResult::Err(without_token(
+            request_failure(&error),
+            settings.bot_token.trim(),
+        )),
     }
+}
+
+/// The same typed error with every occurrence of the bot token in its debug
+/// detail replaced, so a transport error quoting the request URL never puts
+/// the credential in the host log.
+fn without_token(error: PluginError, token: &str) -> PluginError {
+    let builder = scryer_plugin_pdk::plugin_error(error.code, error.public_message);
+    let builder = match error.debug_message {
+        Some(debug) if !token.is_empty() => builder.debug(debug.replace(token, "<bot_token>")),
+        Some(debug) => builder.debug(debug),
+        None => builder,
+    };
+    match error.retry_after_seconds {
+        Some(seconds) => builder.retry_after_seconds(seconds),
+        None => builder,
+    }
+    .build()
 }
 
 /// The response body every Bot API call returns
@@ -1359,29 +1380,36 @@ fn classify_response(
         // Flood control. The wait is in `parameters.retry_after`, not a header,
         // but a proxy may add `Retry-After`; both are whole seconds.
         429 => {
-            let mut failure =
-                error_response(format!("HTTP 429: {detail}"), Some("http_429".to_string()));
-            failure.retry_after_seconds = answer
+            let retry_after = answer
                 .retry_after
                 .or_else(|| header(headers, "retry-after").and_then(|value| value.parse().ok()))
                 .filter(|seconds| *seconds >= 0)
                 .map(|seconds: i64| seconds.max(1));
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
+            let error = scryer_plugin_pdk::plugin_error(
+                PluginErrorCode::RateLimited,
+                "Telegram is rate limiting this bot",
+            )
+            .debug(format!("HTTP 429: {detail}"));
+            PluginResult::Err(
+                match retry_after {
+                    Some(seconds) => error.retry_after_seconds(seconds),
+                    None => error,
+                }
+                .build(),
+            )
         }
         // 401 Unauthorized is always the token. A 404 on `/bot<token>/METHOD` is
-        // the same thing — that bot path does not exist — unless Telegram says
-        // otherwise in the description.
+        // the same thing — that bot path does not exist on Telegram's fixed API
+        // host — unless Telegram says otherwise in the description.
         401 => PluginResult::Err(plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!("bot_token was rejected by Telegram: {detail}"),
+            codes::INVALID_API_KEY,
+            "bot_token was rejected by Telegram".to_string(),
             Some(format!("HTTP {status}: {detail}")),
         )),
         404 if !answer.describes("chat not found") => PluginResult::Err(plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!(
-                "bot_token is not a valid Telegram bot token (HTTP 404): {detail}. Check the token @BotFather issued."
-            ),
+            codes::INVALID_API_KEY,
+            "bot_token is not a valid Telegram bot token. Check the token @BotFather issued."
+                .to_string(),
             Some(format!("HTTP 404: {detail}")),
         )),
         // 403 is always about the chat relationship: blocked by the user,
@@ -1389,11 +1417,11 @@ fn classify_response(
         // token here; the chat is the setting the operator has to change.
         403 => PluginResult::Err(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!("the bot is not allowed to post to the configured chat_id: {detail}"),
+            "the bot is not allowed to post to the configured chat_id".to_string(),
             Some(format!("HTTP 403: {detail}")),
         )),
         _ if is_chat_error(&answer) => {
-            let mut message = format!("chat_id was rejected by Telegram: {detail}");
+            let mut message = "chat_id was rejected by Telegram".to_string();
             // ResponseParameters.migrate_to_chat_id — the structured field
             // Sonarr only ever read as a description string.
             if let Some(migrated) = answer.migrate_to_chat_id {
@@ -1411,7 +1439,7 @@ fn classify_response(
         {
             PluginResult::Err(plugin_error(
                 PluginErrorCode::InvalidConfig,
-                format!("topic_id was rejected by Telegram: {detail}"),
+                "topic_id was rejected by Telegram".to_string(),
                 Some(format!("HTTP {status}: {detail}")),
             ))
         }
@@ -1424,28 +1452,26 @@ fn classify_response(
         {
             PluginResult::Err(plugin_error(
                 PluginErrorCode::Permanent,
-                format!("Telegram rejected the message this plugin built: {detail}"),
+                "Telegram rejected the message this plugin built".to_string(),
                 Some(format!("HTTP {status}: {detail}")),
             ))
         }
         // Sonarr's fall-through for a 400 is `BotToken` (`TelegramProxy.cs:101`).
         400 => PluginResult::Err(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "Telegram rejected the request (HTTP 400): {detail}. Check bot_token and chat_id."
-            ),
+            "Telegram rejected the request. Check bot_token and chat_id.".to_string(),
             Some(format!("HTTP 400: {detail}")),
         )),
-        // 5xx and anything else is the provider saying no right now: the
-        // delivery lane, not the configuration lane.
-        _ => {
-            let mut failure = error_response(
-                format!("HTTP {status}: {detail}"),
-                Some(format!("http_{status}")),
-            );
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        500..=599 => PluginResult::Err(plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "Telegram answered with a server error".to_string(),
+            Some(format!("HTTP {status}: {detail}")),
+        )),
+        _ => PluginResult::Err(plugin_error(
+            PluginErrorCode::Permanent,
+            "Telegram refused the message".to_string(),
+            Some(format!("HTTP {status}: {detail}")),
+        )),
     }
 }
 
@@ -1467,17 +1493,16 @@ fn header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a s
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let error = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug_message) => error.debug(debug_message),
+        None => error,
     }
+    .build()
 }
 
 /// The world's single `process` entry, dispatching the SDK's notification
@@ -2295,21 +2320,6 @@ mod tests {
         }
     }
 
-    fn expect_delivery_failure(
-        result: PluginResult<PluginNotificationResponse>,
-    ) -> PluginNotificationResponse {
-        match result {
-            PluginResult::Ok(response) => {
-                assert!(
-                    !response.success,
-                    "expected a failed delivery: {response:?}"
-                );
-                response
-            }
-            PluginResult::Err(error) => panic!("expected a delivery failure, got {error:?}"),
-        }
-    }
-
     #[test]
     fn a_success_reports_the_message_id_as_the_delivery_id() {
         let PluginResult::Ok(response) =
@@ -2331,7 +2341,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_bot_token_is_an_auth_failure_naming_the_field() {
+    fn a_rejected_bot_token_is_invalid_api_key_naming_the_field() {
         for (status, body) in [
             (
                 401,
@@ -2343,7 +2353,11 @@ mod tests {
             ),
         ] {
             let error = expect_error(classify(status, body));
-            assert_eq!(error.code, PluginErrorCode::AuthFailed, "status {status}");
+            assert_eq!(
+                error.code.as_str(),
+                codes::INVALID_API_KEY,
+                "status {status}"
+            );
             assert!(
                 error.public_message.contains("bot_token"),
                 "status {status}: {}",
@@ -2429,50 +2443,71 @@ mod tests {
     }
 
     #[test]
-    fn flood_control_reports_the_retry_after_telegram_asked_for() {
-        let response = expect_delivery_failure(classify(
+    fn flood_control_is_rate_limited_with_the_retry_after_telegram_asked_for() {
+        let error = expect_error(classify(
             429,
             r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 37","parameters":{"retry_after":37}}"#,
         ));
-        assert_eq!(response.retry_after_seconds, Some(37));
-        assert_eq!(response.provider_status.as_deref(), Some("http_429"));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(37));
     }
 
     #[test]
     fn a_retry_after_header_is_used_when_the_body_carries_none() {
         let headers = BTreeMap::from([("Retry-After".to_string(), "12".to_string())]);
-        let response = expect_delivery_failure(classify_response(
+        let error = expect_error(classify_response(
             429,
             &headers,
             br#"{"ok":false,"error_code":429,"description":"Too Many Requests"}"#,
             Vec::new(),
         ));
-        assert_eq!(response.retry_after_seconds, Some(12));
+        assert_eq!(error.retry_after_seconds, Some(12));
     }
 
     #[test]
-    fn a_server_error_stays_in_the_delivery_lane() {
-        let response = expect_delivery_failure(classify(502, "upstream exploded"));
-        assert_eq!(response.provider_status.as_deref(), Some("http_502"));
+    fn a_server_error_is_upstream_unavailable_with_the_detail_in_debug_only() {
+        let error = expect_error(classify(502, "upstream exploded"));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert!(!error.public_message.contains("upstream exploded"));
         assert!(
-            response
-                .error
+            error
+                .debug_message
                 .as_deref()
-                .unwrap()
-                .contains("upstream exploded"),
-            "{response:?}"
+                .is_some_and(|debug| debug.contains("upstream exploded")),
+            "{error:?}"
         );
     }
 
     #[test]
-    fn a_truncation_warning_survives_a_failed_delivery() {
-        let response = expect_delivery_failure(classify_response(
-            502,
+    fn a_truncation_warning_survives_a_delivery() {
+        let PluginResult::Ok(response) = classify_response(
+            200,
             &BTreeMap::new(),
-            b"{}",
+            br#"{"ok":true,"result":{"message_id":1}}"#,
             vec!["message trimmed".to_string()],
-        ));
+        ) else {
+            panic!("a 200 is a delivery");
+        };
         assert_eq!(response.warnings, vec!["message trimmed".to_string()]);
+    }
+
+    #[test]
+    fn a_transport_error_never_logs_the_bot_token() {
+        let error = without_token(
+            plugin_error(
+                PluginErrorCode::UpstreamUnavailable,
+                "Telegram could not be reached".to_string(),
+                Some(
+                    "request to https://api.telegram.org/bot123456:SYNTHETICTOKEN/sendmessage failed"
+                        .to_string(),
+                ),
+            ),
+            "123456:SYNTHETICTOKEN",
+        );
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        let debug = error.debug_message.expect("the detail is kept");
+        assert!(!debug.contains("SYNTHETICTOKEN"), "{debug}");
+        assert!(debug.contains("<bot_token>"), "{debug}");
     }
 
     #[test]

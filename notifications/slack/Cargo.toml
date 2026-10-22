@@ -1,6 +1,6 @@
 [package]
 name = "slack-notification"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Slack notification plugin"
@@ -15,7 +15,9 @@ catalog_versions = ["v3"]
 # run the Preview 1 command runtime and cannot instantiate this artifact at
 # all, so the floor is load-bearing, not advisory. Scryer 0.21.11 is the
 # first release that sends the `title_moved` event this version handles.
-min_scryer_version = "0.21.11"
+# Scryer 0.21.21 is the first release that decodes the open error codes
+# (`invalid_api_key`, `endpoint_not_found`, ...) this version sends.
+min_scryer_version = "0.21.21"
 docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/notifications/slack"
 source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/notifications/slack"
 
@@ -26,7 +28,7 @@ crate-type = ["cdylib"]
 notify-common = { path = "../notify-common" }
 serde_json = "1"
 scryer-plugin-pdk = "0.8.0"
-scryer-plugin-sdk = "3.12.0"
+scryer-plugin-sdk = "3.18.0"
 wit-bindgen = "0.61"
 
 [dev-dependencies]

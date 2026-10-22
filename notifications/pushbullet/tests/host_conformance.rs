@@ -9,13 +9,13 @@
 // conformance: bespoke
 
 use scryer_plugin_conformance::notification::{
-    NotificationConformance, call_notification, instantiate,
+    Check, NotificationConformance, call_notification, instantiate, test_request,
 };
 use scryer_plugin_conformance::{HttpReply, HttpRoute, HttpScript, Script};
-use scryer_plugin_sdk::PluginResult;
 use scryer_plugin_sdk::command::{
     PluginActionRequest, PluginNotificationCommand, PluginNotificationCommandResult,
 };
+use scryer_plugin_sdk::{NotificationEventType, PluginErrorCode, PluginResult};
 
 const PUSHES_URL: &str = "https://api.pushbullet.com/v2/pushes";
 const ACCESS_TOKEN: &str = "pushbullettoken";
@@ -26,6 +26,39 @@ fn conformance() -> NotificationConformance {
         .config("api_key", ACCESS_TOKEN)
         .expects_url(PUSHES_URL)
         .required_setting("api_key")
+        // A send with no target configured is one push, so a non-success
+        // answer is a typed plugin error carrying its code rather than an
+        // unsuccessful delivery; the typed check below replaces the suite's
+        // in-band one.
+        .without(Check::UpstreamFailureIsReported)
+}
+
+/// A single push that Pushbullet refuses reports the code the answer means,
+/// with the provider's text kept out of the public message.
+#[test]
+fn a_single_push_failure_is_a_typed_error_with_its_code() {
+    let conformance = conformance();
+    for (status, code) in [
+        (500, PluginErrorCode::UpstreamUnavailable),
+        (401, PluginErrorCode::from("invalid_api_key")),
+    ] {
+        let script = Script {
+            http: HttpScript::status(status, b"synthetic upstream answer".to_vec()),
+            ..conformance.script()
+        };
+        let (mut store, plugin) = instantiate(&conformance.wasm_path(), script);
+        let result = call_notification(
+            &mut store,
+            &plugin,
+            PluginNotificationCommand::Send(test_request(NotificationEventType::Grab)),
+        );
+        let PluginNotificationCommandResult::Send(PluginResult::Err(error)) = result else {
+            panic!("HTTP {status} must be a typed plugin error: {result:?}");
+        };
+        assert_eq!(error.code, code, "HTTP {status}");
+        assert!(!error.public_message.contains("synthetic upstream answer"));
+        assert!(!error.public_message.contains(ACCESS_TOKEN));
+    }
 }
 
 #[test]

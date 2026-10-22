@@ -1,6 +1,6 @@
 [package]
 name = "pushbullet-notification"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Pushbullet notification plugin"
@@ -16,7 +16,9 @@ catalog_versions = ["v3"]
 # all, so the floor is load-bearing, not advisory. Scryer 0.21.11 is the
 # first release that sends the `title_moved` event this version handles, and
 # the first to bundle scryer-plugin-sdk 3.12, which the descriptor requires.
-min_scryer_version = "0.21.11"
+# Scryer 0.21.21 is the first release that decodes the open error codes
+# (`invalid_api_key`, `endpoint_not_found`, ...) this version sends.
+min_scryer_version = "0.21.21"
 docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/notifications/pushbullet"
 source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/notifications/pushbullet"
 
@@ -27,7 +29,7 @@ crate-type = ["cdylib"]
 notify-common = { path = "../notify-common" }
 serde_json = "1"
 scryer-plugin-pdk = "0.8.0"
-scryer-plugin-sdk = "3.12.0"
+scryer-plugin-sdk = "3.18.0"
 wit-bindgen = "0.61"
 
 [dev-dependencies]

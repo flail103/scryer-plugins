@@ -131,6 +131,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(NotificationDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec![],
@@ -499,6 +500,7 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<String> {
         | NotificationEventType::ListTitleLeft
         | NotificationEventType::ListSyncFailed
         | NotificationEventType::ListUnfollowed
+        | NotificationEventType::FileRestored
         | NotificationEventType::Test => {}
     }
     lines
@@ -1022,9 +1024,11 @@ struct Reply {
     body: Vec<u8>,
 }
 
-type Transport<'a> = dyn FnMut(&Outbound) -> Result<Reply, String> + 'a;
+/// A request that got no HTTP answer carries the typed error the PDK reads
+/// from the host's transport detail (TLS, timeout, unreachable).
+type Transport<'a> = dyn FnMut(&Outbound) -> Result<Reply, PluginError> + 'a;
 
-fn host_transport(outbound: &Outbound) -> Result<Reply, String> {
+fn host_transport(outbound: &Outbound) -> Result<Reply, PluginError> {
     let mut request = HttpRequest::new(outbound.url.clone()).with_method(outbound.method);
     for (name, value) in &outbound.headers {
         request = request.with_header(*name, value.clone());
@@ -1035,8 +1039,16 @@ fn host_transport(outbound: &Outbound) -> Result<Reply, String> {
             headers: response.headers().clone(),
             body: response.body(),
         }),
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(request_failure(&error)),
     }
+}
+
+/// The host-log text of a transport failure, for the per-target delivery lane.
+fn transport_detail(error: &PluginError) -> &str {
+    error
+        .debug_message
+        .as_deref()
+        .unwrap_or(&error.public_message)
 }
 
 fn now_unix() -> Option<i64> {
@@ -1122,9 +1134,9 @@ impl ApiError {
 
 fn quota_error(detail: &str) -> PluginError {
     plugin_error(
-        PluginErrorCode::RateLimited,
+        codes::QUOTA_EXCEEDED,
         format!(
-            "Pushbullet refused the push because it needs Pushbullet Pro. For a note or link push that is the free monthly push limit: accounts without Pro may send {FREE_MONTHLY_PUSHES} pushes a month, and pushes work again when the limit resets or the account is upgraded ({detail})"
+            "Pushbullet refused the push because it needs Pushbullet Pro: accounts without Pro may send {FREE_MONTHLY_PUSHES} note or link pushes a month, and this monthly push limit is used up until it resets or the account is upgraded"
         ),
         Some(format!("{QUOTA_ERROR_CODE}: {detail}")),
     )
@@ -1132,11 +1144,10 @@ fn quota_error(detail: &str) -> PluginError {
 
 fn token_rejected(detail: &str) -> PluginError {
     plugin_error(
-        PluginErrorCode::AuthFailed,
-        format!(
-            "api_key was rejected by Pushbullet ({detail}). Create a new access token at {TOKEN_SETTINGS_URL}."
-        ),
-        None,
+        codes::INVALID_API_KEY,
+        "api_key was rejected by Pushbullet; create a new access token in the Pushbullet account settings"
+            .to_string(),
+        Some(detail.to_string()),
     )
 }
 
@@ -1151,23 +1162,41 @@ enum Outcome {
         iden: Option<String>,
         headers: BTreeMap<String, String>,
     },
-    /// A retryable delivery failure for this target only.
+    /// A retryable delivery failure for this target only. `error` is what a
+    /// single-target send reports on the typed lane.
     Failed {
         status: String,
         message: String,
         retry_after: Option<i64>,
+        error: PluginError,
     },
     /// This target's setting is wrong; the others may still be fine.
     Misconfigured(PluginError),
     /// Wrong for every target (token, quota, sender): stop sending.
     Fatal(PluginError),
     /// A delivery failure that would repeat for every target (429, host
-    /// unreachable): stop sending.
+    /// unreachable): stop sending. `error` is what a single-target send
+    /// reports on the typed lane.
     Halt {
         status: String,
         message: String,
         retry_after: Option<i64>,
+        error: PluginError,
     },
+}
+
+/// A typed error carrying the service's requested delay, if any.
+fn with_retry_after(error: PluginError, retry_after: Option<i64>) -> PluginError {
+    let builder = scryer_plugin_pdk::plugin_error(error.code, error.public_message);
+    let builder = match error.debug_message {
+        Some(debug) => builder.debug(debug),
+        None => builder,
+    };
+    match retry_after {
+        Some(seconds) => builder.retry_after_seconds(seconds),
+        None => builder,
+    }
+    .build()
 }
 
 fn classify_push(target: &Target, reply: &Reply, now: Option<i64>) -> Outcome {
@@ -1202,28 +1231,49 @@ fn classify_push(target: &Target, reply: &Reply, now: Option<i64>) -> Outcome {
             Target::Channel(tag) => Outcome::Misconfigured(plugin_error(
                 PluginErrorCode::InvalidConfig,
                 format!(
-                    "channel_tags: Pushbullet refused channel {tag:?} ({detail}). The channel must exist and be owned by the account this access token belongs to."
+                    "channel_tags: Pushbullet refused channel {tag:?}. The channel must exist and be owned by the account this access token belongs to."
                 ),
-                None,
+                Some(format!("HTTP {status}: {detail}")),
             )),
             _ => Outcome::Fatal(plugin_error(
-                PluginErrorCode::AuthFailed,
-                format!(
-                    "api_key is not allowed to create this push ({detail}). Check the access token at {TOKEN_SETTINGS_URL}."
-                ),
-                None,
+                codes::INVALID_API_KEY,
+                "api_key is not allowed to create this push; check the access token in the Pushbullet account settings"
+                    .to_string(),
+                Some(format!("HTTP {status}: {detail}")),
             )),
         },
-        429 => Outcome::Halt {
-            status: "http_429".to_string(),
-            message: format!("Pushbullet rate limit reached: {detail}"),
-            retry_after: retry_after(&reply.headers, now),
-        },
-        500..=599 => Outcome::Failed {
-            status: format!("http_{status}"),
-            message: format!("HTTP {status}: {detail}"),
-            retry_after: retry_after_header(&reply.headers),
-        },
+        429 => {
+            let retry_after = retry_after(&reply.headers, now);
+            Outcome::Halt {
+                status: "http_429".to_string(),
+                message: format!("Pushbullet rate limit reached: {detail}"),
+                retry_after,
+                error: with_retry_after(
+                    plugin_error(
+                        PluginErrorCode::RateLimited,
+                        "Pushbullet is rate limiting requests".to_string(),
+                        Some(format!("HTTP {status}: {detail}")),
+                    ),
+                    retry_after,
+                ),
+            }
+        }
+        500..=599 => {
+            let retry_after = retry_after_header(&reply.headers);
+            Outcome::Failed {
+                status: format!("http_{status}"),
+                message: format!("HTTP {status}: {detail}"),
+                retry_after,
+                error: with_retry_after(
+                    plugin_error(
+                        PluginErrorCode::UpstreamUnavailable,
+                        "Pushbullet answered with a server error".to_string(),
+                        Some(format!("HTTP {status}: {detail}")),
+                    ),
+                    retry_after,
+                ),
+            }
+        }
         _ => classify_rejection(target, status, &answer, &detail),
     }
 }
@@ -1234,10 +1284,9 @@ fn classify_rejection(target: &Target, status: u16, answer: &ApiError, detail: &
     if answer.mentions("source_device_iden") {
         return Outcome::Fatal(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "sender_id was rejected by Pushbullet ({detail}). Use a device iden from this account, or leave it empty."
-            ),
-            None,
+            "sender_id was rejected by Pushbullet. Use a device iden from this account, or leave it empty."
+                .to_string(),
+            Some(format!("HTTP {status}: {detail}")),
         ));
     }
 
@@ -1265,15 +1314,15 @@ fn classify_rejection(target: &Target, status: u16, answer: &ApiError, detail: &
     if let Some((setting, value, hint)) = rejected {
         return Outcome::Misconfigured(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!("{setting}: Pushbullet rejected {value:?} ({detail}). {hint}"),
-            Some(format!("HTTP {status}")),
+            format!("{setting}: Pushbullet rejected {value:?}. {hint}"),
+            Some(format!("HTTP {status}: {detail}")),
         ));
     }
 
     Outcome::Misconfigured(plugin_error(
         PluginErrorCode::Permanent,
-        format!("Pushbullet rejected the push this plugin built (HTTP {status}): {detail}"),
-        None,
+        "Pushbullet rejected the push this plugin built".to_string(),
+        Some(format!("HTTP {status}: {detail}")),
     ))
 }
 
@@ -1315,16 +1364,8 @@ fn header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a s
         .map(|(_, value)| value.trim())
 }
 
-fn code_status(code: PluginErrorCode) -> &'static str {
-    match code {
-        PluginErrorCode::InvalidConfig => "invalid_config",
-        PluginErrorCode::AuthFailed => "auth_failed",
-        PluginErrorCode::RateLimited => "rate_limited",
-        PluginErrorCode::UpstreamUnavailable => "upstream_unavailable",
-        PluginErrorCode::Unsupported => "unsupported",
-        PluginErrorCode::Temporary => "temporary",
-        PluginErrorCode::Permanent => "permanent",
-    }
+fn code_status(code: &PluginErrorCode) -> &str {
+    code.as_str()
 }
 
 fn target_result(
@@ -1372,6 +1413,9 @@ fn deliver(
     let mut retry: Option<i64> = None;
     let mut rate_warning: Option<String> = None;
     let mut stopped_at: Option<usize> = None;
+    // A single target is a single request: its delivery failure is the send's
+    // failure and goes on the typed lane with its code.
+    let mut single_failure: Option<PluginError> = None;
 
     for (index, target) in targets.iter().enumerate() {
         let outbound = Outbound::new("POST", PUSHES_URL.to_string(), &settings.access_token)
@@ -1382,15 +1426,12 @@ fn deliver(
             // send that is the provider being unreachable: a delivery failure
             // the core may retry. On a Test the operator is waiting for an
             // answer, and "Pushbullet is unreachable" is that answer.
-            Err(error) if req.is_test => Outcome::Fatal(plugin_error(
-                PluginErrorCode::UpstreamUnavailable,
-                format!("Pushbullet could not be reached: {error}"),
-                None,
-            )),
+            Err(error) if req.is_test => Outcome::Fatal(error),
             Err(error) => Outcome::Halt {
                 status: "request_failed".to_string(),
-                message: format!("request failed: {error}"),
+                message: format!("request failed: {}", transport_detail(&error)),
                 retry_after: None,
+                error,
             },
         };
 
@@ -1406,17 +1447,21 @@ fn deliver(
                 status,
                 message,
                 retry_after,
+                error,
             } => {
                 results.push(target_result(target, false, &status, Some(message.clone())));
                 failures.push(format!("{}: {message}", target.label()));
                 statuses.push(status);
                 retry = retry.max(retry_after);
+                if targets.len() == 1 {
+                    single_failure = Some(error);
+                }
             }
             Outcome::Misconfigured(error) => {
                 results.push(target_result(
                     target,
                     false,
-                    code_status(error.code),
+                    code_status(&error.code),
                     Some(error.public_message.clone()),
                 ));
                 misconfigured.push(error);
@@ -1425,7 +1470,7 @@ fn deliver(
                 results.push(target_result(
                     target,
                     false,
-                    code_status(error.code),
+                    code_status(&error.code),
                     Some(error.public_message.clone()),
                 ));
                 fatal = Some(error);
@@ -1436,15 +1481,23 @@ fn deliver(
                 status,
                 message,
                 retry_after,
+                error,
             } => {
                 results.push(target_result(target, false, &status, Some(message.clone())));
                 failures.push(format!("{}: {message}", target.label()));
                 statuses.push(status);
                 retry = retry.max(retry_after);
+                if targets.len() == 1 {
+                    single_failure = Some(error);
+                }
                 stopped_at = Some(index);
                 break;
             }
         }
+    }
+
+    if let Some(error) = single_failure {
+        return PluginResult::Err(error);
     }
 
     // Targets after a stop are reported, not silently dropped.
@@ -1468,7 +1521,7 @@ fn deliver(
         // a typed error would say nothing was.
         let mut response = error_response(
             error.public_message,
-            Some(code_status(error.code).to_string()),
+            Some(code_status(&error.code).to_string()),
         );
         response.warnings = warnings;
         response.target_results = results;
@@ -1478,19 +1531,24 @@ fn deliver(
     if delivered.is_empty() && failures.is_empty() && !misconfigured.is_empty() {
         // Nothing went out and every target was refused for its configuration:
         // that is a configuration error, not a delivery failure.
-        let first = misconfigured[0].code;
-        let code = if misconfigured.iter().all(|error| error.code == first) {
-            first
+        let first = &misconfigured[0].code;
+        let code = if misconfigured.iter().all(|error| &error.code == first) {
+            first.clone()
         } else {
             PluginErrorCode::InvalidConfig
         };
         let mut messages: Vec<String> = Vec::new();
+        let mut details: Vec<String> = Vec::new();
         for error in &misconfigured {
             if !messages.contains(&error.public_message) {
                 messages.push(error.public_message.clone());
             }
+            if let Some(detail) = &error.debug_message {
+                details.push(detail.clone());
+            }
         }
-        return PluginResult::Err(plugin_error(code, messages.join("; "), None));
+        let debug = (!details.is_empty()).then(|| details.join("; "));
+        return PluginResult::Err(plugin_error(code, messages.join("; "), debug));
     }
 
     if failures.is_empty() && misconfigured.is_empty() {
@@ -1544,10 +1602,11 @@ impl Device {
 
 #[derive(Debug)]
 enum DeviceListError {
-    Unreachable(String),
+    Unreachable(PluginError),
     Unauthorized(String),
     Quota(String),
-    Rejected(u16, String),
+    Rejected(u16, Option<i64>, String),
+    Unreadable(String),
 }
 
 /// `GET /v2/devices?active=true`, following `cursor` for up to
@@ -1573,11 +1632,11 @@ fn list_devices(
             } else if matches!(reply.status, 401 | 403) {
                 DeviceListError::Unauthorized(detail)
             } else {
-                DeviceListError::Rejected(reply.status, detail)
+                DeviceListError::Rejected(reply.status, retry_after_header(&reply.headers), detail)
             });
         }
         let body: Value = serde_json::from_slice(&reply.body).map_err(|error| {
-            DeviceListError::Rejected(reply.status, format!("unreadable device list: {error}"))
+            DeviceListError::Unreadable(format!("unreadable device list: {error}"))
         })?;
         for device in body
             .get("devices")
@@ -1642,7 +1701,14 @@ fn verify_configuration(
         Ok(listed) => listed,
         Err(DeviceListError::Unauthorized(detail)) => return Err(token_rejected(&detail)),
         Err(DeviceListError::Quota(detail)) => return Err(quota_error(&detail)),
-        Err(DeviceListError::Unreachable(detail)) | Err(DeviceListError::Rejected(_, detail)) => {
+        Err(DeviceListError::Unreachable(error)) => {
+            warnings.push(format!(
+                "could not list this account's devices to check device_ids and sender_id: {}",
+                transport_detail(&error)
+            ));
+            return Ok(());
+        }
+        Err(DeviceListError::Rejected(_, _, detail)) | Err(DeviceListError::Unreadable(detail)) => {
             warnings.push(format!(
                 "could not list this account's devices to check device_ids and sender_id: {detail}"
             ));
@@ -1728,23 +1794,20 @@ fn device_options(
             return PluginResult::Err(token_rejected(&detail));
         }
         Err(DeviceListError::Quota(detail)) => return PluginResult::Err(quota_error(&detail)),
-        Err(DeviceListError::Unreachable(detail)) => {
-            return PluginResult::Err(plugin_error(
-                PluginErrorCode::UpstreamUnavailable,
-                format!("Pushbullet could not be reached: {detail}"),
-                None,
+        Err(DeviceListError::Unreachable(error)) => return PluginResult::Err(error),
+        Err(DeviceListError::Rejected(status, retry_after, detail)) => {
+            return PluginResult::Err(http_failure(
+                status,
+                retry_after,
+                Credential::ApiKey,
+                format!("Pushbullet devices request failed (HTTP {status}): {detail}"),
             ));
         }
-        Err(DeviceListError::Rejected(status, detail)) => {
-            let code = if status == 429 || status >= 500 {
-                PluginErrorCode::Temporary
-            } else {
-                PluginErrorCode::Permanent
-            };
+        Err(DeviceListError::Unreadable(detail)) => {
             return PluginResult::Err(plugin_error(
-                code,
-                format!("Pushbullet devices request failed (HTTP {status}): {detail}"),
-                None,
+                codes::INVALID_RESPONSE,
+                "Pushbullet answered the device list with something unreadable".to_string(),
+                Some(detail),
             ));
         }
     };
@@ -1770,17 +1833,16 @@ fn device_options(
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let error = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug_message) => error.debug(debug_message),
+        None => error,
     }
+    .build()
 }
 
 /// The world's single `process` entry, dispatching the SDK's notification
