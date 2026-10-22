@@ -11,7 +11,7 @@ use scryer_plugin_pdk::component;
 use scryer_plugin_sdk::host::PluginHttpRequest;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldType, ConfigFieldValueSource, IndexerProtocol, IndexerSourceKind,
-    PluginSearchRequest, PluginSearchResponse, PluginSearchResult,
+    PluginError, PluginErrorCode, PluginSearchRequest, PluginSearchResponse, PluginSearchResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,6 +115,37 @@ pub enum Step {
         message: String,
         retryable: bool,
     },
+    /// A failure the operator has to act on — the tracker refused the login,
+    /// or the login needs a setting that is not set — carried to the component
+    /// boundary as the SDK's typed error instead of a generic one.
+    Rejected {
+        error: PluginError,
+    },
+}
+
+/// Why an engine operation did not complete.
+#[derive(Debug)]
+pub enum EngineError {
+    /// An engine, transport or definition failure. The component reports it
+    /// as its generic error, with this text as the debug detail.
+    Message(String),
+    /// A typed SDK error whose `public_message` is safe to show the operator.
+    Plugin(PluginError),
+}
+
+impl From<String> for EngineError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Plugin(error) => formatter.write_str(&error.public_message),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,7 +236,7 @@ pub fn begin(
         Operation::Search(request) => StoredOperation::Search(request),
         Operation::Grab(url) => StoredOperation::Grab(url),
     };
-    // Prowlarr's `HttpIndexerBase.Fetch` skips a search whose criteria use an id
+    // The reference Cardigann engine skips a search whose criteria use an id
     // the definition's `caps.modes` does not list. Without that gate an id-only
     // strategy renders an empty keyword search on every definition that cannot
     // read the id, and the tracker's front page comes back as results.
@@ -246,7 +277,7 @@ pub async fn search_with_host<H: EngineHost>(
     definition: Definition,
     request: PluginSearchRequest,
     config: BTreeMap<String, String>,
-) -> Result<PluginSearchResponse, String> {
+) -> Result<PluginSearchResponse, EngineError> {
     let output = drive_operation(
         host,
         definition,
@@ -255,8 +286,9 @@ pub async fn search_with_host<H: EngineHost>(
         false,
     )
     .await?;
-    serde_json::from_value(output)
-        .map_err(|error| format!("search produced an invalid response: {error}"))
+    serde_json::from_value(output).map_err(|error| {
+        EngineError::Message(format!("search produced an invalid response: {error}"))
+    })
 }
 
 pub async fn action_with_host<H: EngineHost>(
@@ -264,7 +296,7 @@ pub async fn action_with_host<H: EngineHost>(
     definition: Definition,
     action: EngineAction,
     config: BTreeMap<String, String>,
-) -> Result<Value, String> {
+) -> Result<Value, EngineError> {
     let wants_captcha = matches!(action, EngineAction::CheckCaptcha);
     let operation = match action {
         EngineAction::CheckCaptcha => Operation::TestConnection,
@@ -277,7 +309,7 @@ pub async fn search(
     definition: Definition,
     request: PluginSearchRequest,
     config: BTreeMap<String, String>,
-) -> Result<PluginSearchResponse, String> {
+) -> Result<PluginSearchResponse, EngineError> {
     let mut host = ComponentEngineHost;
     search_with_host(&mut host, definition, request, config).await
 }
@@ -286,7 +318,7 @@ pub async fn action(
     definition: Definition,
     action: EngineAction,
     config: BTreeMap<String, String>,
-) -> Result<Value, String> {
+) -> Result<Value, EngineError> {
     let mut host = ComponentEngineHost;
     action_with_host(&mut host, definition, action, config).await
 }
@@ -368,7 +400,7 @@ async fn drive_operation<H: EngineHost>(
     operation: Operation,
     mut config: BTreeMap<String, String>,
     wants_captcha: bool,
-) -> Result<Value, String> {
+) -> Result<Value, EngineError> {
     let state_key = session_state_key(&definition, &config)?;
     let mut session: EngineSession = host
         .state_get(&state_key)
@@ -409,7 +441,8 @@ async fn drive_operation<H: EngineHost>(
             return Err(format!(
                 "unsupported Cardigann CAPTCHA type `{}`",
                 captcha.captcha_type
-            ));
+            )
+            .into());
         }
         config.remove("CAPTCHA");
     }
@@ -481,12 +514,13 @@ async fn drive_operation<H: EngineHost>(
                 persist_session(host, &state_key, &session).await?;
                 return Ok(output);
             }
-            Step::Failed { message, .. } => return Err(message),
+            Step::Failed { message, .. } => return Err(EngineError::Message(message)),
+            Step::Rejected { error } => return Err(EngineError::Plugin(error)),
         }
     }
-    Err(format!(
+    Err(EngineError::Message(format!(
         "Cardigann operation exceeded the {MAX_OPERATION_STEPS}-step limit"
-    ))
+    )))
 }
 
 fn session_state_key(
@@ -543,7 +577,12 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(request) = follow_redirect(&definition, &mut context, &response, true)? {
                 return need_redirect(request, Continuation::LoginLanding(context));
             }
-            require_success(&response, "login landing page")?;
+            // The landing page is the login form itself, so the definition's
+            // error blocks — which often match a link back to it — only run on
+            // the submit response.
+            if !(200..300).contains(&response.status) {
+                return Ok(login_http_failure(response.status, "login landing page"));
+            }
             submit_form_login(context, &response)
         }
         (Continuation::SimpleCaptcha(mut context), ResumeInput::Http(response)) => {
@@ -582,8 +621,9 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(request) = follow_redirect(&definition, &mut context, &response, true)? {
                 return need_redirect(request, Continuation::LoginSubmit(context));
             }
-            require_success(&response, "login")?;
-            check_login_errors(&definition, &response)?;
+            if let Some(step) = login_failure(&definition, &context, &response)? {
+                return Ok(step);
+            }
             continue_operation(&definition, context)
         }
         (Continuation::CaptchaImage(mut context), ResumeInput::Http(response)) => {
@@ -1067,8 +1107,8 @@ fn submit_form_login(mut context: Context, response: &PluginHttpResponse) -> Res
 /// Start the operation the caller asked for.
 ///
 /// The definition's `ratio:` block is deliberately not consulted. In Cardigann
-/// it is a Jackett-era display of the operator's own account ratio, and Prowlarr
-/// parses it without ever evaluating it. Fetching it cost one extra
+/// it is a Jackett-era display of the operator's own account ratio, and the
+/// reference engine parses it without ever evaluating it. Fetching it cost one extra
 /// authenticated request before every search and grab on 328 definitions and
 /// stamped a fabricated `minimum_seed_ratio` onto every release.
 fn continue_operation(definition: &Definition, context: Context) -> Result<Step, String> {
@@ -1431,7 +1471,7 @@ fn complete_grab_response(context: &Context, response: PluginHttpResponse) -> Re
             "torrent response exceeded the {MAX_TORRENT_BYTES}-byte runtime limit"
         ));
     }
-    // Prowlarr rejects an HTML-typed download outright: it is a login wall, a
+    // An HTML-typed download is rejected outright: it is a login wall, a
     // rate-limit notice or an interstitial, never a torrent. A tracker that
     // mislabels a real bencoded body is still believed.
     let html_typed = response.headers.iter().any(|(name, value)| {
@@ -1711,9 +1751,8 @@ fn search_variables(
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
         ),
-        // Prowlarr binds `.Query.IMDBID` to the `tt`-prefixed, seven-digit form
-        // and `.Query.IMDBIDShort` to the bare id, whichever spelling reached
-        // it. 238 definitions read one of the two.
+        // `.Query.IMDBID` is the `tt`-prefixed, seven-digit form and
+        // `.Query.IMDBIDShort` the bare id, whichever spelling reached us. 238 definitions read one of the two.
         ("IMDBID", full_imdb_id(&imdb)),
         ("IMDBIDShort", short_imdb_id(&imdb)),
         ("TMDBID", id(&["tmdb_id", "tmdb", "tmdbid"])),
@@ -1825,7 +1864,7 @@ fn caps_mode_parameters(definition: &Definition, mode: &str) -> Vec<String> {
 ///
 /// An id-only search (no keywords) against a definition whose `caps.modes` lists
 /// none of the supplied ids renders an empty keyword search and returns the
-/// tracker's front page, so Prowlarr skips it outright. A request that also
+/// tracker's front page, so it is skipped outright. A request that also
 /// carries keywords still scopes the search, so it proceeds either way.
 fn id_search_is_supported(definition: &Definition, request: &PluginSearchRequest) -> bool {
     if !request.query.trim().is_empty() {
@@ -1862,7 +1901,7 @@ fn imdb_digits(value: &str) -> String {
         .collect()
 }
 
-/// Prowlarr's `FullImdbId`: `tt` plus the id padded to seven digits.
+/// The full IMDb id: `tt` plus the id padded to seven digits.
 fn full_imdb_id(value: &str) -> String {
     let digits = imdb_digits(value);
     if digits.is_empty() || digits.chars().all(|digit| digit == '0') {
@@ -1928,8 +1967,8 @@ fn map_categories(definition: &Definition, request: &PluginSearchRequest) -> Vec
     if mapped.is_empty() {
         mapped = defaults;
     }
-    // Prowlarr's `MapTorznabCapsToTrackers` keeps the definition's mapping order
-    // and only de-duplicates, which is the order `{{ range .Categories }}`
+    // The reference engine keeps the definition's mapping order and only
+    // de-duplicates, which is the order `{{ range .Categories }}`
     // renders. Sorting reordered every multi-category request.
     let mut seen = BTreeSet::new();
     mapped.retain(|id| seen.insert(id.clone()));
@@ -1940,7 +1979,7 @@ fn map_categories(definition: &Definition, request: &PluginSearchRequest) -> Vec
 ///
 /// A request category may be a torznab id (`5040`), a standard name (`TV/HD`) or
 /// a bare parent name (`Movies`). A parent matches the parent itself and every
-/// child under it — Prowlarr expands a parent id to its whole subtree — while a
+/// child under it — a parent id expands to its whole subtree — while a
 /// child matches only its own name.
 fn category_matches(requested: &[String], category: &str) -> bool {
     requested.iter().any(|requested| {
@@ -1956,8 +1995,8 @@ fn category_matches(requested: &[String], category: &str) -> bool {
     })
 }
 
-/// The standard newznab category tree Prowlarr routes request categories
-/// through (`NewznabStandardCategory`). Custom (`>= 100000`) categories are a
+/// The standard newznab category tree request categories are routed
+/// through. Custom (`>= 100000`) categories are a
 /// per-indexer construct the engine does not synthesize.
 const STANDARD_CATEGORIES: &[(&str, &str)] = &[
     ("1000", "Console"),
@@ -2077,8 +2116,8 @@ fn merge_response_cookies(
 
 /// The attribute names a `Cookie` header may not be carrying as a cookie.
 ///
-/// Prowlarr's `CookieUtil.FilterProps`, minus its `DISCORD` typo for the
-/// RFC 2965 `Discard` attribute, which is what the list means.
+/// The reference engine's attribute list, with the RFC 2965 `Discard`
+/// attribute spelled correctly.
 const COOKIE_ATTRIBUTE_NAMES: [&str; 12] = [
     "COMMENT",
     "COMMENTURL",
@@ -2095,7 +2134,7 @@ const COOKIE_ATTRIBUTE_NAMES: [&str; 12] = [
 ];
 
 /// Every cookie in a `Cookie`-header value (`uid=1; pass=abc; …`), the way
-/// Prowlarr's `CookieUtil.CookieHeaderToDictionary` reads one.
+/// the reference engine reads one.
 ///
 /// This is not [`merge_cookie_header`]: a `Set-Cookie` field carries one cookie
 /// followed by its attributes, while the operator's `cookie` setting and a
@@ -2204,9 +2243,9 @@ fn login_headers(
 }
 
 /// The header templates every login request renders: the login block's own
-/// `headers:` when it has the key, otherwise the search headers. Prowlarr's
-/// `Login?.Headers ?? Search?.Headers` is why an API tracker whose only
-/// `Authorization` header sits under `search:` still authenticates its login.
+/// `headers:` when it has the key, otherwise the search headers. That fallback
+/// is why an API tracker whose only `Authorization` header sits under
+/// `search:` still authenticates its login.
 fn login_header_templates(definition: &Definition) -> &ScalarMap {
     definition
         .login
@@ -2402,8 +2441,8 @@ fn need_http(
 /// Whether two hosts belong to the same registrable site, the way a cookie
 /// container with a `Domain=.tracker.example` attribute treats them.
 ///
-/// Prowlarr keeps one `CookieContainer` per indexer and sends a domain cookie to
-/// every host under it, so a tracker whose download or API endpoint lives on a
+/// The reference engine keeps one cookie jar per indexer and sends a domain
+/// cookie to every host under it, so a tracker whose download or API endpoint lives on a
 /// sibling subdomain keeps its session. Same-origin stripping lost it.
 fn same_site_host(base_host: &str, target_host: &str) -> bool {
     let base = base_host.to_ascii_lowercase();
@@ -2547,7 +2586,7 @@ fn retry_login_if_needed(
         return Ok(None);
     }
 
-    // Prowlarr's `CheckIfLoginIsNeeded`: any redirect that was not followed, any
+    // Login is needed again on any redirect that was not followed, any
     // HTTP error status, or an HTML body missing the login test selector. A 3xx
     // can only reach here unfollowed — `follow_redirect` returns a fresh request
     // when redirects are enabled for this request — so the status test is the
@@ -2843,20 +2882,120 @@ fn parse_selector(selector: &str) -> Result<CardigannSelector, String> {
         .map_err(|error| format!("invalid CSS selector `{selector}`: {error:?}"))
 }
 
-fn check_login_errors(
+/// The definition's error check for a login response.
+///
+/// A non-2xx response still reaches the definition's `error:` blocks. They run first
+/// here for every status, which keeps the definition's own explanation of a
+/// rejected login whatever status the tracker answered it with. A non-2xx
+/// response no block explains is reported as the HTTP failure it is.
+fn login_failure(
     definition: &Definition,
+    context: &Context,
     response: &PluginHttpResponse,
-) -> Result<(), String> {
-    let Some(login) = definition.login.as_ref() else {
-        return Ok(());
+) -> Result<Option<Step>, String> {
+    if let Some(login) = definition.login.as_ref()
+        && let Some(message) = error_block_message(
+            definition,
+            &login.error,
+            response,
+            &context.variables,
+            "login",
+        )?
+    {
+        let message = mask_credentials(context, &message);
+        return Ok(Some(rejected(
+            PluginErrorCode::AuthFailed,
+            format!("Tracker login failed: {}", public_text(&message)),
+            format!(
+                "Cardigann login returned HTTP {} and matched the definition's error block: {}",
+                response.status,
+                message.trim()
+            ),
+        )));
+    }
+    if !(200..300).contains(&response.status) {
+        return Ok(Some(login_http_failure(response.status, "login")));
+    }
+    Ok(None)
+}
+
+/// A login request the tracker answered with an HTTP error and nothing the
+/// definition explains.
+fn login_http_failure(status: u16, phase: &str) -> Step {
+    let (code, public_message) = match status {
+        401 | 403 => (
+            PluginErrorCode::AuthFailed,
+            format!("Tracker login was rejected (HTTP {status}). Check the indexer's credentials."),
+        ),
+        408 | 429 => (
+            PluginErrorCode::Temporary,
+            format!("Tracker login was temporarily refused (HTTP {status}). Try again later."),
+        ),
+        _ => (
+            PluginErrorCode::UpstreamUnavailable,
+            format!("Tracker login failed: the tracker returned HTTP {status}."),
+        ),
     };
-    check_error_blocks(
-        definition,
-        &login.error,
-        response,
-        &Variables::new(),
-        "login",
+    rejected(
+        code,
+        public_message,
+        format!("Cardigann {phase} returned HTTP {status}"),
     )
+}
+
+fn rejected(code: PluginErrorCode, public_message: String, debug_message: String) -> Step {
+    Step::Rejected {
+        error: PluginError {
+            code,
+            public_message,
+            debug_message: Some(debug_message),
+            retry_after_seconds: None,
+            details: None,
+        },
+    }
+}
+
+/// Upper bound on tracker-supplied text in an operator-facing message. An
+/// error block without a `message:` reports the matched element's text, which
+/// for a `:root:contains(…)` selector is the whole page.
+const PUBLIC_TEXT_LIMIT: usize = 200;
+
+/// Tracker or definition text with every credential-bearing setting value the
+/// operator configured masked, in case a definition's message template or the
+/// tracker's page echoes one back.
+fn mask_credentials(context: &Context, text: &str) -> String {
+    let mut text = text.to_string();
+    let mut secrets = ["username", "password", "cookie", "cardigannCaptcha"]
+        .into_iter()
+        .chain(
+            context
+                .definition
+                .settings
+                .iter()
+                .filter(|setting| matches!(setting.setting_type.as_str(), "text" | "password"))
+                .map(|setting| setting.name.as_str()),
+        )
+        .filter_map(|key| context.config.get(key))
+        .map(|value| value.trim())
+        .filter(|value| value.len() >= 4)
+        .collect::<Vec<_>>();
+    // Longest first, so a value that contains another is masked whole.
+    secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    for secret in secrets {
+        text = text.replace(secret, "[redacted]");
+    }
+    text
+}
+
+/// Masked text made fit for a `public_message`: whitespace collapsed and
+/// length bounded.
+fn public_text(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > PUBLIC_TEXT_LIMIT {
+        text.chars().take(PUBLIC_TEXT_LIMIT).collect::<String>() + "…"
+    } else {
+        text
+    }
 }
 
 fn check_error_blocks(
@@ -2866,6 +3005,20 @@ fn check_error_blocks(
     variables: &Variables,
     phase: &str,
 ) -> Result<(), String> {
+    match error_block_message(definition, errors, response, variables, phase)? {
+        Some(message) => Err(format!("tracker {phase} failed: {message}")),
+        None => Ok(()),
+    }
+}
+
+/// The message of the first `error:` block that matches the response.
+fn error_block_message(
+    definition: &Definition,
+    errors: &[crate::definition::ErrorBlock],
+    response: &PluginHttpResponse,
+    variables: &Variables,
+    phase: &str,
+) -> Result<Option<String>, String> {
     let mut document = Html::parse_document(&decode_body(definition, &response.body));
     mark_contains(&mut document, &error_needles(errors, variables));
     for error in errors {
@@ -2884,10 +3037,10 @@ fn check_error_blocks(
                     select_element_value(definition, &element, field, variables, false).ok()
                 })
                 .unwrap_or_else(|| element.text().collect::<String>().trim().to_string());
-            return Err(format!("tracker {phase} failed: {message}"));
+            return Ok(Some(message));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn select_download_value(
@@ -2957,8 +3110,8 @@ fn select_element_value(
                 );
             }
         }
-        // Prowlarr: when no case selector matches, the field is null (an error
-        // when required). Falling through to the field's own selector would
+        // When no case selector matches, the field is null (an error when
+        // required). Falling through to the field's own selector would
         // hand back the row's text instead.
         if required {
             return Err("none of the case selectors matched".to_string());
@@ -3303,8 +3456,7 @@ fn parse_markup_results(
             Ok(None)
         })();
         // A row that fails outside field parsing — a required `dateheaders`
-        // selector, say — is skipped on its own. Prowlarr does the same, and a
-        // page whose rows all fail is an empty page, never an indexer error:
+        // selector, say — is skipped on its own, and a page whose rows all fail is an empty page, never an indexer error:
         // a header row matched by `rows.selector`, a "no results" row, or a
         // Cloudflare interstitial must not turn into a failing indexer.
         if let Ok(result) = parsed {
@@ -3359,14 +3511,14 @@ fn is_id_search(variables: &Variables) -> bool {
     })
 }
 
-/// Prowlarr's `IndexerBase.FilterReleasesByQuery`, which is what `andmatch`
-/// means.
+/// The release filter `andmatch` means.
 ///
 /// The query is split on runs of non-word characters, one-character terms and
 /// the common words are dropped, and a release passes when a term appears in its
 /// title *or its description*. With more than one term two must match; with one,
 /// one. An RSS search and an id search are not filtered at all. Requiring every
-/// whitespace-separated token in the title alone dropped releases Prowlarr keeps.
+/// whitespace-separated token in the title alone dropped releases the reference
+/// engine keeps.
 fn should_keep_row(
     definition: &Definition,
     result: &PluginSearchResult,
@@ -3419,7 +3571,7 @@ fn should_keep_row(
     matches >= required
 }
 
-/// Parse one HTML row into a release, Prowlarr's way.
+/// Parse one HTML row into a release.
 ///
 /// A field that cannot be read — a selector that missed a required field, a
 /// filter that errored on the tracker's own malformed value — binds
@@ -3991,8 +4143,8 @@ fn normalize_result(definition: &Definition, result: &mut PluginSearchResult) {
     }
 }
 
-/// The tracker list Prowlarr's `MagnetLinkBuilder` puts on every magnet it
-/// synthesizes from a bare infohash. A magnet with no `tr=` entry is only
+/// The public tracker list put on every magnet synthesized from a bare
+/// infohash. A magnet with no `tr=` entry is only
 /// resolvable through DHT, which several clients do not run.
 const PUBLIC_MAGNET_TRACKERS: [&str; 20] = [
     "http://tracker.opentrackr.org:1337/announce",
@@ -4017,7 +4169,7 @@ const PUBLIC_MAGNET_TRACKERS: [&str; 20] = [
     "udp://movies.zsw.ca:6969/announce",
 ];
 
-/// Prowlarr's `MagnetLinkBuilder.BuildPublicMagnetLink`.
+/// A magnet link for a bare infohash, carrying the public tracker list.
 fn public_magnet_link(info_hash: &str, title: &str) -> String {
     let encode =
         |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
@@ -4049,7 +4201,7 @@ fn parse_i64(value: &str) -> Option<i64> {
         .ok()
 }
 
-/// Prowlarr's `ParseUtil.NormalizeNumber` for a non-integer value.
+/// Normalize a non-integer number the way the reference engine does.
 ///
 /// Everything but digits, `.` and `,` is dropped; `,` becomes `.`; and when more
 /// than one `.` survives, all but the last are removed, so the thousands
@@ -4072,11 +4224,11 @@ fn normalize_number(value: &str) -> Option<f64> {
     normalized.parse::<f64>().ok()
 }
 
-/// Prowlarr's `ParseUtil.GetBytes`.
+/// Parse a size into bytes the way the reference engine does.
 ///
 /// The unit is every letter of the value, lower-cased, with `i` removed, so
-/// `GiB`, `GIB` and `GB` are the same unit — and every unit Prowlarr names is a
-/// power of 1024, never of 1000. (Prowlarr strips the `i` before lower-casing,
+/// `GiB`, `GIB` and `GB` are the same unit — and every unit named is a power
+/// of 1024, never of 1000. (The reference engine strips the `i` before lower-casing,
 /// which reads an all-caps `GIB` as bytes; lower-casing first is the intent.)
 /// The number is read the `NormalizeNumber` way, which is what makes `1,5 GB`
 /// and `1.234,5 MB` parse.
@@ -4531,7 +4683,7 @@ search:
         assert_eq!(value(".Query.Type"), "tv-search");
 
         // The bare spellings a pasted definition may still carry keep working,
-        // and a bare id is promoted to the `tt` form Prowlarr binds.
+        // and a bare id is promoted to the `tt` form the template binds.
         let mut bare = request.clone();
         bare.ids = std::collections::HashMap::from([("imdbid".to_string(), "111161".to_string())]);
         bare.facet = Some("movie".to_string());
@@ -4726,7 +4878,7 @@ search:
         assert_eq!(results[0].title, "xml valid");
 
         // A page whose only matched row yields no title is an empty result, the
-        // way Prowlarr reports it. The previous "all HTML rows failed" error
+        // way the reference engine reports it. The previous "all HTML rows failed" error
         // turned a decorative header row, a "no results" row, or a Cloudflare
         // interstitial into a failing indexer.
         let results = parse_search_response(
@@ -4758,8 +4910,8 @@ search:
         assert!(results.is_empty());
     }
 
-    /// Prowlarr records a field error, binds `.Result.<name>` to null, and
-    /// still emits the release. Dropping the row instead is how a single
+    /// The reference engine records a field error, binds `.Result.<name>` to
+    /// null, and still emits the release. Dropping the row instead is how a single
     /// divergent filter — a date layout, a regex dialect — turned into missing
     /// releases.
     #[test]
@@ -5241,7 +5393,7 @@ search:
         assert_eq!(result.guid, result.magnet_url);
     }
 
-    /// A magnet synthesized from a bare infohash carries Prowlarr's public
+    /// A magnet synthesized from a bare infohash carries the public
     /// tracker list; without it the link only resolves through DHT.
     #[test]
     fn synthesized_magnets_carry_the_public_tracker_list() {
@@ -5437,7 +5589,7 @@ search:
     /// the number before parsing it. Treating `GB` as 1000³ understated every
     /// size by 7–10 %, and `1.234,5 GB` did not parse at all.
     #[test]
-    fn parses_sizes_the_prowlarr_way() {
+    fn parses_sizes_the_reference_way() {
         for (value, expected) in [
             ("1 GB", Some(1_073_741_824)),
             ("1.5 GiB", Some(1_610_612_736)),
@@ -5532,7 +5684,7 @@ search:
         );
     }
 
-    /// Prowlarr translates the request's torznab ids through the standard
+    /// The request's torznab ids are translated through the standard
     /// category tree: a parent id claims its whole subtree, a child id claims
     /// only its own name, and the definition's mapping order is preserved.
     #[test]
@@ -5604,11 +5756,11 @@ search:
         assert!(map_categories(&definition, &PluginSearchRequest::default()).is_empty());
     }
 
-    /// `andmatch` is Prowlarr's `FilterReleasesByQuery`: two of the query's
+    /// `andmatch` is the reference release filter: two of the query's
     /// terms have to appear in the title *or* the description, common words and
     /// one-character tokens do not count, and RSS and id searches are exempt.
     #[test]
-    fn andmatch_filters_rows_the_way_prowlarr_filters_releases() {
+    fn andmatch_filters_rows_the_way_the_reference_engine_filters_releases() {
         let definition = parse_definition(
             r#"
 id: fixture
@@ -5822,7 +5974,7 @@ search:
     }
 
     /// Cardigann's `ratio:` block is a Jackett-era display of the operator's own
-    /// account ratio; Prowlarr parses it and never evaluates it. Fetching it
+    /// account ratio; the reference engine parses it and never evaluates it. Fetching it
     /// spent an extra authenticated request before every search and grab and
     /// stamped a seeding requirement the tracker never stated onto every
     /// release.
@@ -5935,7 +6087,209 @@ search:
         );
     }
 
-    /// Prowlarr re-logs in on any unfollowed redirect and any HTTP error, not
+    /// A UNIT3D-style API definition: the API key is only a search header, and
+    /// the login block, which checks the key, declares no headers of its own.
+    fn api_definition(login: &str) -> String {
+        PUBLIC_DEFINITION
+            .replace(
+                "search:\n  paths:\n",
+                &format!(
+                    "settings:\n  - {{ name: apikey, type: text, label: API Key }}\n{login}search:\n  headers:\n    Authorization: [\"Bearer {{{{ .Config.apikey }}}}\"]\n  paths:\n"
+                ),
+            )
+            .replace("id: fixture", "id: example-api")
+    }
+
+    fn api_key_config() -> BTreeMap<String, String> {
+        BTreeMap::from([("apikey".to_string(), "synthetic-key".to_string())])
+    }
+
+    fn first_request(definition: &str) -> PluginHttpRequest {
+        let Step::NeedHttp { request, .. } = begin(
+            compiled(definition),
+            Operation::Search(Box::default()),
+            api_key_config(),
+        )
+        .unwrap() else {
+            panic!("login request expected")
+        };
+        request
+    }
+
+    /// A login block without a `headers:` key sends the search headers, so the API key reaches the
+    /// login check instead of the tracker rejecting an anonymous request.
+    #[test]
+    fn get_login_without_headers_sends_the_search_headers() {
+        let request = first_request(&api_definition(
+            "login:\n  path: api/torrents\n  method: get\n",
+        ));
+        assert_eq!(request.url, "https://tracker.example/api/torrents");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer synthetic-key")
+        );
+    }
+
+    #[test]
+    fn form_login_landing_without_headers_sends_the_search_headers() {
+        let request = first_request(&api_definition("login:\n  path: login\n  method: form\n"));
+        assert_eq!(request.url, "https://tracker.example/login");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer synthetic-key")
+        );
+    }
+
+    /// The fallback only covers an absent key: login headers the definition
+    /// does declare, even an empty map, replace the search headers.
+    #[test]
+    fn explicit_login_headers_replace_the_search_headers() {
+        let request = first_request(&api_definition(
+            "login:\n  path: api/torrents\n  method: get\n  headers:\n    Authorization: \"Bearer login-{{ .Config.apikey }}\"\n",
+        ));
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer login-synthetic-key")
+        );
+
+        let request = first_request(&api_definition(
+            "login:\n  path: api/torrents\n  method: get\n  headers: {}\n",
+        ));
+        assert!(!request.headers.contains_key("authorization"));
+    }
+
+    const API_LOGIN_WITH_ERRORS: &str = "login:\n  path: api/torrents\n  method: get\n  error:\n    - selector: a[href*=\"/login\"]\n      message:\n        text: \"The API key was not accepted by {{ .Config.sitelink }}.\"\n    - selector: :root:contains(\"Account is Banned\")\n";
+
+    /// Answer the definition's login request with `response` and return the
+    /// typed error the flow ends with.
+    fn login_rejection(definition: &str, response: PluginHttpResponse) -> PluginError {
+        let Step::NeedHttp { continuation, .. } = begin(
+            compiled(definition),
+            Operation::Search(Box::default()),
+            api_key_config(),
+        )
+        .unwrap() else {
+            panic!("login request expected")
+        };
+        match resume(&continuation, ResumeInput::Http(response)).unwrap() {
+            Step::Rejected { error } => error,
+            step => panic!("login rejection expected, got {step:?}"),
+        }
+    }
+
+    fn html_response(status: u16, body: &str) -> PluginHttpResponse {
+        PluginHttpResponse {
+            status,
+            headers: BTreeMap::from([("content-type".to_string(), "text/html".to_string())]),
+            set_cookie_headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// Login `error:` messages render with the definition's variables, so a
+    /// `{{ .Config.sitelink }}` names the configured site instead of rendering
+    /// empty, and the message reaches the operator as a typed auth failure.
+    #[test]
+    fn login_error_block_message_renders_config_variables() {
+        let error = login_rejection(
+            &api_definition(API_LOGIN_WITH_ERRORS),
+            html_response(200, "<html><a href='/login'>Sign in</a></html>"),
+        );
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            error.public_message,
+            "Tracker login failed: The API key was not accepted by https://tracker.example/."
+        );
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("HTTP 200"))
+        );
+    }
+
+    /// The definition's own explanation survives an error status; a status no block explains is
+    /// reported by what the status means.
+    #[test]
+    fn login_error_status_prefers_the_definitions_message() {
+        let definition = api_definition(API_LOGIN_WITH_ERRORS);
+        let error = login_rejection(
+            &definition,
+            html_response(403, "<html><a href='/login'>Sign in</a></html>"),
+        );
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert!(
+            error
+                .public_message
+                .starts_with("Tracker login failed: The API key was not accepted"),
+            "{}",
+            error.public_message
+        );
+
+        for (status, code) in [
+            (401, PluginErrorCode::AuthFailed),
+            (403, PluginErrorCode::AuthFailed),
+            (429, PluginErrorCode::Temporary),
+            (503, PluginErrorCode::UpstreamUnavailable),
+        ] {
+            let error = login_rejection(&definition, html_response(status, "<html></html>"));
+            assert_eq!(error.code, code, "HTTP {status}");
+            assert!(
+                error.public_message.contains(&format!("HTTP {status}")),
+                "{}",
+                error.public_message
+            );
+            assert_eq!(
+                error.debug_message.as_deref(),
+                Some(format!("Cardigann login returned HTTP {status}").as_str())
+            );
+        }
+
+        // A matching block on a successful status still rejects the login.
+        let error = login_rejection(
+            &definition,
+            html_response(200, "<html><p>Account is Banned</p></html>"),
+        );
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            error.public_message,
+            "Tracker login failed: Account is Banned"
+        );
+    }
+
+    /// The public message never carries a configured credential back out, and
+    /// a block without a `message:` cannot dump a whole page into it.
+    #[test]
+    fn login_error_public_message_masks_credentials_and_stays_short() {
+        let definition = api_definition(
+            "login:\n  path: api/torrents\n  method: get\n  error:\n    - selector: p.denied\n      message:\n        text: \"Key {{ .Config.apikey }} refused\"\n    - selector: :root:contains(\"Account is Banned\")\n",
+        );
+        let error = login_rejection(
+            &definition,
+            html_response(200, "<html><p class=denied>no</p></html>"),
+        );
+        assert_eq!(
+            error.public_message,
+            "Tracker login failed: Key [redacted] refused"
+        );
+        assert!(
+            !error
+                .debug_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("synthetic-key")
+        );
+
+        let page = format!(
+            "<html><p>Account is Banned</p>{}</html>",
+            "filler ".repeat(200)
+        );
+        let error = login_rejection(&definition, html_response(200, &page));
+        assert!(error.public_message.chars().count() <= 230);
+        assert!(error.public_message.ends_with('…'));
+    }
+
+    /// Login is redone on any unfollowed redirect and any HTTP error, not
     /// only on 401/403 or a `Location` naming the login path, and then reissues
     /// the request that provoked it.
     #[test]
@@ -6621,7 +6975,7 @@ search:
     }
 
     #[test]
-    fn raw_query_matrix_matches_prowlarr_split_then_encode_semantics() {
+    fn raw_query_matrix_matches_the_reference_split_then_encode_semantics() {
         let definition = parse_definition(PUBLIC_DEFINITION).unwrap();
         let variables = BTreeMap::from([(
             ".Keywords".to_string(),
@@ -6758,7 +7112,7 @@ search:
 
     /// A tracker whose download endpoint lives on a sibling subdomain shares the
     /// session cookie with its base host, exactly as a `Domain=` cookie does in
-    /// Prowlarr's cookie container. Same-origin stripping lost it on every one.
+    /// the reference engine's cookie jar. Same-origin stripping lost it on every one.
     #[test]
     fn attaches_cookies_across_the_configured_site_but_never_beyond_it() {
         assert!(same_site_host("tracker.example", "dl.tracker.example"));
@@ -6882,77 +7236,5 @@ search:
             panic!()
         };
         assert_eq!(request.url, "https://tracker.example/health");
-    }
-
-    /// A UNIT3D-style API definition: the API key is only a search header, and
-    /// the login block, which checks the key, declares no headers of its own.
-    fn api_definition(login: &str) -> String {
-        PUBLIC_DEFINITION
-            .replace(
-                "search:\n  paths:\n",
-                &format!(
-                    "settings:\n  - {{ name: apikey, type: text, label: API Key }}\n{login}search:\n  headers:\n    Authorization: [\"Bearer {{{{ .Config.apikey }}}}\"]\n  paths:\n"
-                ),
-            )
-            .replace("id: fixture", "id: example-api")
-    }
-
-    fn api_key_config() -> BTreeMap<String, String> {
-        BTreeMap::from([("apikey".to_string(), "synthetic-key".to_string())])
-    }
-
-    fn first_request(definition: &str) -> PluginHttpRequest {
-        let Step::NeedHttp { request, .. } = begin(
-            compiled(definition),
-            Operation::Search(Box::default()),
-            api_key_config(),
-        )
-        .unwrap() else {
-            panic!("login request expected")
-        };
-        request
-    }
-
-    /// Prowlarr's `Login?.Headers ?? Search?.Headers`: a login block without a
-    /// `headers:` key sends the search headers, so the API key reaches the
-    /// login check instead of the tracker rejecting an anonymous request.
-    #[test]
-    fn get_login_without_headers_sends_the_search_headers() {
-        let request = first_request(&api_definition(
-            "login:\n  path: api/torrents\n  method: get\n",
-        ));
-        assert_eq!(request.url, "https://tracker.example/api/torrents");
-        assert_eq!(
-            request.headers.get("authorization").map(String::as_str),
-            Some("Bearer synthetic-key")
-        );
-    }
-
-    #[test]
-    fn form_login_landing_without_headers_sends_the_search_headers() {
-        let request = first_request(&api_definition("login:\n  path: login\n  method: form\n"));
-        assert_eq!(request.url, "https://tracker.example/login");
-        assert_eq!(
-            request.headers.get("authorization").map(String::as_str),
-            Some("Bearer synthetic-key")
-        );
-    }
-
-    /// The fallback only covers an absent key: login headers the definition
-    /// does declare, even an empty map, replace the search headers.
-    #[test]
-    fn explicit_login_headers_replace_the_search_headers() {
-        let request = first_request(&api_definition(
-            "login:\n  path: api/torrents\n  method: get\n  headers:\n    Authorization: \"Bearer login-{{ .Config.apikey }}\"\n",
-        ));
-        assert_eq!(
-            request.headers.get("authorization").map(String::as_str),
-            Some("Bearer login-synthetic-key")
-        );
-
-        let request = first_request(&api_definition(
-            "login:\n  path: api/torrents\n  method: get\n  headers: {}\n",
-        ));
-        assert!(!request.headers.contains_key("authorization"));
     }
 }

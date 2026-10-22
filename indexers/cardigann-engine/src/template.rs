@@ -290,9 +290,10 @@ fn evaluate(
         current,
     };
     let value = parser.parse_expression()?;
-    // Prowlarr evaluates logic functions with regular expressions that never
-    // balance parentheses, so a stray trailing `)` — as in the upstream 1337x
-    // definition's `(eq .Config.disablesort .False))` — is harmless there.
+    // The reference Cardigann engine evaluates logic functions with regular
+    // expressions that never balance parentheses, so a stray trailing `)` — as
+    // in the upstream 1337x definition's `(eq .Config.disablesort .False))` —
+    // is harmless there.
     // Accept it the same way instead of failing the whole search.
     while tokens.get(parser.cursor).is_some_and(|token| token == ")") {
         parser.cursor += 1;
@@ -541,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stray_closing_parenthesis_is_ignored_like_prowlarr_does() {
+    fn a_stray_closing_parenthesis_is_ignored_like_the_reference_engine_does() {
         let mut variables = variables();
         variables.insert(".Keywords".to_string(), Value::String("synthetic".into()));
         variables.insert(".Config.disablesort".to_string(), Value::Null);

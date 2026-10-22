@@ -194,9 +194,8 @@ pub struct LoginBlock {
     #[serde(default)]
     pub cookies: Vec<String>,
     /// `None` when the block has no `headers:` key. The login requests then
-    /// carry the search headers, as Prowlarr's
-    /// `Login?.Headers ?? Search?.Headers` does; an explicit map, even an
-    /// empty one, replaces them.
+    /// carry the search headers, as the reference Cardigann engine does; an
+    /// explicit map, even an empty one, replaces them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<ScalarMap>,
     #[serde(default)]
