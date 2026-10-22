@@ -7,7 +7,7 @@ use chrono::{DateTime, Datelike, Utc};
 use html5ever::{LocalName, QualName, ns};
 use roxmltree::{Document as XmlDocument, Node as XmlNode};
 use scraper::{ElementRef, Html, Node, Selector, StrTendril};
-use scryer_plugin_pdk::component;
+use scryer_plugin_pdk::{codes, component, plugin_error};
 use scryer_plugin_sdk::host::PluginHttpRequest;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldType, ConfigFieldValueSource, IndexerProtocol, IndexerSourceKind,
@@ -581,7 +581,11 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             // error blocks — which often match a link back to it — only run on
             // the submit response.
             if !(200..300).contains(&response.status) {
-                return Ok(login_http_failure(response.status, "login landing page"));
+                return Ok(login_http_failure(
+                    response.status,
+                    "login landing page",
+                    PluginErrorCode::AuthFailed,
+                ));
             }
             submit_form_login(context, &response)
         }
@@ -2582,7 +2586,8 @@ fn retry_login_if_needed(
     let Some(login) = definition.login.as_ref() else {
         return Ok(None);
     };
-    if context.relogin_attempts >= 1 {
+    let cookie_login = login.method.eq_ignore_ascii_case("cookie");
+    if context.relogin_attempts >= 1 && !cookie_login {
         return Ok(None);
     }
 
@@ -2613,6 +2618,23 @@ fn retry_login_if_needed(
                 })
         });
     if !(needs_login || missing_login_test) {
+        return Ok(None);
+    }
+    if context.relogin_attempts >= 1 {
+        // A cookie login has nothing to log in again with: the reissued
+        // request still carried the configured cookie, so the tracker refused
+        // that cookie. Any other status stays the search failure it was.
+        if missing_login_test || matches!(response.status, 300..=399 | 401 | 403) {
+            return Ok(Some(rejected(
+                codes::INVALID_COOKIE.into(),
+                "The tracker did not accept the configured cookie. Update the cookie setting."
+                    .to_string(),
+                format!(
+                    "Cardigann cookie login: HTTP {} still had no logged-in session after the retry",
+                    response.status
+                ),
+            )));
+        }
         return Ok(None);
     }
 
@@ -2904,7 +2926,7 @@ fn login_failure(
     {
         let message = mask_credentials(context, &message);
         return Ok(Some(rejected(
-            PluginErrorCode::AuthFailed,
+            login_rejection_code(definition, response),
             format!("Tracker login failed: {}", public_text(&message)),
             format!(
                 "Cardigann login returned HTTP {} and matched the definition's error block: {}",
@@ -2914,17 +2936,55 @@ fn login_failure(
         )));
     }
     if !(200..300).contains(&response.status) {
-        return Ok(Some(login_http_failure(response.status, "login")));
+        return Ok(Some(login_http_failure(
+            response.status,
+            "login",
+            login_rejection_code(definition, response),
+        )));
     }
     Ok(None)
 }
 
+/// The code a rejected login carries, from how the definition logs in: a
+/// login page that shows the definition's captcha again wants a captcha
+/// answer, a cookie login was refused its cookie, and a definition with
+/// username and password settings was refused that pair. Anything else, such
+/// as an API-key login, stays the generic auth failure.
+fn login_rejection_code(definition: &Definition, response: &PluginHttpResponse) -> PluginErrorCode {
+    let Some(login) = definition.login.as_ref() else {
+        return PluginErrorCode::AuthFailed;
+    };
+    if let Some(captcha) = login.captcha.as_ref()
+        && let Ok(selector) = parse_selector(&captcha.selector)
+    {
+        let mut document = Html::parse_document(&decode_body(definition, &response.body));
+        mark_contains(&mut document, &selector.needles);
+        if select_matching_element(&document.root_element(), &selector).is_some() {
+            return codes::CAPTCHA_REQUIRED.into();
+        }
+    }
+    if login.method.eq_ignore_ascii_case("cookie") {
+        return codes::INVALID_COOKIE.into();
+    }
+    let has_setting = |name: &str| {
+        definition
+            .settings
+            .iter()
+            .any(|setting| setting.name == name)
+    };
+    if has_setting("username") && has_setting("password") {
+        return codes::INVALID_USERNAME_PASSWORD.into();
+    }
+    PluginErrorCode::AuthFailed
+}
+
 /// A login request the tracker answered with an HTTP error and nothing the
-/// definition explains.
-fn login_http_failure(status: u16, phase: &str) -> Step {
+/// definition explains. `auth_code` is what a 401 or 403 means for this
+/// request.
+fn login_http_failure(status: u16, phase: &str, auth_code: PluginErrorCode) -> Step {
     let (code, public_message) = match status {
         401 | 403 => (
-            PluginErrorCode::AuthFailed,
+            auth_code,
             format!("Tracker login was rejected (HTTP {status}). Check the indexer's credentials."),
         ),
         408 | 429 => (
@@ -2945,13 +3005,9 @@ fn login_http_failure(status: u16, phase: &str) -> Step {
 
 fn rejected(code: PluginErrorCode, public_message: String, debug_message: String) -> Step {
     Step::Rejected {
-        error: PluginError {
-            code,
-            public_message,
-            debug_message: Some(debug_message),
-            retry_after_seconds: None,
-            details: None,
-        },
+        error: plugin_error(code, public_message)
+            .debug(debug_message)
+            .build(),
     }
 }
 
@@ -4665,6 +4721,7 @@ search:
             absolute_episode: None,
             tagged_aliases: Vec::new(),
             context: None,
+            ..PluginSearchRequest::default()
         };
         let variables = search_variables(&definition, &BTreeMap::new(), &request).unwrap();
         let value = |name: &str| {
@@ -6255,6 +6312,86 @@ search:
             error.public_message,
             "Tracker login failed: Account is Banned"
         );
+    }
+
+    /// A username/password login, optionally with an image captcha.
+    fn password_login_definition(captcha: &str) -> String {
+        PUBLIC_DEFINITION.replace(
+            "search:\n  paths:\n",
+            &format!(
+                "settings:\n  - {{ name: username, type: text, label: Username }}\n  - {{ name: password, type: password, label: Password }}\nlogin:\n  path: takelogin.php\n  method: post\n  inputs:\n    username: \"{{{{ .Config.username }}}}\"\n    password: \"{{{{ .Config.password }}}}\"\n{captcha}  error:\n    - selector: div.login-error\nsearch:\n  paths:\n"
+            ),
+        )
+    }
+
+    /// A rejected username/password login says which credential failed, and
+    /// a login page that shows the captcha again asks for the captcha instead.
+    #[test]
+    fn login_rejections_carry_the_credential_code() {
+        let definition = password_login_definition("");
+        let error = login_rejection(
+            &definition,
+            html_response(200, "<html><div class=login-error>Wrong</div></html>"),
+        );
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        let error = login_rejection(&definition, html_response(401, "<html></html>"));
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        // A status that is not a refusal keeps its own meaning.
+        let error = login_rejection(&definition, html_response(503, "<html></html>"));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+
+        let definition = password_login_definition(
+            "  captcha:\n    type: image\n    selector: img.captcha\n    input: captcha\n",
+        );
+        let error = login_rejection(
+            &definition,
+            html_response(
+                200,
+                "<html><div class=login-error>Wrong</div><img class=captcha src='/c.png'></html>",
+            ),
+        );
+        assert_eq!(error.code, PluginErrorCode::from(codes::CAPTCHA_REQUIRED));
+        let error = login_rejection(
+            &definition,
+            html_response(200, "<html><div class=login-error>Wrong</div></html>"),
+        );
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+    }
+
+    /// A cookie login whose reissued request still lands on a logged-out page
+    /// reports the cookie as refused instead of an empty search.
+    #[test]
+    fn cookie_login_rejection_carries_invalid_cookie() {
+        let definition = parse_definition(&PUBLIC_DEFINITION.replace(
+            "search:\n",
+            "login:\n  method: cookie\n  test:\n    path: index.php\n    selector: a[href*=\"logout\"]\nsearch:\n",
+        ))
+        .unwrap();
+        let logged_out = || html_response(200, "<html><a href='/login.php'>Sign in</a></html>");
+        let mut host = MockEngineHost {
+            responses: vec![logged_out(), logged_out()],
+            ..Default::default()
+        };
+        let Err(EngineError::Plugin(error)) = block_on(search_with_host(
+            &mut host,
+            definition,
+            PluginSearchRequest::default(),
+            BTreeMap::from([("cookie".to_string(), "uid=1; pass=synthetic".to_string())]),
+        )) else {
+            panic!("cookie rejection expected")
+        };
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_COOKIE));
+        assert!(!error.public_message.contains("synthetic"));
+        assert_eq!(host.requests.len(), 2);
     }
 
     /// The public message never carries a configured credential back out, and

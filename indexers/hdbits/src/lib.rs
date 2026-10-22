@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use scryer_plugin_pdk::component::{self, StartRateGate, structured_plugin_error};
+use scryer_plugin_pdk::component::{self, StartRateGate};
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
@@ -36,7 +36,7 @@ use scryer_plugin_sdk::{
     IndexerCategoryValueKind, IndexerDescriptor, IndexerFeedMode, IndexerLimitCapabilities,
     IndexerProtocol, IndexerResponseFeatures, IndexerSearchIncompleteReason, IndexerSearchInput,
     IndexerSearchInvalidResponseKind, IndexerSearchPluginError, IndexerSourceKind,
-    IndexerTorrentCapabilities, PluginDescriptor, PluginError, PluginErrorCode, PluginErrorDetails,
+    IndexerTorrentCapabilities, PluginDescriptor, PluginErrorCode, PluginErrorDetails,
     PluginRssCatchUp, PluginSearchRequest as SearchRequest, PluginSearchRequestKind,
     PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult, ProviderDescriptor,
     SDK_VERSION, derive_indexer_flags, torrent_result,
@@ -184,6 +184,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "hdbits".to_string(),
             provider_aliases: vec!["hdbits.org".to_string()],
@@ -195,6 +196,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 // `tvdb` is the only id HDBits accepts for TV and `imdb` the
                 // only one it accepts for film. Sending an IMDb id with a TV
                 // query is answered with status 9 `ImdbTvNotAllowed`, so the
@@ -255,6 +259,7 @@ fn build_descriptor() -> PluginDescriptor {
                     rate_limit_hint_seconds: Some(2),
                     api_quota_supported: false,
                     grab_quota_supported: false,
+                    paged_search: false,
                 }),
                 torrent: Some(IndexerTorrentCapabilities {
                     reports_seeders: true,
@@ -980,7 +985,7 @@ fn classify_response(
             ));
         }
         401 => {
-            return Err(auth_failed_error(format!(
+            return Err(invalid_passkey_error(format!(
                 "HDBits rejected the account credentials with HTTP 401: {}",
                 body_excerpt(body)
             )));
@@ -998,6 +1003,15 @@ fn classify_response(
             return Err(auth_failed_error(format!(
                 "HDBits refused the API call with HTTP 403: {excerpt}"
             )));
+        }
+        404 => {
+            return Err(typed_error(
+                PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND),
+                "the HDBits API endpoint was not found".to_string(),
+                format!("HDBits returned HTTP 404: {}", body_excerpt(body)),
+                None,
+                None,
+            ));
         }
         429 => {
             return Err(rate_limited_error(
@@ -1115,13 +1129,14 @@ fn typed_error(
     retry_after_seconds: Option<i64>,
     details: Option<IndexerSearchPluginError>,
 ) -> Error {
-    structured_plugin_error(PluginError {
-        code,
-        public_message,
-        debug_message: Some(debug_message),
-        retry_after_seconds,
-        details: details.map(PluginErrorDetails::IndexerSearch),
-    })
+    let mut error = plugin_error(code, public_message).debug(debug_message);
+    if let Some(seconds) = retry_after_seconds {
+        error = error.retry_after_seconds(seconds);
+    }
+    if let Some(details) = details {
+        error = error.details(PluginErrorDetails::IndexerSearch(details));
+    }
+    error.into_error()
 }
 
 /// A configuration fault. Deliberately NOT a deferred error: the host must
@@ -1136,9 +1151,20 @@ fn invalid_config_error(field: &str, detail: String) -> Error {
     )
 }
 
+/// HDBits authenticates with the account username and passkey, so a
+/// credential rejection names the passkey.
+fn invalid_passkey_error(detail: String) -> Error {
+    auth_error(PluginErrorCode::from(codes::INVALID_PASSKEY), detail)
+}
+
+/// A refusal HDBits does not attribute to the credentials.
 fn auth_failed_error(detail: String) -> Error {
+    auth_error(PluginErrorCode::AuthFailed, detail)
+}
+
+fn auth_error(code: PluginErrorCode, detail: String) -> Error {
     typed_error(
-        PluginErrorCode::AuthFailed,
+        code,
         "HDBits rejected the configured 'username' and 'api_key'".to_string(),
         detail,
         None,
@@ -1184,7 +1210,7 @@ fn deferred_error(
 
 fn invalid_response_error(kind: IndexerSearchInvalidResponseKind, detail: String) -> Error {
     typed_error(
-        PluginErrorCode::UpstreamUnavailable,
+        PluginErrorCode::from(codes::INVALID_RESPONSE),
         "HDBits returned a response Scryer could not read".to_string(),
         detail,
         None,
@@ -1219,7 +1245,7 @@ fn classify_api_status(status: i64, message: &str) -> Error {
             "username",
             format!("{detail} (both 'username' and 'api_key' must be configured)"),
         ),
-        5 => auth_failed_error(detail),
+        5 => invalid_passkey_error(detail),
         3 | 6 | 7 | 8 | 9 => typed_error(
             PluginErrorCode::Permanent,
             "HDBits rejected the search request".to_string(),
@@ -2778,7 +2804,10 @@ mod tests {
     #[test]
     fn an_unauthorised_response_reports_an_auth_failure() {
         let error = classify_response(401, &BTreeMap::new(), b"nope").unwrap_err();
-        assert_eq!(error_code(&error), PluginErrorCode::AuthFailed);
+        assert_eq!(
+            error_code(&error),
+            PluginErrorCode::from(codes::INVALID_PASSKEY)
+        );
     }
 
     #[test]
@@ -2907,7 +2936,7 @@ mod tests {
     fn a_wrong_passkey_is_a_typed_auth_failure() {
         let body = r#"{"status":5,"message":"Invalid authentication credentials"}"#;
         let error = plugin_error(&parse_response(&config(), body).unwrap_err());
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_PASSKEY));
         assert!(error.public_message.contains("api_key"));
         assert!(
             error
@@ -2924,7 +2953,7 @@ mod tests {
             (2, PluginErrorCode::InvalidConfig),
             (3, PluginErrorCode::Permanent),
             (4, PluginErrorCode::InvalidConfig),
-            (5, PluginErrorCode::AuthFailed),
+            (5, PluginErrorCode::from(codes::INVALID_PASSKEY)),
             (6, PluginErrorCode::Permanent),
             (7, PluginErrorCode::Permanent),
             (8, PluginErrorCode::Permanent),
@@ -3753,5 +3782,156 @@ mod tests {
         ] {
             assert_eq!(rfc3339_to_unix(junk), None, "{junk}");
         }
+    }
+
+    /// A host that answers every HTTP request on this thread with one canned
+    /// response, so a handler runs end to end without a network.
+    mod canned_host {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        use scryer_plugin_pdk::runtime::{
+            HostError, HostRuntime, PluginHttpFieldsResponse, PluginHttpRequest,
+            install_host_runtime,
+        };
+
+        #[derive(Default)]
+        struct Canned {
+            active: bool,
+            config: HashMap<String, String>,
+            status: u16,
+            body: String,
+            /// Monotonic time; a sleep advances it by exactly its duration.
+            now_ms: u64,
+        }
+
+        thread_local! {
+            static CANNED: RefCell<Canned> = RefCell::new(Canned::default());
+        }
+
+        struct CannedHost;
+
+        static HOST: CannedHost = CannedHost;
+
+        impl HostRuntime for CannedHost {
+            fn http_fields(
+                &self,
+                _request: PluginHttpRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<PluginHttpFieldsResponse, HostError>> + '_>>
+            {
+                Box::pin(async move {
+                    CANNED.with(|canned| {
+                        let canned = canned.borrow();
+                        if !canned.active {
+                            return Err(HostError::Transport);
+                        }
+                        Ok(PluginHttpFieldsResponse {
+                            status: canned.status,
+                            headers: Vec::new(),
+                            body: canned.body.clone().into_bytes(),
+                        })
+                    })
+                })
+            }
+
+            fn sleep(&self, duration_ms: u64) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+                CANNED.with(|canned| {
+                    let mut canned = canned.borrow_mut();
+                    canned.now_ms = canned.now_ms.saturating_add(duration_ms);
+                });
+                Box::pin(async {})
+            }
+
+            fn monotonic_now_ms(&self) -> u64 {
+                CANNED.with(|canned| canned.borrow().now_ms)
+            }
+
+            fn operation_deadline_monotonic_ms(&self) -> u64 {
+                u64::MAX
+            }
+
+            fn wall_now_ms(&self) -> u64 {
+                0
+            }
+
+            fn config_get(&self, key: &str) -> Option<String> {
+                CANNED.with(|canned| canned.borrow().config.get(key).cloned())
+            }
+
+            fn provider_profile_bytes(&self) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_get(&self, _key: &str) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_cas(
+                &self,
+                _key: &str,
+                _expected: Option<&[u8]>,
+                _replacement: Option<&[u8]>,
+            ) -> bool {
+                true
+            }
+
+            fn log(&self, _level: scryer_plugin_pdk::log::LogLevel, _message: &str) {}
+        }
+
+        /// Answer every request on this thread with `status` and `body`, and
+        /// serve `config` as the instance settings.
+        pub fn answer(config: &[(&str, &str)], status: u16, body: &str) {
+            install_host_runtime(&HOST);
+            CANNED.with(|canned| {
+                *canned.borrow_mut() = Canned {
+                    active: true,
+                    config: config
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                    status,
+                    body: body.to_string(),
+                    now_ms: 1_000_000,
+                }
+            });
+        }
+
+        /// Drive `future` to completion; the canned host never suspends.
+        pub fn run<T>(future: impl Future<Output = T>) -> T {
+            let mut future = std::pin::pin!(future);
+            match future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                Poll::Ready(output) => output,
+                Poll::Pending => panic!("the canned host never suspends"),
+            }
+        }
+    }
+
+    fn query_error(status: u16, body: &str) -> PluginError {
+        canned_host::answer(&[], status, body);
+        let error = canned_host::run(async {
+            let body = post_query(&config(), &TorrentQuery::default()).await?;
+            parse_response(&config(), &body)
+        })
+        .expect_err("the query fails");
+        scryer_plugin_pdk::error::plugin_error_from(&error)
+    }
+
+    #[test]
+    fn a_rejected_passkey_reaches_the_host_as_invalid_passkey() {
+        let error = query_error(200, r#"{"status":5,"message":"Invalid passkey"}"#);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_PASSKEY));
+        assert!(!error.public_message.contains("Invalid passkey"));
+    }
+
+    #[test]
+    fn a_missing_api_root_is_endpoint_not_found() {
+        let error = query_error(404, "");
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
     }
 }

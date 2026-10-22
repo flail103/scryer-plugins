@@ -173,6 +173,7 @@ pub fn build_indexer_descriptor(spec: DescriptorSpec) -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: spec.provider_type.to_string(),
             provider_aliases: spec.provider_aliases,
@@ -184,6 +185,7 @@ pub fn build_indexer_descriptor(spec: DescriptorSpec) -> PluginDescriptor {
             }),
             source_kind: spec.source_kind,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
                 supported_ids: spec.supported_ids,
                 deduplicates_aliases: false,
                 season_param: Some("season".to_string()),
@@ -219,6 +221,8 @@ pub fn build_indexer_descriptor(spec: DescriptorSpec) -> PluginDescriptor {
                     raw_provider_metadata: true,
                     ..IndexerResponseFeatures::default()
                 }),
+                http: None,
+                dynamic_config_fields: None,
             },
             scoring_policies: vec![],
             config_fields: spec.config_fields,
@@ -364,7 +368,13 @@ pub fn config_value(key: &str) -> Option<String> {
 }
 
 pub fn required_config(key: &str) -> Result<String, Error> {
-    config_value(key).ok_or_else(|| Error::msg(format!("{key} is not configured")))
+    config_value(key).ok_or_else(|| {
+        plugin_error(
+            PluginErrorCode::InvalidConfig,
+            format!("the {key} setting is required"),
+        )
+        .into_error()
+    })
 }
 
 pub fn config_bool(key: &str) -> bool {
@@ -394,7 +404,16 @@ pub async fn execute_rss_urls(
 
     for url in urls {
         let body = fetch_feed(provider_id, url, http_config).await?;
-        results.extend(parse_rss_feed(&body, url, options));
+        let (parsed, parse_error) = parse_rss_feed_reporting(&body, url, options);
+        if let Some(parse_error) = parse_error.filter(|_| parsed.is_empty()) {
+            return plugin_error(
+                codes::INVALID_RESPONSE,
+                "the feed answered with something that is not a readable RSS document",
+            )
+            .debug(parse_error)
+            .err();
+        }
+        results.extend(parsed);
         if results.len() >= limit {
             break;
         }
@@ -473,7 +492,9 @@ pub async fn fetch_feed(
                 "http_trace_error plugin={provider_id} method=GET attempt=1 url={logged_url} error={error}"
             ),
         );
-        Error::msg(format!("HTTP request failed: {error}"))
+        // Keep the host's error in the chain so the PDK can classify it.
+        let message = format!("HTTP request failed: {error}");
+        Error::new(error).context(message)
     })?;
     let status = response.status;
     component::log(
@@ -482,9 +503,13 @@ pub async fn fetch_feed(
             "http_trace_response plugin={provider_id} method=GET attempt=1 status={status} url={logged_url}"
         ),
     );
-    if status >= 400 {
-        return Err(Error::msg(format!("RSS feed returned HTTP {status}")));
-    }
+    let retry_after = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.as_str());
+    check_http_status(status, retry_after)
+        .map_err(|error| error.context(format!("RSS feed returned HTTP {status}")))?;
 
     Ok(String::from_utf8_lossy(&response.body).to_string())
 }
@@ -517,6 +542,16 @@ pub fn redact_url_for_log(url: &str) -> String {
 }
 
 pub fn parse_rss_feed(body: &str, feed_url: &str, options: RssParseOptions) -> Vec<SearchResult> {
+    parse_rss_feed_reporting(body, feed_url, options).0
+}
+
+/// [`parse_rss_feed`], also returning the XML error that stopped the parse
+/// early, if one did. Items read before the error are kept.
+fn parse_rss_feed_reporting(
+    body: &str,
+    feed_url: &str,
+    options: RssParseOptions,
+) -> (Vec<SearchResult>, Option<String>) {
     // Element text arrives split at every entity reference, so it is collected
     // untrimmed and trimmed once when the element closes.
     let mut reader = Reader::from_str(body);
@@ -599,7 +634,7 @@ pub fn parse_rss_feed(body: &str, feed_url: &str, options: RssParseOptions) -> V
                         options.provider_tag,
                     ),
                 );
-                break;
+                return (results, Some(error.to_string()));
             }
             _ => {}
         }
@@ -607,7 +642,7 @@ pub fn parse_rss_feed(body: &str, feed_url: &str, options: RssParseOptions) -> V
         buf.clear();
     }
 
-    results
+    (results, None)
 }
 
 fn tag_name(event: &BytesStart<'_>) -> String {
@@ -1451,5 +1486,13 @@ mod tests {
             results[0].download_url.as_deref(),
             Some("https://tracker.example/download.php?id=1&passkey=synthetic")
         );
+    }
+
+    #[test]
+    fn a_missing_required_setting_is_invalid_config() {
+        let error = required_config("feed_url").unwrap_err();
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert!(error.public_message.contains("feed_url"));
     }
 }

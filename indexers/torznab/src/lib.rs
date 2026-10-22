@@ -30,6 +30,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 supported_ids: HashMap::from([
                     ("movie".into(), vec!["imdb_id".into()]),
                     ("series".into(), vec!["tvdb_id".into()]),
@@ -614,5 +617,154 @@ mod tests {
             extra.get("minimumseedtime"),
             Some(&serde_json::Value::from(7200))
         );
+    }
+
+    /// A host that answers every HTTP request on this thread with one canned
+    /// response, so a handler runs end to end without a network.
+    mod canned_host {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        use scryer_plugin_pdk::runtime::{
+            HostError, HostRuntime, PluginHttpFieldsResponse, PluginHttpRequest,
+            install_host_runtime,
+        };
+
+        #[derive(Default)]
+        struct Canned {
+            active: bool,
+            config: HashMap<String, String>,
+            status: u16,
+            body: String,
+            /// Monotonic time; a sleep advances it by exactly its duration.
+            now_ms: u64,
+        }
+
+        thread_local! {
+            static CANNED: RefCell<Canned> = RefCell::new(Canned::default());
+        }
+
+        struct CannedHost;
+
+        static HOST: CannedHost = CannedHost;
+
+        impl HostRuntime for CannedHost {
+            fn http_fields(
+                &self,
+                _request: PluginHttpRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<PluginHttpFieldsResponse, HostError>> + '_>>
+            {
+                Box::pin(async move {
+                    CANNED.with(|canned| {
+                        let canned = canned.borrow();
+                        if !canned.active {
+                            return Err(HostError::Transport);
+                        }
+                        Ok(PluginHttpFieldsResponse {
+                            status: canned.status,
+                            headers: Vec::new(),
+                            body: canned.body.clone().into_bytes(),
+                        })
+                    })
+                })
+            }
+
+            fn sleep(&self, duration_ms: u64) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+                CANNED.with(|canned| {
+                    let mut canned = canned.borrow_mut();
+                    canned.now_ms = canned.now_ms.saturating_add(duration_ms);
+                });
+                Box::pin(async {})
+            }
+
+            fn monotonic_now_ms(&self) -> u64 {
+                CANNED.with(|canned| canned.borrow().now_ms)
+            }
+
+            fn operation_deadline_monotonic_ms(&self) -> u64 {
+                u64::MAX
+            }
+
+            fn wall_now_ms(&self) -> u64 {
+                0
+            }
+
+            fn config_get(&self, key: &str) -> Option<String> {
+                CANNED.with(|canned| canned.borrow().config.get(key).cloned())
+            }
+
+            fn provider_profile_bytes(&self) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_get(&self, _key: &str) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_cas(
+                &self,
+                _key: &str,
+                _expected: Option<&[u8]>,
+                _replacement: Option<&[u8]>,
+            ) -> bool {
+                true
+            }
+
+            fn log(&self, _level: scryer_plugin_pdk::log::LogLevel, _message: &str) {}
+        }
+
+        /// Answer every request on this thread with `status` and `body`, and
+        /// serve `config` as the instance settings.
+        pub fn answer(config: &[(&str, &str)], status: u16, body: &str) {
+            install_host_runtime(&HOST);
+            CANNED.with(|canned| {
+                *canned.borrow_mut() = Canned {
+                    active: true,
+                    config: config
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                    status,
+                    body: body.to_string(),
+                    now_ms: 1_000_000,
+                }
+            });
+        }
+
+        /// Drive `future` to completion; the canned host never suspends.
+        pub fn run<T>(future: impl Future<Output = T>) -> T {
+            let mut future = std::pin::pin!(future);
+            match future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                Poll::Ready(output) => output,
+                Poll::Pending => panic!("the canned host never suspends"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_rejected_api_key_reaches_the_host_as_invalid_api_key() {
+        canned_host::answer(
+            &[
+                ("base_url", "https://torznab.example.invalid"),
+                ("api_key", "synthetic-key"),
+            ],
+            200,
+            r#"<?xml version="1.0" encoding="UTF-8"?><error code="100" description="Invalid API Key"/>"#,
+        );
+        let request = SearchRequest {
+            query: "Synthetic Title".to_string(),
+            ..SearchRequest::default()
+        };
+
+        let error = canned_host::run(search(request)).expect_err("the key is rejected");
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+        assert!(!error.public_message.contains("Invalid API Key"));
     }
 }

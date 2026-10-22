@@ -8,14 +8,12 @@ use newznab_common::{
     PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION, SearchRequest, SearchResponse,
     SearchResult, current_sdk_constraint, hit_budget_retry_after_seconds, reserve_hit_budget_uses,
 };
-use scryer_plugin_pdk::component::{
-    self, LogLevel, StartRateGate, StreamExt, structured_plugin_error,
-};
+use scryer_plugin_pdk::component::{self, LogLevel, StartRateGate, StreamExt};
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource,
     IndexerSearchIncompleteReason, IndexerSearchInvalidResponseKind, IndexerSearchPluginError,
-    PluginError, PluginErrorCode, PluginErrorDetails,
+    PluginErrorCode, PluginErrorDetails,
 };
 use serde::Deserialize;
 use url::Url;
@@ -176,6 +174,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Usenet,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 supported_ids: HashMap::from([
                     ("series".into(), vec!["tvdb_id".into(), "anidb_id".into()]),
                     ("anime".into(), vec!["tvdb_id".into(), "anidb_id".into()]),
@@ -761,6 +762,8 @@ fn incomplete_search_error(
 ) -> Error {
     let code = if reason == IndexerSearchIncompleteReason::RateLimited {
         PluginErrorCode::RateLimited
+    } else if !completed_request && invalid_kind.is_some() {
+        PluginErrorCode::from(codes::INVALID_RESPONSE)
     } else {
         PluginErrorCode::UpstreamUnavailable
     };
@@ -780,33 +783,42 @@ fn incomplete_search_error(
             retry_after_seconds,
         }
     };
-    structured_plugin_error(PluginError {
-        code,
-        public_message: "AniNZB search did not complete".to_string(),
-        debug_message: Some("one or more AniNZB search branches did not complete".to_string()),
-        retry_after_seconds,
-        details: Some(PluginErrorDetails::IndexerSearch(details)),
-    })
+    let mut error = plugin_error(code, "AniNZB search did not complete")
+        .debug("one or more AniNZB search branches did not complete")
+        .details(PluginErrorDetails::IndexerSearch(details));
+    if let Some(seconds) = retry_after_seconds {
+        error = error.retry_after_seconds(seconds);
+    }
+    error.into_error()
 }
 
 fn parse_api_response(body: &str) -> Result<AniNzbApiResponse, Error> {
     validate_api_response_size(body.len())?;
-    serde_json::from_str(body)
-        .map_err(|error| Error::msg(format!("invalid AniNZB API response: {error}")))
+    serde_json::from_str(body).or_plugin_error(
+        codes::INVALID_RESPONSE,
+        "AniNZB returned a response that could not be read",
+    )
 }
 
 fn validate_api_response_size(response_bytes: usize) -> Result<(), Error> {
     if response_bytes > MAX_API_RESPONSE_BYTES {
-        return Err(Error::msg(format!(
+        return plugin_error(
+            codes::INVALID_RESPONSE,
+            "AniNZB returned a response that was too large",
+        )
+        .debug(format!(
             "AniNZB API response exceeded {MAX_API_RESPONSE_BYTES} bytes"
-        )));
+        ))
+        .err();
     }
     Ok(())
 }
 
 fn build_api_search_url(config: &AniNzbConfig, request: &ApiSearchQuery) -> Result<String, Error> {
-    let mut url = Url::parse(config.api_base_url)
-        .map_err(|error| Error::msg(format!("invalid fixed AniNZB API URL: {error}")))?;
+    let mut url = Url::parse(config.api_base_url).or_plugin_error(
+        PluginErrorCode::Permanent,
+        "the AniNZB search address could not be built",
+    )?;
     url.set_path("/");
     url.set_query(None);
     url.set_fragment(None);
@@ -845,8 +857,10 @@ fn build_api_size_probe_url(
     request: &ApiSearchQuery,
     order: &str,
 ) -> Result<String, Error> {
-    let mut url = Url::parse(&build_api_search_url(config, request)?)
-        .map_err(|error| Error::msg(format!("invalid AniNZB size probe URL: {error}")))?;
+    let mut url = Url::parse(&build_api_search_url(config, request)?).or_plugin_error(
+        PluginErrorCode::Permanent,
+        "the AniNZB search address could not be built",
+    )?;
     url.query_pairs_mut()
         .append_pair("sort", "size")
         .append_pair("order", order);
@@ -1544,6 +1558,53 @@ mod tests {
     fn api_response_size_is_limited_to_20_mib() {
         assert!(validate_api_response_size(MAX_API_RESPONSE_BYTES).is_ok());
         let error = validate_api_response_size(MAX_API_RESPONSE_BYTES + 1).unwrap_err();
-        assert!(error.to_string().contains("exceeded 20971520 bytes"));
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
+        assert!(
+            error
+                .debug_message
+                .is_some_and(|message| message.contains("exceeded 20971520 bytes"))
+        );
+    }
+
+    fn first_page_failure(response: PluginHttpResponse) -> PluginError {
+        let Err(failure) = parse_api_http_response(response) else {
+            panic!("the page fails");
+        };
+        let error = incomplete_search_error(
+            SearchResponse::default(),
+            failure.incomplete_reason(),
+            failure.retry_after_seconds(),
+            false,
+            failure.invalid_kind(),
+        );
+        scryer_plugin_pdk::error::plugin_error_from(&error)
+    }
+
+    #[test]
+    fn an_unreadable_first_page_is_invalid_response() {
+        let error = first_page_failure(PluginHttpResponse {
+            status: 200,
+            headers: BTreeMap::from([("Content-Type".to_string(), "text/html".to_string())]),
+            body: b"<html>synthetic</html>".to_vec(),
+        });
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
+        assert!(matches!(
+            error.details,
+            Some(PluginErrorDetails::IndexerSearch(
+                IndexerSearchPluginError::InvalidResponse { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_throttled_first_page_is_rate_limited_with_retry_after() {
+        let error = first_page_failure(PluginHttpResponse {
+            status: 429,
+            headers: BTreeMap::from([("Retry-After".to_string(), "17".to_string())]),
+            body: Vec::new(),
+        });
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(17));
     }
 }

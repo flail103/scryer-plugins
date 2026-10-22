@@ -37,7 +37,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "broadcasthe-net-indexer"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "chrono",
  "scryer-plugin-pdk",
@@ -348,7 +348,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scryer-plugin-pdk"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -361,9 +361,9 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-sdk"
-version = "3.13.0"
+version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "275348caa465390decf4fc783434d2b4fd72bfa89fb24e569ae684742cae601b"
+checksum = "a045c679044705d66fa330cc0e59ba1d12dcab84e354c6f37705efdf7444b3f2"
 dependencies = [
  "base64",
  "schemars",

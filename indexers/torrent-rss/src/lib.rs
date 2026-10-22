@@ -72,13 +72,13 @@ fn parse_title_rewrite_rules(text: &str) -> Result<Vec<TitleRewriteRule>, Error>
             continue;
         }
         let Some((pattern, replacement)) = line.split_once("=>") else {
-            return Err(Error::msg(format!(
+            return Err(rewrite_rule_error(format!(
                 "title_rewrite_rules line {}: expected `<regex> => <replacement>`",
                 index + 1
             )));
         };
         let pattern = Regex::new(pattern.trim()).map_err(|error| {
-            Error::msg(format!(
+            rewrite_rule_error(format!(
                 "title_rewrite_rules line {}: invalid regex: {error}",
                 index + 1
             ))
@@ -89,6 +89,15 @@ fn parse_title_rewrite_rules(text: &str) -> Result<Vec<TitleRewriteRule>, Error>
         });
     }
     Ok(rules)
+}
+
+fn rewrite_rule_error(detail: String) -> Error {
+    plugin_error(
+        PluginErrorCode::InvalidConfig,
+        "the title_rewrite_rules setting has a line that cannot be used",
+    )
+    .debug(detail)
+    .into_error()
 }
 
 /// Apply every rule in order. Returns the rewritten title and whether any rule
@@ -117,6 +126,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "torrent_rss".to_string(),
             provider_aliases: vec!["rss".to_string()],
@@ -128,6 +138,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 supported_ids: HashMap::new(),
                 deduplicates_aliases: false,
                 season_param: None,
@@ -190,9 +203,7 @@ fn build_descriptor() -> PluginDescriptor {
 async fn search(req: SearchRequest) -> Result<SearchResponse, Error> {
     let feed_url = read_config("feed_url")?;
     if feed_url.trim().is_empty() {
-        return Err(Error::msg(
-            "Torrent RSS feed indexer requires feed_url configuration",
-        ));
+        return Err(missing_setting_error("feed_url"));
     }
 
     let cookie = optional_config("cookie");
@@ -206,6 +217,10 @@ async fn search(req: SearchRequest) -> Result<SearchResponse, Error> {
     let rewrite_rules =
         parse_title_rewrite_rules(&optional_config("title_rewrite_rules").unwrap_or_default())?;
 
+    let credentials = Credentials {
+        cookie: cookie.is_some(),
+        username: username.is_some(),
+    };
     let body = fetch_feed(
         feed_url.trim(),
         &user_agent,
@@ -214,10 +229,26 @@ async fn search(req: SearchRequest) -> Result<SearchResponse, Error> {
         password.as_deref(),
         &additional_headers,
     )
-    .await?;
+    .await
+    .map_err(|error| match error.downcast::<HttpStatus>() {
+        Ok(HttpStatus {
+            status,
+            retry_after,
+        }) => classify_feed_status(status, retry_after.as_deref(), credentials),
+        Err(error) => error,
+    })?;
+    check_feed_body(&body, credentials)?;
 
     let limit = req.limit.clamp(1, 200);
-    let mut results = parse_rss_feed(&body, preference, &rewrite_rules);
+    let (mut results, parse_failed) = parse_rss_feed_reporting(&body, preference, &rewrite_rules);
+    if results.is_empty() && (parse_failed || !has_feed_root(&body)) {
+        return plugin_error(
+            codes::INVALID_RESPONSE,
+            "the feed returned a response that could not be read",
+        )
+        .debug("the body is not an RSS or Atom document")
+        .err();
+    }
     results = filter_results(results, &req, limit);
 
     Ok(SearchResponse {
@@ -383,7 +414,116 @@ fn config_fields() -> Vec<ConfigFieldDef> {
 }
 
 fn read_config(key: &str) -> Result<String, Error> {
-    component::config_get(key).ok_or_else(|| Error::msg(format!("missing config {key}")))
+    component::config_get(key).ok_or_else(|| missing_setting_error(key))
+}
+
+fn missing_setting_error(key: &str) -> Error {
+    plugin_error(
+        PluginErrorCode::InvalidConfig,
+        format!("the {key} setting is required"),
+    )
+    .into_error()
+}
+
+/// Which credentials the operator configured, so a refusal can name the one
+/// the feed rejected.
+#[derive(Clone, Copy, Debug, Default)]
+struct Credentials {
+    cookie: bool,
+    username: bool,
+}
+
+/// A non-success status, carried out of `fetch_feed` for classification.
+#[derive(Debug)]
+struct HttpStatus {
+    status: u16,
+    retry_after: Option<String>,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Torrent RSS feed returned HTTP {}", self.status)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+fn credential_error(credentials: Credentials, detail: String) -> Error {
+    let (code, public_message) = if credentials.cookie {
+        (
+            PluginErrorCode::from(codes::INVALID_COOKIE),
+            "the feed rejected the configured cookie",
+        )
+    } else if credentials.username {
+        (
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD),
+            "the feed rejected the configured username and password",
+        )
+    } else {
+        (
+            PluginErrorCode::AuthFailed,
+            "the feed requires credentials that are not configured",
+        )
+    };
+    plugin_error(code, public_message)
+        .debug(detail)
+        .into_error()
+}
+
+fn classify_feed_status(status: u16, retry_after: Option<&str>, credentials: Credentials) -> Error {
+    let detail = format!("Torrent RSS feed returned HTTP {status}");
+    match status {
+        401 | 403 => credential_error(credentials, detail),
+        404 => plugin_error(codes::ENDPOINT_NOT_FOUND, "the feed address was not found")
+            .debug(detail)
+            .into_error(),
+        _ => match check_http_status(status, retry_after) {
+            Err(error) => error,
+            Ok(()) => plugin_error(
+                PluginErrorCode::Temporary,
+                "the feed answered with an unexpected status",
+            )
+            .debug(detail)
+            .into_error(),
+        },
+    }
+}
+
+/// An HTML page where the feed belongs: a CAPTCHA challenge, a login wall
+/// (the configured credentials were not accepted), or something unreadable.
+fn check_feed_body(body: &str, credentials: Credentials) -> Result<(), Error> {
+    let head = body.trim_start().to_ascii_lowercase();
+    if !(head.starts_with("<!doctype html") || head.starts_with("<html")) {
+        return Ok(());
+    }
+    if head.contains("captcha")
+        || head.contains("cf-challenge")
+        || head.contains("challenge-platform")
+    {
+        return plugin_error(
+            codes::CAPTCHA_REQUIRED,
+            "the feed answered with a CAPTCHA challenge",
+        )
+        .err();
+    }
+    if head.contains("type=\"password\"") || head.contains("type='password'") {
+        return Err(credential_error(
+            credentials,
+            "the feed answered with a login page".to_string(),
+        ));
+    }
+    plugin_error(
+        codes::INVALID_RESPONSE,
+        "the feed returned a response that could not be read",
+    )
+    .debug("the feed answered with an HTML page")
+    .err()
+}
+
+/// Whether the body has an RSS or Atom root at all.
+fn has_feed_root(body: &str) -> bool {
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("<rss") || lowered.contains("<feed") || lowered.contains("<channel")
 }
 
 fn optional_config(key: &str) -> Option<String> {
@@ -472,7 +612,7 @@ async fn fetch_feed(
             logged_url,
             e
         );
-        Error::msg(format!("HTTP request failed: {e}"))
+        Error::new(e).context("Torrent RSS feed request failed")
     })?;
     let status = response.status;
     log!(
@@ -482,9 +622,14 @@ async fn fetch_feed(
         logged_url
     );
     if status >= 400 {
-        return Err(Error::msg(format!(
-            "Torrent RSS feed returned HTTP {status}"
-        )));
+        return Err(Error::new(HttpStatus {
+            status,
+            retry_after: response
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, value)| value.clone()),
+        }));
     }
 
     Ok(String::from_utf8_lossy(&response.body).to_string())
@@ -517,11 +662,22 @@ fn redact_url_for_log(url: &str) -> String {
     format!("{base}?{redacted_query}")
 }
 
+#[cfg(test)]
 fn parse_rss_feed(
     body: &str,
     preference: DownloadPreference,
     rewrite_rules: &[TitleRewriteRule],
 ) -> Vec<SearchResult> {
+    parse_rss_feed_reporting(body, preference, rewrite_rules).0
+}
+
+/// [`parse_rss_feed`], also reporting whether the XML reader stopped on an
+/// error rather than at the end of the document.
+fn parse_rss_feed_reporting(
+    body: &str,
+    preference: DownloadPreference,
+    rewrite_rules: &[TitleRewriteRule],
+) -> (Vec<SearchResult>, bool) {
     // Element text arrives split at every entity reference, so it is collected
     // untrimmed and trimmed once when the element closes.
     let mut reader = Reader::from_str(body);
@@ -532,6 +688,7 @@ fn parse_rss_feed(
     let mut in_item = false;
     let mut current_tag: Option<String> = None;
     let mut text = String::new();
+    let mut parse_failed = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -590,14 +747,17 @@ fn parse_rss_feed(
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(_) => {
+                parse_failed = true;
+                break;
+            }
             _ => {}
         }
 
         buf.clear();
     }
 
-    results
+    (results, parse_failed)
 }
 
 fn tag_name(event: &BytesStart<'_>) -> String {
@@ -1465,5 +1625,99 @@ mod tests {
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].title, "Keep.Me");
         }
+    }
+
+    fn code(error: &Error) -> PluginErrorCode {
+        scryer_plugin_pdk::error::plugin_error_from(error).code
+    }
+
+    #[test]
+    fn a_refused_feed_names_the_configured_credential() {
+        let cookie = Credentials {
+            cookie: true,
+            username: false,
+        };
+        let login = Credentials {
+            cookie: false,
+            username: true,
+        };
+        assert_eq!(
+            code(&classify_feed_status(403, None, cookie)),
+            PluginErrorCode::from(codes::INVALID_COOKIE)
+        );
+        assert_eq!(
+            code(&classify_feed_status(401, None, login)),
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        assert_eq!(
+            code(&classify_feed_status(401, None, Credentials::default())),
+            PluginErrorCode::AuthFailed
+        );
+    }
+
+    #[test]
+    fn other_statuses_carry_their_codes() {
+        let none = Credentials::default();
+        assert_eq!(
+            code(&classify_feed_status(404, None, none)),
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        let limited = scryer_plugin_pdk::error::plugin_error_from(&classify_feed_status(
+            429,
+            Some("30"),
+            none,
+        ));
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(30));
+        assert_eq!(
+            code(&classify_feed_status(502, None, none)),
+            PluginErrorCode::UpstreamUnavailable
+        );
+    }
+
+    #[test]
+    fn an_html_page_is_classified() {
+        let cookie = Credentials {
+            cookie: true,
+            username: false,
+        };
+        let login = "<html><form><input type=\"password\" name=\"password\"></form></html>";
+        assert_eq!(
+            code(&check_feed_body(login, cookie).unwrap_err()),
+            PluginErrorCode::from(codes::INVALID_COOKIE)
+        );
+        let challenge = "<!DOCTYPE html><html><div class=\"cf-challenge\"></div></html>";
+        assert_eq!(
+            code(&check_feed_body(challenge, cookie).unwrap_err()),
+            PluginErrorCode::from(codes::CAPTCHA_REQUIRED)
+        );
+        assert_eq!(
+            code(&check_feed_body("<html><body>synthetic</body></html>", cookie).unwrap_err()),
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
+        assert!(check_feed_body("<rss><channel></channel></rss>", cookie).is_ok());
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_feed_is_detected() {
+        let (results, failed) = parse_rss_feed_reporting(
+            "<rss><channel></item></channel></rss>",
+            DownloadPreference::Auto,
+            &[],
+        );
+        assert!(results.is_empty());
+        assert!(failed, "a mismatched end tag is a parse failure");
+        assert!(!has_feed_root("synthetic plain text"));
+        assert!(has_feed_root("<rss><channel></channel></rss>"));
+    }
+
+    #[test]
+    fn a_bad_rewrite_rule_is_invalid_config() {
+        let Err(error) = parse_title_rewrite_rules("no separator") else {
+            panic!("the rule is rejected");
+        };
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert!(error.public_message.contains("title_rewrite_rules"));
     }
 }
