@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesRef, Event, attributes::Attribute};
 use quick_xml::{Reader, XmlVersion};
-use scryer_plugin_pdk::component::{self, StructuredPluginError, structured_plugin_error};
+use scryer_plugin_pdk::component::{self, StructuredPluginError};
 use scryer_plugin_pdk::log::LogLevel;
 use scryer_plugin_pdk::*;
 pub use scryer_plugin_sdk::command::{PluginActionRequest, PluginActionResponse};
@@ -263,9 +263,12 @@ impl NewznabConfig {
             .finish();
 
         if base_url.is_empty() {
-            return Err(Error::msg(
-                "Newznab indexer requires base_url configuration",
-            ));
+            return plugin_error(
+                PluginErrorCode::InvalidConfig,
+                "the base_url setting is required",
+            )
+            .debug("Newznab indexer requires base_url configuration")
+            .err();
         }
 
         let page_size = configured("page_size")
@@ -322,7 +325,14 @@ fn resolved_provider_profile()
         })
         .as_ref()
         .map(Option::as_ref)
-        .map_err(|error| Error::msg(format!("invalid Newznab provider profile: {error}")))
+        .map_err(|error| {
+            plugin_error(
+                PluginErrorCode::InvalidConfig,
+                "the indexer's provider profile is not valid",
+            )
+            .debug(format_args!("invalid Newznab provider profile: {error}"))
+            .into_error()
+        })
 }
 
 fn apply_response_format(parameters: &mut BTreeMap<String, String>, allowed: &[String]) {
@@ -751,6 +761,8 @@ fn incomplete_newznab_search_error(
 ) -> Error {
     let code = if reason == IndexerSearchIncompleteReason::RateLimited {
         PluginErrorCode::RateLimited
+    } else if !completed_page && invalid_kind.is_some() {
+        PluginErrorCode::from(codes::INVALID_RESPONSE)
     } else {
         PluginErrorCode::UpstreamUnavailable
     };
@@ -770,13 +782,14 @@ fn incomplete_newznab_search_error(
             retry_after_seconds,
         }
     };
-    structured_plugin_error(PluginError {
-        code,
-        public_message: "indexer search did not complete".to_string(),
-        debug_message: Some(debug_message),
-        retry_after_seconds,
-        details: Some(PluginErrorDetails::IndexerSearch(details)),
-    })
+    let builder = plugin_error(code, "indexer search did not complete")
+        .debug(debug_message)
+        .details(PluginErrorDetails::IndexerSearch(details));
+    match retry_after_seconds {
+        Some(seconds) => builder.retry_after_seconds(seconds),
+        None => builder,
+    }
+    .into_error()
 }
 
 // ---------------------------------------------------------------------------
@@ -874,15 +887,14 @@ fn decode_page_cursor(cursor: Option<&str>) -> Result<usize, Error> {
         .strip_prefix(PAGE_CURSOR_OFFSET_PREFIX)
         .and_then(|offset| offset.parse::<usize>().ok())
         .ok_or_else(|| {
-            structured_plugin_error(PluginError {
-                code: PluginErrorCode::Permanent,
-                public_message: "indexer search page cursor is not valid".to_string(),
-                debug_message: Some(format!(
-                    "Newznab page cursor {cursor:?} was not issued by this plugin"
-                )),
-                retry_after_seconds: None,
-                details: None,
-            })
+            plugin_error(
+                PluginErrorCode::Permanent,
+                "indexer search page cursor is not valid",
+            )
+            .debug(format_args!(
+                "Newznab page cursor {cursor:?} was not issued by this plugin"
+            ))
+            .into_error()
         })
 }
 
@@ -1120,6 +1132,11 @@ async fn search_with_paging(
         }
 
         if status >= 400 {
+            if !completed_page {
+                if let Some(error) = first_page_status_error(status) {
+                    return Err(error);
+                }
+            }
             let reason = if status == 429 {
                 IndexerSearchIncompleteReason::RateLimited
             } else {
@@ -1302,6 +1319,11 @@ async fn raw_search_with_paging(
         }
 
         if status >= 400 {
+            if !completed_page {
+                if let Some(error) = first_page_status_error(status) {
+                    return Err(error);
+                }
+            }
             let reason = if status == 429 {
                 IndexerSearchIncompleteReason::RateLimited
             } else {
@@ -1580,6 +1602,11 @@ async fn execute_rss_search(
             }
 
             if status >= 400 {
+                if !completed_page {
+                    if let Some(error) = first_page_status_error(status) {
+                        return Err(error);
+                    }
+                }
                 let reason = if status == 429 {
                     IndexerSearchIncompleteReason::RateLimited
                 } else {
@@ -2702,8 +2729,14 @@ fn is_empty_response(trimmed: &str) -> bool {
 
 fn build_endpoint(base_url: &str, api_path: &str) -> Result<String, Error> {
     let trimmed_base = base_url.trim();
-    let mut parsed = Url::parse(trimmed_base)
-        .map_err(|error| Error::msg(format!("invalid base_url: {error}")))?;
+    let mut parsed = Url::parse(trimmed_base).map_err(|error| {
+        plugin_error(
+            PluginErrorCode::InvalidConfig,
+            "the base_url setting is not a valid URL",
+        )
+        .debug(format_args!("invalid base_url: {error}"))
+        .into_error()
+    })?;
     let base_path = parsed.path().trim_end_matches('/').to_string();
     let normalized_path = api_path.trim().trim_matches('/');
     let next_path = if normalized_path.is_empty() {
@@ -2867,7 +2900,9 @@ async fn polite_http_get_redacting(
                     logged_url,
                     e
                 );
-                return Err(Error::msg(format!("HTTP request failed: {e}")));
+                // Keep the host's error in the chain so the PDK can classify it.
+                let message = format!("HTTP request failed: {e}");
+                return Err(Error::new(e).context(message));
             }
         };
 
@@ -2924,26 +2959,36 @@ async fn polite_http_get_redacting(
             } else {
                 parse_error_json(&body)
             };
-            let public_message = parsed_error
-                .map(|(code, description)| {
-                    classify_and_format_error(&code, &description).to_string()
-                })
-                .unwrap_or_else(|| "Newznab upstream rate limit reached".to_string());
-            return Err(structured_plugin_error(PluginError {
-                code: PluginErrorCode::RateLimited,
-                public_message,
-                debug_message: Some(format!(
-                    "HTTP 429 after {attempt} attempt(s) and {}s total wait",
+            let quota = parsed_error
+                .as_ref()
+                .is_some_and(|(code, description)| is_quota_error(code, description));
+            let builder = if quota {
+                plugin_error(codes::QUOTA_EXCEEDED, QUOTA_EXCEEDED_MESSAGE)
+            } else {
+                plugin_error(
+                    PluginErrorCode::RateLimited,
+                    "the indexer is rate limiting requests",
+                )
+            };
+            let upstream = parsed_error
+                .map(|(code, description)| format!("; indexer error {code}: {description}"))
+                .unwrap_or_default();
+            let builder = builder
+                .debug(format_args!(
+                    "HTTP 429 after {attempt} attempt(s) and {}s total wait{upstream}",
                     total_wait.as_secs()
-                )),
-                retry_after_seconds,
-                details: Some(PluginErrorDetails::IndexerSearch(
+                ))
+                .details(PluginErrorDetails::IndexerSearch(
                     IndexerSearchPluginError::Deferred {
                         reason: IndexerSearchIncompleteReason::RateLimited,
                         retry_after_seconds,
                     },
-                )),
-            }));
+                ));
+            return Err(match retry_after_seconds {
+                Some(seconds) => builder.retry_after_seconds(seconds),
+                None => builder,
+            }
+            .into_error());
         }
 
         if let Some(delay) = rate_limit_pause_from_headers(&headers, behavior.retry_max_delay) {
@@ -3549,16 +3594,95 @@ fn url_encode(input: &str) -> String {
 // Error classification
 // ---------------------------------------------------------------------------
 
+const QUOTA_EXCEEDED_MESSAGE: &str = "the indexer's request or download limit is used up";
+
+/// Newznab 500 ("Request limit reached") and 501 ("Download limit reached"),
+/// or a description that says the same without the standard code.
+fn is_quota_error(code: &str, description: &str) -> bool {
+    let description = description.to_ascii_lowercase();
+    matches!(code.trim(), "500" | "501")
+        || description.contains("request limit")
+        || description.contains("download limit")
+        || description.contains("api limit")
+}
+
+/// The structured error for a Newznab `<error code=".." description=".."/>`
+/// answer. The upstream text only ever reaches the debug message.
 fn classify_and_format_error(code: &str, description: &str) -> Error {
-    let code_num: u32 = code.parse().unwrap_or(0);
-    let prefix = if (100..200).contains(&code_num) {
-        "Newznab API key error"
-    } else if description.to_ascii_lowercase().contains("request limit") {
-        "Newznab rate limit"
+    let code_num: u32 = code.trim().parse().unwrap_or(0);
+    let lower = description.to_ascii_lowercase();
+    let (prefix, builder) = if code_num == 101
+        || (code_num == 0 && (lower.contains("suspended") || lower.contains("disabled")))
+    {
+        (
+            "Newznab account error",
+            plugin_error(
+                codes::ACCOUNT_DISABLED,
+                "the indexer says the account is suspended or disabled",
+            ),
+        )
+    } else if code_num == 0 && lower.contains("banned") {
+        (
+            "Newznab account error",
+            plugin_error(
+                codes::ACCOUNT_BANNED,
+                "the indexer says the account is banned",
+            ),
+        )
+    } else if (100..200).contains(&code_num)
+        || (code_num == 0
+            && ((lower.contains("api key") || lower.contains("apikey"))
+                || lower.contains("user credentials")))
+    {
+        (
+            "Newznab API key error",
+            plugin_error(codes::INVALID_API_KEY, "the indexer rejected the API key"),
+        )
+    } else if is_quota_error(code, description) {
+        (
+            "Newznab rate limit",
+            plugin_error(codes::QUOTA_EXCEEDED, QUOTA_EXCEEDED_MESSAGE),
+        )
+    } else if code_num == 300 {
+        (
+            "Newznab error",
+            plugin_error(codes::ITEM_NOT_FOUND, "the indexer has no such item"),
+        )
     } else {
-        "Newznab error"
+        (
+            "Newznab error",
+            plugin_error(
+                PluginErrorCode::Temporary,
+                "the indexer answered with an error",
+            ),
+        )
     };
-    Error::msg(format!("{prefix} {code}: {description}"))
+    builder
+        .debug(format_args!("{prefix} {code}: {description}"))
+        .into_error()
+}
+
+/// The error for a non-success HTTP status on the first request of a search
+/// or connection test, before any page was read: the API key is the only
+/// credential a Newznab request carries, and a 404 means the configured URL
+/// does not serve this API. Other statuses keep their existing handling.
+fn first_page_status_error(status: u16) -> Option<Error> {
+    match status {
+        401 => Some(
+            plugin_error(codes::INVALID_API_KEY, "the indexer rejected the API key")
+                .debug(format_args!("the indexer answered HTTP {status}"))
+                .into_error(),
+        ),
+        404 => Some(
+            plugin_error(
+                codes::ENDPOINT_NOT_FOUND,
+                "the configured URL does not serve a Newznab API",
+            )
+            .debug(format_args!("the indexer answered HTTP {status}"))
+            .into_error(),
+        ),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4706,17 +4830,29 @@ fn validate_newznab_connection_feed(
         return Err(classify_and_format_error(&code, &description));
     }
     if status >= 400 {
-        return Err(Error::msg(format!(
-            "Newznab connection feed returned HTTP {status}"
-        )));
+        if let Some(error) = first_page_status_error(status) {
+            return Err(error);
+        }
+        check_http_status(status, None)
+            .map_err(|error| error.context("Newznab connection feed failed"))?;
     }
 
     let (results, _, _) = parse_newznab_feed(body, is_xml, page_size, extract_base_metadata)
-        .map_err(|failure| Error::msg(failure.message))?;
+        .map_err(|failure| {
+            plugin_error(
+                codes::INVALID_RESPONSE,
+                "the indexer answered with a feed that could not be read",
+            )
+            .debug(failure.message)
+            .into_error()
+        })?;
     if results.is_empty() {
-        return Err(Error::msg(
-            "Newznab connection feed was valid but returned no results",
-        ));
+        return plugin_error(
+            PluginErrorCode::Temporary,
+            "the indexer returned no results for the connection test",
+        )
+        .debug("Newznab connection feed was valid but returned no results")
+        .err();
     }
     Ok(())
 }
@@ -6490,25 +6626,128 @@ mod tests {
 
     // ── classify_and_format_error ────────────────────────────────────────
 
+    fn structured(error: &Error) -> &PluginError {
+        error
+            .downcast_ref::<StructuredPluginError>()
+            .expect("structured plugin error")
+            .plugin_error()
+    }
+
     #[test]
     fn error_api_key_range() {
-        let err = classify_and_format_error("100", "Invalid API key");
-        let msg = format!("{err}");
-        assert!(msg.starts_with("Newznab API key error"), "got: {msg}");
+        for code in ["100", "102", "103"] {
+            let err = classify_and_format_error(code, "Invalid API key 0123456789abcdef");
+            let error = structured(&err);
+            assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+            assert!(!error.public_message.contains("0123456789abcdef"));
+            let debug = error.debug_message.as_deref().unwrap();
+            assert!(debug.starts_with("Newznab API key error"), "got: {debug}");
+        }
+    }
+
+    #[test]
+    fn error_account_suspended() {
+        let err = classify_and_format_error("101", "Account suspended");
+        assert_eq!(
+            structured(&err).code,
+            PluginErrorCode::from(codes::ACCOUNT_DISABLED)
+        );
     }
 
     #[test]
     fn error_rate_limit() {
-        let err = classify_and_format_error("500", "Request limit reached");
-        let msg = format!("{err}");
-        assert!(msg.starts_with("Newznab rate limit"), "got: {msg}");
+        for (code, description) in [
+            ("500", "Request limit reached"),
+            ("501", "Download limit reached"),
+            ("unknown", "Daily request limit reached"),
+        ] {
+            let err = classify_and_format_error(code, description);
+            let error = structured(&err);
+            assert_eq!(error.code, PluginErrorCode::from(codes::QUOTA_EXCEEDED));
+            assert_eq!(error.public_message, QUOTA_EXCEEDED_MESSAGE);
+        }
+    }
+
+    #[test]
+    fn error_account_status_without_a_code_is_classified_from_its_text() {
+        let err = classify_and_format_error("unknown", "Invalid API Key");
+        assert_eq!(
+            structured(&err).code,
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
+        let err = classify_and_format_error("unknown", "Account disabled");
+        assert_eq!(
+            structured(&err).code,
+            PluginErrorCode::from(codes::ACCOUNT_DISABLED)
+        );
     }
 
     #[test]
     fn error_generic() {
         let err = classify_and_format_error("300", "something went wrong");
-        let msg = format!("{err}");
-        assert!(msg.starts_with("Newznab error"), "got: {msg}");
+        assert_eq!(
+            structured(&err).code,
+            PluginErrorCode::from(codes::ITEM_NOT_FOUND)
+        );
+        let err = classify_and_format_error("900", "something went wrong");
+        let error = structured(&err);
+        assert_eq!(error.code, PluginErrorCode::Temporary);
+        let debug = error.debug_message.as_deref().unwrap();
+        assert!(debug.starts_with("Newznab error"), "got: {debug}");
+    }
+
+    #[test]
+    fn first_page_http_statuses_name_the_failure() {
+        let error = first_page_status_error(401).unwrap();
+        assert_eq!(
+            structured(&error).code,
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
+        let error = first_page_status_error(404).unwrap();
+        assert_eq!(
+            structured(&error).code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        assert!(first_page_status_error(500).is_none());
+        assert!(first_page_status_error(429).is_none());
+    }
+
+    #[test]
+    fn connection_test_failures_carry_codes() {
+        let classify = |status: u16, body: &str| {
+            scryer_plugin_pdk::error::plugin_error_from(
+                &validate_newznab_connection_feed(status, body, 1).unwrap_err(),
+            )
+        };
+        assert_eq!(
+            classify(
+                200,
+                r#"<error code="100" description="Incorrect user credentials"/>"#
+            )
+            .code,
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
+        assert_eq!(
+            classify(401, "").code,
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
+        assert_eq!(
+            classify(404, "").code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        assert_eq!(classify(503, "").code, PluginErrorCode::UpstreamUnavailable);
+        assert_eq!(
+            classify(200, "<rss><channel><item>").code,
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
+    }
+
+    #[test]
+    fn an_unparsable_base_url_is_invalid_config() {
+        let error = build_endpoint("not a url", "/api").unwrap_err();
+        let error = structured(&error);
+        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert!(error.public_message.contains("base_url"));
     }
 
     // ── apply_standard_attrs ─────────────────────────────────────────────
@@ -8139,18 +8378,19 @@ mod tests {
     }
 
     fn rate_limited_structured_error(retry_after_seconds: Option<i64>) -> Error {
-        structured_plugin_error(PluginError {
-            code: PluginErrorCode::RateLimited,
-            public_message: "indexer rate limited".to_string(),
-            debug_message: Some("HTTP 429 after 1 attempt(s)".to_string()),
-            retry_after_seconds,
-            details: Some(PluginErrorDetails::IndexerSearch(
+        let builder = plugin_error(PluginErrorCode::RateLimited, "indexer rate limited")
+            .debug("HTTP 429 after 1 attempt(s)")
+            .details(PluginErrorDetails::IndexerSearch(
                 IndexerSearchPluginError::Deferred {
                     reason: IndexerSearchIncompleteReason::RateLimited,
                     retry_after_seconds,
                 },
-            )),
-        })
+            ));
+        match retry_after_seconds {
+            Some(seconds) => builder.retry_after_seconds(seconds),
+            None => builder,
+        }
+        .into_error()
     }
 
     fn indexer_search_details(error: &Error) -> IndexerSearchPluginError {
@@ -9487,6 +9727,44 @@ mod tests {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn a_rejected_api_key_on_the_first_feed_page_is_invalid_api_key() {
+            install_script();
+            SCRIPT.with(|script| {
+                script.borrow_mut().pages.insert(
+                    ("tvsearch".to_string(), 0),
+                    r#"<?xml version="1.0"?><error code="100" description="Incorrect user credentials"/>"#
+                        .to_string(),
+                )
+            });
+
+            let error = run(&config(1), &rss_request(&["5000"], None))
+                .expect_err("a rejected key fails the run");
+
+            let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+            assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+            assert_eq!(error.public_message, "the indexer rejected the API key");
+            assert!(error.details.is_none());
+        }
+
+        #[test]
+        fn a_request_limit_answer_on_the_first_feed_page_is_quota_exceeded() {
+            install_script();
+            SCRIPT.with(|script| {
+                script.borrow_mut().pages.insert(
+                    ("tvsearch".to_string(), 0),
+                    r#"<?xml version="1.0"?><error code="500" description="Request limit reached"/>"#
+                        .to_string(),
+                )
+            });
+
+            let error = run(&config(1), &rss_request(&["5000"], None))
+                .expect_err("an exhausted allowance fails the run");
+
+            let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+            assert_eq!(error.code, PluginErrorCode::from(codes::QUOTA_EXCEEDED));
         }
     }
 }
