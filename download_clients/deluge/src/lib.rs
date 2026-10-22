@@ -26,9 +26,8 @@ use scryer_plugin_sdk::{
     PluginDescriptor, PluginDownloadClientAddRequest, PluginDownloadClientAddResponse,
     PluginDownloadClientControlRequest, PluginDownloadClientMarkImportedRequest,
     PluginDownloadClientStatus, PluginDownloadIsolation, PluginDownloadItem,
-    PluginDownloadOutputKind, PluginError, PluginErrorCode, PluginResult,
-    PluginTorrentInitialState, PluginTorrentItem, PluginTorrentQueuePlacement, ProviderDescriptor,
-    SDK_VERSION,
+    PluginDownloadOutputKind, PluginErrorCode, PluginResult, PluginTorrentInitialState,
+    PluginTorrentItem, PluginTorrentQueuePlacement, ProviderDescriptor, SDK_VERSION,
 };
 use serde::Deserialize;
 
@@ -101,27 +100,39 @@ struct DelugeFailure {
     field: Option<&'static str>,
     message: String,
     detail: Option<String>,
+    retry_after: Option<i64>,
 }
 
 type DelugeResult<T> = Result<T, DelugeFailure>;
 
 impl DelugeFailure {
-    fn new(code: PluginErrorCode, message: impl Into<String>) -> Self {
+    fn new(code: impl Into<PluginErrorCode>, message: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.into(),
             field: None,
             message: message.into(),
             detail: None,
+            retry_after: None,
         }
     }
 
-    fn for_field(code: PluginErrorCode, field: &'static str, message: impl Into<String>) -> Self {
+    fn for_field(
+        code: impl Into<PluginErrorCode>,
+        field: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
-            code,
+            code: code.into(),
             field: Some(field),
             message: message.into(),
             detail: None,
+            retry_after: None,
         }
+    }
+
+    fn with_retry_after(mut self, seconds: Option<i64>) -> Self {
+        self.retry_after = seconds;
+        self
     }
 
     fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -137,13 +148,14 @@ impl DelugeFailure {
     }
 
     fn into_result<T>(self) -> PluginResult<T> {
-        PluginResult::Err(PluginError {
-            code: self.code,
-            public_message: self.public_message(),
-            debug_message: self.detail,
-            retry_after_seconds: None,
-            details: None,
-        })
+        let mut error = plugin_error(self.code.clone(), self.public_message());
+        if let Some(detail) = self.detail {
+            error = error.debug(detail);
+        }
+        if let Some(seconds) = self.retry_after {
+            error = error.retry_after_seconds(seconds);
+        }
+        PluginResult::Err(error.build())
     }
 }
 
@@ -248,6 +260,9 @@ struct DelugeTorrent {
     label: Option<String>,
     #[serde(default, rename = "num_files")]
     num_files: Option<i64>,
+    /// Unix time the torrent was added to the session.
+    #[serde(default, rename = "time_added")]
+    time_added: Option<f64>,
 }
 
 pub fn scryer_describe(_input: String) -> FnResult<String> {
@@ -258,6 +273,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "deluge".to_string(),
             provider_aliases: vec![],
@@ -290,6 +306,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
                 per_download_directory: true,
                 host_fs_required: false,
                 test_connection: true,
+                // Deluge only takes torrents; it has no plain-HTTP fetch.
+                http: None,
                 torrent: Some(DownloadTorrentCapabilities {
                     supported_sources: vec![
                         DownloadInputKind::MagnetUri,
@@ -923,7 +941,7 @@ fn authenticate(config: &DelugeConfig, force: bool) -> DelugeResult<String> {
     let parsed = parse_rpc(&response.body_text)?;
     if let Some(error) = parsed.error {
         return Err(DelugeFailure::for_field(
-            PluginErrorCode::AuthFailed,
+            codes::INVALID_USERNAME_PASSWORD,
             "password",
             "Deluge rejected the configured password",
         )
@@ -934,14 +952,14 @@ fn authenticate(config: &DelugeConfig, force: bool) -> DelugeResult<String> {
     }
     if !parsed.result.as_bool().unwrap_or(false) {
         return Err(DelugeFailure::for_field(
-            PluginErrorCode::AuthFailed,
+            codes::INVALID_USERNAME_PASSWORD,
             "password",
             "Deluge rejected the configured password",
         ));
     }
     let cookie = response.cookie.ok_or_else(|| {
         DelugeFailure::new(
-            PluginErrorCode::UpstreamUnavailable,
+            codes::INVALID_RESPONSE,
             "Deluge accepted the password but returned no session cookie",
         )
     })?;
@@ -1006,7 +1024,7 @@ fn call_value(
     match parsed.error {
         None => Ok(parsed.result),
         Some(error) => Err(DelugeFailure::for_field(
-            PluginErrorCode::AuthFailed,
+            codes::INVALID_USERNAME_PASSWORD,
             "password",
             "Deluge rejected the session even after re-authenticating",
         )
@@ -1032,12 +1050,30 @@ fn is_reauth_error(code: i64) -> bool {
     matches!(code, 1 | 2)
 }
 
+/// Deluge's JSON-RPC errors carry the daemon's exception text, which is upstream
+/// wording and stays in the debug detail; the code is read from it where Deluge's
+/// own exceptions make the cause unambiguous.
 fn rpc_failure(method: &str, code: i64, message: &str) -> DelugeFailure {
-    DelugeFailure::new(
-        PluginErrorCode::Temporary,
-        format!("Deluge refused {method}: {message}"),
-    )
-    .with_detail(format!("json-rpc error code {code}"))
+    let lower = message.to_ascii_lowercase();
+    let failure = if lower.contains("permission denied") || lower.contains("read-only") {
+        DelugeFailure::new(
+            codes::PATH_NOT_WRITABLE,
+            "Deluge cannot write to the download directory",
+        )
+    } else if lower.contains("invalidtorrenterror") || lower.contains("not in session") {
+        DelugeFailure::new(codes::ITEM_NOT_FOUND, "Deluge no longer has that torrent")
+    } else if method.starts_with("core.add_torrent") {
+        DelugeFailure::new(
+            codes::DOWNLOAD_REJECTED,
+            "Deluge refused to add the torrent",
+        )
+    } else {
+        DelugeFailure::new(
+            PluginErrorCode::Temporary,
+            format!("Deluge refused {method}"),
+        )
+    };
+    failure.with_detail(format!("json-rpc error code {code}: {message}"))
 }
 
 struct RawResponse {
@@ -1074,7 +1110,7 @@ fn raw_call(
         .with_detail(error.to_string())
     })?;
     let response = http::request::<Vec<u8>>(&request, Some(payload))
-        .map_err(|error| transport_failure(&error.to_string()))?;
+        .map_err(|error| transport_failure(&error))?;
     let status = response.status_code();
     let body_text = String::from_utf8_lossy(&response.body()).to_string();
 
@@ -1087,14 +1123,27 @@ fn raw_call(
             cookie: extract_cookie(&response),
         });
     }
-    Err(http_status_failure(status, &body_text))
+    Err(http_status_failure(
+        status,
+        retry_after(&response),
+        &body_text,
+    ))
 }
 
-fn http_status_failure(status: u16, body: &str) -> DelugeFailure {
+fn retry_after(response: &HttpResponse) -> Option<i64> {
+    response
+        .headers()
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds >= 0)
+}
+
+fn http_status_failure(status: u16, retry_after: Option<i64>, body: &str) -> DelugeFailure {
     let detail = format!("HTTP {status}: {}", truncate(body, 512));
     match status {
         401 | 403 => DelugeFailure::for_field(
-            PluginErrorCode::AuthFailed,
+            codes::INVALID_USERNAME_PASSWORD,
             "password",
             "Deluge rejected the configured password",
         ),
@@ -1107,18 +1156,19 @@ fn http_status_failure(status: u16, body: &str) -> DelugeFailure {
         // A login page instead of the JSON-RPC endpoint means url_base points at the
         // wrong resource.
         301 | 302 | 303 | 307 | 308 => DelugeFailure::for_field(
-            PluginErrorCode::InvalidConfig,
+            codes::ENDPOINT_NOT_FOUND,
             "url_base",
             "Deluge redirected the JSON-RPC endpoint; check the host, port and URL base",
         ),
         404 => DelugeFailure::for_field(
-            PluginErrorCode::InvalidConfig,
+            codes::ENDPOINT_NOT_FOUND,
             "url_base",
             "Deluge has no JSON-RPC endpoint at the configured URL",
         ),
-        429 => DelugeFailure::new(PluginErrorCode::RateLimited, "Deluge rate-limited Scryer"),
+        429 => DelugeFailure::new(PluginErrorCode::RateLimited, "Deluge rate-limited Scryer")
+            .with_retry_after(retry_after),
         500..=599 => DelugeFailure::new(
-            PluginErrorCode::Temporary,
+            PluginErrorCode::UpstreamUnavailable,
             "Deluge's web UI returned a server error; its daemon may be down",
         ),
         _ => DelugeFailure::new(
@@ -1130,38 +1180,54 @@ fn http_status_failure(status: u16, body: &str) -> DelugeFailure {
 }
 
 /// Sonarr splits `WebException.Status` into Host / UseSsl validation failures
-/// (Deluge.cs:289-311); the PDK gives us only a message, so the SSL hint is keyed off
-/// the transport's own wording.
-fn transport_failure(error: &str) -> DelugeFailure {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("ssl")
-        || lower.contains("tls")
-        || lower.contains("certificate")
-        || lower.contains("handshake")
-    {
+/// (Deluge.cs:289-311); the PDK classifies the host's transport error, and the
+/// failure names the setting that fixes it.
+fn transport_failure(error: &Error) -> DelugeFailure {
+    let classified = scryer_plugin_pdk::error::plugin_error_from(error);
+    let detail = classified
+        .debug_message
+        .clone()
+        .unwrap_or_else(|| format!("{error:#}"));
+    if classified.code == PluginErrorCode::from(codes::TLS_ERROR) {
         return DelugeFailure::for_field(
-            PluginErrorCode::UpstreamUnavailable,
+            codes::TLS_ERROR,
             "use_ssl",
             "Could not establish a secure connection to Deluge; verify the SSL setting and its certificate",
         )
-        .with_detail(error.to_string());
+        .with_detail(detail);
+    }
+    if classified.code == PluginErrorCode::Temporary {
+        return DelugeFailure::new(PluginErrorCode::Temporary, "Deluge did not answer in time")
+            .with_detail(detail);
     }
     DelugeFailure::for_field(
         PluginErrorCode::UpstreamUnavailable,
         "host",
         "Unable to connect to Deluge",
     )
-    .with_detail(error.to_string())
+    .with_detail(detail)
 }
 
 fn parse_rpc(body: &str) -> DelugeResult<RpcResponse> {
     serde_json::from_str(body).map_err(|error| {
-        DelugeFailure::new(
-            PluginErrorCode::Temporary,
-            "Deluge returned a response Scryer could not parse",
-        )
-        .with_detail(format!("{error}; body: {}", truncate(body, 512)))
+        let failure = if looks_like_html(body) {
+            DelugeFailure::for_field(
+                codes::ENDPOINT_NOT_FOUND,
+                "url_base",
+                "Deluge answered with a web page instead of its JSON-RPC endpoint",
+            )
+        } else {
+            DelugeFailure::new(
+                codes::INVALID_RESPONSE,
+                "Deluge returned a response Scryer could not parse",
+            )
+        };
+        failure.with_detail(format!("{error}; body: {}", truncate(body, 512)))
     })
+}
+
+fn looks_like_html(body: &str) -> bool {
+    body.trim_start().starts_with('<')
 }
 
 fn extract_cookie(response: &HttpResponse) -> Option<String> {
@@ -1187,7 +1253,7 @@ fn list_torrents(config: &DelugeConfig) -> DelugeResult<Vec<DelugeTorrent>> {
     )?;
     let update: UpdateUiResult = serde_json::from_value(response).map_err(|error| {
         DelugeFailure::new(
-            PluginErrorCode::Temporary,
+            codes::INVALID_RESPONSE,
             "Deluge returned a torrent listing Scryer could not parse",
         )
         .with_detail(error.to_string())
@@ -1445,6 +1511,7 @@ fn torrent_to_item(config: &DelugeConfig, torrent: DelugeTorrent) -> PluginDownl
     let label = reported_label(config, &torrent);
     let message = state_message(&torrent);
     let completed_at = completed_at(&torrent);
+    let added_at = added_at(&torrent);
     PluginDownloadItem {
         client_item_id: hash.clone(),
         download_id: None,
@@ -1480,6 +1547,8 @@ fn torrent_to_item(config: &DelugeConfig, torrent: DelugeTorrent) -> PluginDownl
         removed: Some(false),
         raw_state: Some(torrent.state),
         completed_at,
+        added_at,
+        http: None,
     }
 }
 
@@ -1502,6 +1571,7 @@ fn torrent_to_completed(config: &DelugeConfig, torrent: DelugeTorrent) -> Plugin
         completed_at,
         parameters: Vec::new(),
         release_name: None,
+        subtitle_paths: Vec::new(),
     }
 }
 
@@ -1523,6 +1593,14 @@ fn reported_label(config: &DelugeConfig, torrent: &DelugeTorrent) -> Option<Stri
 fn rate_to_bytes(rate: Option<f64>) -> Option<i64> {
     rate.filter(|rate| rate.is_finite() && *rate >= 0.0)
         .map(|rate| rate as i64)
+}
+
+/// Deluge's `time_added` is the unix time the torrent entered the session.
+fn added_at(torrent: &DelugeTorrent) -> Option<String> {
+    torrent
+        .time_added
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| unix_to_rfc3339(value as i64))
 }
 
 fn completed_at(torrent: &DelugeTorrent) -> Option<String> {
@@ -1659,6 +1737,13 @@ fn get_external_bytes(url: &str) -> DelugeResult<Vec<u8>> {
     })?;
     let status = response.status_code();
     let body = response.body();
+    if status == 429 {
+        return Err(DelugeFailure::new(
+            PluginErrorCode::RateLimited,
+            "The .torrent URL rate-limited Scryer",
+        )
+        .with_retry_after(retry_after(&response)));
+    }
     if status >= 400 {
         return Err(DelugeFailure::new(
             PluginErrorCode::Temporary,
@@ -2524,35 +2609,80 @@ mod tests {
     #[test]
     fn http_statuses_map_to_honest_error_codes() {
         let cases = [
-            (401, PluginErrorCode::AuthFailed),
-            (403, PluginErrorCode::AuthFailed),
-            (302, PluginErrorCode::InvalidConfig),
-            (404, PluginErrorCode::InvalidConfig),
+            (401, PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)),
+            (403, PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)),
+            (302, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)),
+            (404, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)),
             (408, PluginErrorCode::Temporary),
             (429, PluginErrorCode::RateLimited),
-            (500, PluginErrorCode::Temporary),
-            (503, PluginErrorCode::Temporary),
+            (500, PluginErrorCode::UpstreamUnavailable),
+            (503, PluginErrorCode::UpstreamUnavailable),
             (418, PluginErrorCode::Permanent),
         ];
         for (status, expected) in cases {
             assert_eq!(
-                http_status_failure(status, "body").code,
+                http_status_failure(status, None, "body").code,
                 expected,
                 "status {status}"
             );
         }
+        let limited = http_status_failure(429, Some(30), "slow down");
+        assert_eq!(limited.retry_after, Some(30));
+        let PluginResult::Err(error) = limited.into_result::<()>() else {
+            panic!("a failure is an error");
+        };
+        assert_eq!(error.retry_after_seconds, Some(30));
+    }
+
+    fn host_failure(detail: &str) -> Error {
+        scryer_plugin_pdk::host::HostCallError::Service(
+            plugin_error(PluginErrorCode::Temporary, "request failed")
+                .debug(detail)
+                .build(),
+        )
+        .into()
     }
 
     #[test]
     fn transport_failures_separate_the_ssl_hint_from_a_dead_host() {
-        let ssl = transport_failure("tls handshake failure: certificate verify failed");
-        assert_eq!(ssl.code, PluginErrorCode::UpstreamUnavailable);
+        let ssl = transport_failure(&host_failure(
+            "tls handshake failure: certificate verify failed",
+        ));
+        assert_eq!(ssl.code, PluginErrorCode::from(codes::TLS_ERROR));
         assert_eq!(ssl.field, Some("use_ssl"));
 
-        let host = transport_failure("connection refused");
+        let host = transport_failure(&host_failure("dns error: connection refused"));
         assert_eq!(host.code, PluginErrorCode::UpstreamUnavailable);
         assert_eq!(host.field, Some("host"));
         assert_eq!(host.public_message(), "host: Unable to connect to Deluge");
+    }
+
+    #[test]
+    fn added_at_is_deluges_time_added() {
+        let torrent = DelugeTorrent {
+            time_added: Some(1_700_000_000.0),
+            ..DelugeTorrent::default()
+        };
+        assert_eq!(
+            added_at(&torrent).as_deref(),
+            Some(unix_to_rfc3339(1_700_000_000).as_str())
+        );
+        assert_eq!(added_at(&DelugeTorrent::default()), None);
+    }
+
+    #[test]
+    fn an_html_page_is_not_the_json_rpc_endpoint() {
+        let Err(failure) = parse_rpc("<!DOCTYPE html><html><body>login</body></html>") else {
+            panic!("an HTML page is not JSON-RPC");
+        };
+        assert_eq!(
+            failure.code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        let Err(failure) = parse_rpc("{\"result\": tru") else {
+            panic!("truncated JSON does not parse");
+        };
+        assert_eq!(failure.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
     }
 
     /// `DelugeProxy.cs:235-255`: only codes 1 and 2 mean "re-login and retry".
@@ -2566,11 +2696,42 @@ mod tests {
     }
 
     #[test]
-    fn rpc_errors_keep_deluges_own_message_and_stay_retryable() {
+    fn rpc_errors_keep_deluges_own_message_in_the_debug_detail_and_stay_retryable() {
         let failure = rpc_failure("label.set_torrent", 4, "Unknown Label");
         assert_eq!(failure.code, PluginErrorCode::Temporary);
-        assert!(failure.public_message().contains("Unknown Label"));
-        assert_eq!(failure.detail.as_deref(), Some("json-rpc error code 4"));
+        assert!(!failure.public_message().contains("Unknown Label"));
+        assert_eq!(
+            failure.detail.as_deref(),
+            Some("json-rpc error code 4: Unknown Label")
+        );
+    }
+
+    #[test]
+    fn rpc_errors_name_a_refused_add_a_missing_torrent_and_an_unwritable_path() {
+        let cases = [
+            (
+                "core.add_torrent_magnet",
+                "AddTorrentError: Torrent already in session",
+                codes::DOWNLOAD_REJECTED,
+            ),
+            (
+                "core.remove_torrent",
+                "InvalidTorrentError: torrent_id abc not in session",
+                codes::ITEM_NOT_FOUND,
+            ),
+            (
+                "core.add_torrent_file",
+                "[Errno 13] Permission denied: '/downloads/synthetic'",
+                codes::PATH_NOT_WRITABLE,
+            ),
+        ];
+        for (method, message, code) in cases {
+            assert_eq!(
+                rpc_failure(method, 4, message).code,
+                PluginErrorCode::from(code),
+                "{method}: {message}"
+            );
+        }
     }
 
     /// The invalid-torrent skip is what triggers Sonarr's daemon reconnect
