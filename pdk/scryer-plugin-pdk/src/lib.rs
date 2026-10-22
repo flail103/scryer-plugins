@@ -38,6 +38,18 @@
 //! `cargo test`, say — no transport is installed and those functions report
 //! [`host::HostCallError::Unavailable`].
 //!
+//! ### What 0.8 changed
+//!
+//! The PDK moved to `scryer-plugin-sdk` 3.18, whose `PluginErrorCode` is
+//! open: any snake_case code is valid, and the host turns it into a stable
+//! reason the web client translates. [`error`] is the one way to build a
+//! failure — [`plugin_error`] and the shared spellings in [`codes`] — and
+//! errors a plugin returns without classifying them are now mapped from the
+//! PDK's own host error types rather than all reported as a generic
+//! `Temporary`. A plugin that sends an open code must declare
+//! `min_scryer_version = "0.21.21"`. SDK 3.18 also added
+//! `PluginDownloadItem::added_at`, which every struct literal must now set.
+//!
 //! ## What this crate is (and is not)
 //!
 //! This crate serves **Scryer's plugin contract**. It is intentionally *not* a
@@ -99,6 +111,7 @@
 
 pub mod component;
 mod download_client_bridge;
+pub mod error;
 pub mod family;
 pub mod host;
 mod host_api;
@@ -109,7 +122,13 @@ pub use download_client_bridge::{
     LegacyDownloadClientFunctions, bridge_download_client_command,
     legacy_download_client_descriptor,
 };
+pub use error::{
+    PluginErrorBuilder, PluginResultExt, check_http_status, codes, plugin_error, to_plugin_result,
+};
 pub use host_api::{Error, FnResult, HttpRequest, HttpResponse, config, http, var};
+pub use scryer_plugin_sdk::{
+    DynamicConfigFieldsCapability, PluginError, PluginErrorCode, PluginErrorDetails, PluginResult,
+};
 
 // One wire-protocol source of truth (RFC 123 §2.6): the protocol types live in
 // `scryer-plugin-sdk` and are re-exported here so a plugin can depend on the PDK
@@ -134,11 +153,11 @@ pub use scryer_plugin_sdk::{
 /// Descriptor-aware runners accept a factory returning [`sdk::PluginDescriptor`].
 pub use scryer_plugin_sdk as sdk;
 pub use scryer_plugin_sdk::command::{
-    PluginCommand, PluginCommandRequest, PluginCommandResponse, PluginCommandResult,
-    PluginDownloadClientCommand, PluginDownloadClientCommandResult,
-    PluginDownloadGetCompletedRequest, PluginIndexerCommand, PluginIndexerCommandResult,
-    PluginNotificationCommand, PluginNotificationCommandResult, PluginSubtitleCommand,
-    PluginSubtitleCommandResult,
+    CONFIG_FIELDS_ACTION, ConfigFieldsRequest, ConfigFieldsResponse, PluginCommand,
+    PluginCommandRequest, PluginCommandResponse, PluginCommandResult, PluginDownloadClientCommand,
+    PluginDownloadClientCommandResult, PluginDownloadGetCompletedRequest, PluginIndexerCommand,
+    PluginIndexerCommandResult, PluginNotificationCommand, PluginNotificationCommandResult,
+    PluginSubtitleCommand, PluginSubtitleCommandResult,
 };
 pub use scryer_plugin_sdk::host::{
     PluginArchiveExtractRequest, PluginArchiveExtractResponse, PluginArchiveExtractedFile,

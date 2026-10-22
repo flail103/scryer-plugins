@@ -244,56 +244,17 @@ pub async fn emit_strategy_event(
         .map_err(StrategyEventEmitError::from)
 }
 
-/// Convert an ordinary plugin handler error into the SDK's stable typed result
-/// shape. The component invocation itself still succeeds in this case.
-pub fn to_plugin_result<T>(result: Result<T, crate::Error>) -> PluginResult<T> {
-    match result {
-        Ok(value) => PluginResult::Ok(value),
-        Err(error) => {
-            if let Some(structured) = error.downcast_ref::<StructuredPluginError>() {
-                return PluginResult::Err(structured.0.clone());
-            }
-            PluginResult::Err(PluginError {
-                code: PluginErrorCode::Temporary,
-                public_message: "indexer component failed".to_string(),
-                debug_message: Some(error.to_string()),
-                retry_after_seconds: None,
-                details: None,
-            })
-        }
-    }
-}
+/// The error plumbing every dispatch path shares, re-exported where indexer
+/// plugins have always found it. See [`crate::error`].
+pub use crate::error::{StructuredPluginError, structured_plugin_error, to_plugin_result};
 
-/// Preserve an explicit SDK error through the component result adapter.
-#[derive(Debug)]
-pub struct StructuredPluginError(PluginError);
-
-impl StructuredPluginError {
-    pub fn plugin_error(&self) -> &PluginError {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for StructuredPluginError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0.public_message)
-    }
-}
-
-impl std::error::Error for StructuredPluginError {}
-
-pub fn structured_plugin_error(error: PluginError) -> crate::Error {
-    crate::Error::new(StructuredPluginError(error))
-}
-
+/// The error for an action this indexer does not implement.
 pub fn action_unsupported(action: &str) -> PluginError {
-    PluginError {
-        code: PluginErrorCode::Unsupported,
-        public_message: format!("this indexer does not support the '{action}' action"),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+    crate::error::plugin_error(
+        PluginErrorCode::Unsupported,
+        format!("this indexer does not support the '{action}' action"),
+    )
+    .build()
 }
 
 pub fn descriptor_bytes(descriptor: scryer_plugin_sdk::PluginDescriptor) -> Vec<u8> {
@@ -459,6 +420,8 @@ mod tests {
             absolute_episode: None,
             tagged_aliases: vec![],
             context: None,
+            rss_catch_up: None,
+            page_cursor: None,
         }
     }
 

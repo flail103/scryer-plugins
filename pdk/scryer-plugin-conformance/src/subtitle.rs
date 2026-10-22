@@ -934,12 +934,12 @@ impl SubtitleConformance {
         let PluginSubtitleCommandResult::Download(PluginResult::Err(error)) = result else {
             panic!("a refused host capability must be a typed plugin error: {result:?}");
         };
-        if let Some(code) = self.refused_code {
-            assert_eq!(error.code, code);
+        if let Some(code) = &self.refused_code {
+            assert_eq!(&error.code, code);
         }
-        if let Some(code) = self.refused_not_code {
+        if let Some(code) = &self.refused_not_code {
             assert_ne!(
-                error.code, code,
+                &error.code, code,
                 "a refused egress is not a missing capability: {error:?}"
             );
         }

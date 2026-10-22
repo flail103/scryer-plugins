@@ -78,6 +78,20 @@ impl HttpResponse {
     pub fn header(&self, name: impl AsRef<str>) -> Option<&str> {
         self.headers.get(name.as_ref()).map(String::as_str)
     }
+
+    /// `Ok(self)` for a status below 400, else a
+    /// [`crate::error::HttpStatusError`] carrying the status and any
+    /// `Retry-After`, which the PDK reports as `RateLimited` (429) or
+    /// `UpstreamUnavailable` (5xx).
+    pub fn error_for_status(self) -> FnResult<Self> {
+        let retry_after = self
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.as_str());
+        crate::error::check_http_status(self.status, retry_after)?;
+        Ok(self)
+    }
 }
 
 pub mod config {
@@ -168,6 +182,22 @@ mod tests {
             .with_header("X-Test", "one");
         assert_eq!(request.method.as_deref(), Some("POST"));
         assert_eq!(request.headers.get("X-Test"), Some(&"one".to_string()));
+    }
+
+    #[test]
+    fn error_for_status_passes_success_and_types_failures() {
+        let response = |status: u16| HttpResponse {
+            status,
+            headers: BTreeMap::from([("Retry-After".to_string(), "9".to_string())]),
+            body: Vec::new(),
+        };
+        assert_eq!(response(200).error_for_status().unwrap().status_code(), 200);
+        let error = response(429).error_for_status().unwrap_err();
+        let status = error
+            .downcast_ref::<crate::error::HttpStatusError>()
+            .expect("a typed status error");
+        assert_eq!(status.status, 429);
+        assert_eq!(status.retry_after_seconds, Some(9));
     }
 
     #[test]
