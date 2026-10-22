@@ -193,8 +193,12 @@ pub struct LoginBlock {
     pub get_selector_inputs: BTreeMap<String, SelectorField>,
     #[serde(default)]
     pub cookies: Vec<String>,
-    #[serde(default)]
-    pub headers: ScalarMap,
+    /// `None` when the block has no `headers:` key. The login requests then
+    /// carry the search headers, as Prowlarr's
+    /// `Login?.Headers ?? Search?.Headers` does; an explicit map, even an
+    /// empty one, replaces them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<ScalarMap>,
     #[serde(default)]
     pub test: Option<PageTestBlock>,
     #[serde(default)]
