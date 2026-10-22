@@ -73,7 +73,7 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "cardigann-engine"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-pdk"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -895,9 +895,9 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-sdk"
-version = "3.11.0"
+version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed82740ae081bbbdce615fd871cf83817aeb197caa129d393d8aea4aa6b1058f"
+checksum = "a045c679044705d66fa330cc0e59ba1d12dcab84e354c6f37705efdf7444b3f2"
 dependencies = [
  "base64 0.22.1",
  "schemars",
