@@ -9,8 +9,10 @@ use newznab_common::{
     current_sdk_constraint, execute_full_search, execute_raw_search, is_hit_budget_exhausted_error,
 };
 use scryer_plugin_pdk::component::StructuredPluginError;
+use scryer_plugin_pdk::error::plugin_error_from;
 use scryer_plugin_pdk::runtime::{self, PluginHttpRequest};
 use scryer_plugin_pdk::{Error, PluginSubtitleCommand, PluginSubtitleCommandResult, var};
+use scryer_plugin_pdk::{codes, plugin_error as pdk_error};
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource, PluginDescriptor,
     PluginError, PluginErrorCode, PluginResult, ProviderDescriptor, SDK_VERSION,
@@ -80,32 +82,28 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         // missing capability is information the host can act on and an
         // `invocation-error` is not.
         PluginSubtitleCommand::Generate(_) => {
-            PluginSubtitleCommandResult::Generate(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "ameNZB does not generate subtitles".to_string(),
-                debug_message: Some(
-                    "amenzb-subtitles is a catalog provider; it has no generation mode".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
+            PluginSubtitleCommandResult::Generate(PluginResult::Err(
+                pdk_error(
+                    PluginErrorCode::Unsupported,
+                    "ameNZB does not generate subtitles",
+                )
+                .debug("amenzb-subtitles is a catalog provider; it has no generation mode")
+                .build(),
+            ))
         }
         // Alignment moved into this envelope when the subtitle-sync plugin
         // migrated off its own transport, so every subtitle provider now sees
         // the operation whether or not it can serve one. ameNZB cannot: it has
         // no audio decoder and advertises no `sync` capability. Same in-band
         // refusal as `Generate`, for the same reason.
-        PluginSubtitleCommand::Sync(_) => {
-            PluginSubtitleCommandResult::Sync(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "ameNZB cannot align subtitles".to_string(),
-                debug_message: Some(
-                    "SubtitleCapabilities::sync is None for this provider".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
-        }
+        PluginSubtitleCommand::Sync(_) => PluginSubtitleCommandResult::Sync(PluginResult::Err(
+            pdk_error(
+                PluginErrorCode::Unsupported,
+                "ameNZB cannot align subtitles",
+            )
+            .debug("SubtitleCapabilities::sync is None for this provider")
+            .build(),
+        )),
     }
 }
 
@@ -139,6 +137,14 @@ async fn search(
         // exactly as it did before the move: the host treats "no subtitles right
         // now" as a normal outcome and re-queries later.
         Err(AmenzbError::RateLimited(_)) => Ok(SubtitlePluginSearchResponse::default()),
+        // An used-up request allowance is the same "not right now" for search;
+        // the engine reports it as `quota_exceeded` where it used to say
+        // `RateLimited`.
+        Err(AmenzbError::Plugin(error))
+            if error.code == PluginErrorCode::from(codes::QUOTA_EXCEEDED) =>
+        {
+            Ok(SubtitlePluginSearchResponse::default())
+        }
         Err(error) => Err(error),
     }
 }
@@ -541,17 +547,18 @@ async fn subtitle_download_impl(
         return Err(AmenzbError::RateLimited(retry_after_seconds(&response)));
     }
     if response.status >= 400 {
-        return Err(AmenzbError::Message(format!(
-            "ameNZB subtitle download returned HTTP {}",
-            response.status
-        )));
+        return Err(download_status_error(response.status));
     }
     let bytes = response.body.as_bytes();
     if bytes.len() > MAX_SUBTITLE_BYTES {
-        return Err(AmenzbError::Message(format!(
-            "ameNZB subtitle is too large ({} bytes)",
-            bytes.len()
-        )));
+        return Err(AmenzbError::Plugin(
+            pdk_error(
+                PluginErrorCode::Permanent,
+                "the ameNZB subtitle is larger than the size limit",
+            )
+            .debug(format_args!("ameNZB subtitle is {} bytes", bytes.len()))
+            .build(),
+        ));
     }
     let filename = content_disposition_filename(&response)
         .or_else(|| Some(reference.filename.clone()))
@@ -1020,7 +1027,7 @@ async fn http_get_once(
         body: Vec::new(),
     })
     .await
-    .map_err(|error| AmenzbError::Message(format!("HTTP request failed: {error}")))?;
+    .map_err(|error| AmenzbError::Plugin(plugin_error_from(&Error::new(error))))?;
 
     // First value wins per field, which is what the previous map-shaped
     // response gave: `location` and `retry-after` are single-valued in
@@ -1048,8 +1055,16 @@ fn duration_ms(duration: Duration) -> u64 {
 fn validate_download_url(config: &AmenzbConfig, url: &str) -> Result<(), AmenzbError> {
     let parsed = Url::parse(url)
         .map_err(|error| AmenzbError::Message(format!("invalid ameNZB subtitle URL: {error}")))?;
-    let base = Url::parse(config.site_url())
-        .map_err(|error| AmenzbError::Message(format!("invalid ameNZB base URL: {error}")))?;
+    let base = Url::parse(config.site_url()).map_err(|error| {
+        AmenzbError::Plugin(
+            pdk_error(
+                PluginErrorCode::InvalidConfig,
+                "base_url is not a valid ameNZB address",
+            )
+            .debug(error)
+            .build(),
+        )
+    })?;
     if parsed.scheme() != base.scheme() || parsed.host_str() != base.host_str() {
         return Err(AmenzbError::Message(
             "invalid ameNZB subtitle download host".to_string(),
@@ -1516,28 +1531,59 @@ fn connection_field(
     }
 }
 
+/// The public sentence for a failure this plugin describes only in its debug
+/// detail (a malformed reference, redirect or stored state).
+const REQUEST_FAILED: &str = "the ameNZB request could not be completed";
+
 fn plugin_error(error: AmenzbError) -> PluginError {
     match error {
-        AmenzbError::RateLimited(retry_after_seconds) => PluginError {
-            code: PluginErrorCode::RateLimited,
-            public_message: "ameNZB rate limit reached".to_string(),
-            debug_message: None,
-            retry_after_seconds: retry_after_seconds.and_then(|value| i64::try_from(value).ok()),
-            details: None,
-        },
-        AmenzbError::Message(message) => PluginError {
-            code: PluginErrorCode::Permanent,
-            public_message: message,
-            debug_message: None,
-            retry_after_seconds: None,
-            details: None,
-        },
+        AmenzbError::RateLimited(retry_after_seconds) => {
+            let builder = pdk_error(PluginErrorCode::RateLimited, "ameNZB rate limit reached");
+            match retry_after_seconds.and_then(|value| i64::try_from(value).ok()) {
+                Some(seconds) => builder.retry_after_seconds(seconds),
+                None => builder,
+            }
+            .build()
+        }
+        AmenzbError::Plugin(error) => error,
+        AmenzbError::Message(message) => pdk_error(PluginErrorCode::Permanent, REQUEST_FAILED)
+            .debug(message)
+            .build(),
     }
+}
+
+/// A subtitle download the site answered with an error status.
+fn download_status_error(status: u16) -> AmenzbError {
+    let builder = match status {
+        404 | 410 => pdk_error(
+            codes::ITEM_NOT_FOUND,
+            "the ameNZB subtitle no longer exists",
+        ),
+        500..=599 => pdk_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "ameNZB answered with a server error",
+        ),
+        _ => pdk_error(
+            PluginErrorCode::Permanent,
+            "ameNZB refused the subtitle download",
+        ),
+    };
+    AmenzbError::Plugin(
+        builder
+            .debug(format_args!(
+                "ameNZB subtitle download returned HTTP {status}"
+            ))
+            .build(),
+    )
 }
 
 #[derive(Debug, Clone)]
 enum AmenzbError {
     RateLimited(Option<u64>),
+    /// A failure already classified, by the shared newznab engine (a rejected
+    /// API key, an exhausted quota) or by this plugin.
+    Plugin(PluginError),
+    /// A failure with no better classification; the text is debug detail.
     Message(String),
 }
 
@@ -1558,12 +1604,10 @@ impl AmenzbError {
                         .and_then(|seconds| u64::try_from(seconds).ok()),
                 );
             }
-            return Self::Message(
-                plugin_error
-                    .debug_message
-                    .clone()
-                    .unwrap_or_else(|| plugin_error.public_message.clone()),
-            );
+            // Everything else the engine classified (a rejected API key, a
+            // disabled account, an exhausted quota, an unreadable answer)
+            // reaches the operator with the engine's own code and sentence.
+            return Self::Plugin(plugin_error.clone());
         }
 
         let message = error.to_string();
@@ -1573,7 +1617,7 @@ impl AmenzbError {
         {
             Self::RateLimited(None)
         } else {
-            Self::Message(message)
+            Self::Plugin(plugin_error_from(&error))
         }
     }
 }
@@ -1582,6 +1626,7 @@ impl std::fmt::Display for AmenzbError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RateLimited(_) => write!(formatter, "ameNZB rate limit reached"),
+            Self::Plugin(error) => write!(formatter, "{}", error.public_message),
             Self::Message(message) => write!(formatter, "{message}"),
         }
     }
