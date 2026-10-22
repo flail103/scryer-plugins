@@ -159,6 +159,9 @@ struct TransmissionTorrent {
     /// Unix seconds; `0` when the torrent has never finished.
     #[serde(default, rename = "doneDate")]
     done_date: i64,
+    /// Unix seconds the torrent was added to Transmission.
+    #[serde(default, rename = "addedDate")]
+    added_date: i64,
     #[serde(default)]
     labels: Vec<String>,
     #[serde(default, rename = "seedRatioLimit")]
@@ -187,25 +190,18 @@ struct TransmissionTorrent {
 /// every failure this plugin can name carries its own code instead
 /// (`00-common.md` rule 4, mirroring Sonarr's exception classes in
 /// `TransmissionProxy.cs:263-374` and `TransmissionBase.cs:282-311`).
-fn plugin_error(code: PluginErrorCode, public_message: impl Into<String>) -> PluginError {
-    PluginError {
-        code,
-        public_message: public_message.into(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+fn typed_error(code: impl Into<PluginErrorCode>, public_message: impl Into<String>) -> PluginError {
+    plugin_error(code, public_message).build()
 }
 
 fn detailed_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: impl Into<String>,
     debug_message: impl Into<String>,
 ) -> PluginError {
-    PluginError {
-        debug_message: Some(debug_message.into()),
-        ..plugin_error(code, public_message)
-    }
+    plugin_error(code, public_message)
+        .debug(debug_message.into())
+        .build()
 }
 
 fn respond<T: serde::Serialize>(result: Result<T, PluginError>) -> FnResult<String> {
@@ -321,6 +317,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "transmission".to_string(),
             provider_aliases: vec!["vuze".to_string(), "azureus".to_string()],
@@ -396,6 +393,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
                 // The post-import mark the core actually calls. Both marks run
                 // the same label-only body; neither removes anything.
                 mark_imported_non_destructive: true,
+                // Transmission fetches torrents and magnets only.
+                http: None,
             },
         }),
     };
@@ -414,7 +413,14 @@ fn add(input: &str) -> Result<PluginDownloadClientAddResponse, PluginError> {
     let request: PluginDownloadClientAddRequest = parse_request(input)?;
     let config = TransmissionConfig::from_host();
     if let Some(problem) = conflicting_settings(&config) {
-        return Err(plugin_error(PluginErrorCode::InvalidConfig, problem));
+        return Err(typed_error(PluginErrorCode::InvalidConfig, problem));
+    }
+
+    if request.source.kind == DownloadInputKind::HttpResource {
+        return Err(typed_error(
+            PluginErrorCode::Unsupported,
+            "Transmission cannot download HTTP resources.",
+        ));
     }
 
     let mut arguments = serde_json::Map::new();
@@ -426,7 +432,7 @@ fn add(input: &str) -> Result<PluginDownloadClientAddResponse, PluginError> {
     } else if let Some(source) = source_url(&request) {
         arguments.insert("filename".to_string(), serde_json::Value::String(source));
     } else {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Permanent,
             "download source is missing",
         ));
@@ -487,7 +493,7 @@ fn add(input: &str) -> Result<PluginDownloadClientAddResponse, PluginError> {
                 .map(normalize_hash)
         })
         .ok_or_else(|| {
-            plugin_error(
+            typed_error(
                 PluginErrorCode::Permanent,
                 "Transmission accepted the torrent but reported no hash, and the release carried none either.",
             )
@@ -588,7 +594,7 @@ fn control(input: &str) -> Result<(), PluginError> {
     let config = TransmissionConfig::from_host();
     let hash = normalize_hash(&request.client_item_id);
     if hash.is_empty() {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Permanent,
             "client_item_id is required",
         ));
@@ -620,7 +626,7 @@ fn control(input: &str) -> Result<(), PluginError> {
             )?;
         }
         DownloadControlAction::ForceStart => {
-            return Err(plugin_error(
+            return Err(typed_error(
                 PluginErrorCode::Unsupported,
                 "Transmission does not support force_start through this plugin",
             ));
@@ -656,7 +662,7 @@ fn mark_imported(input: &str) -> Result<(), PluginError> {
             .unwrap_or(request.client_item_id.as_str()),
     );
     if hash.is_empty() {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Permanent,
             "client_item_id is required",
         ));
@@ -799,7 +805,7 @@ pub fn scryer_download_test_connection(_input: String) -> FnResult<String> {
 fn test_connection() -> Result<String, PluginError> {
     let config = TransmissionConfig::from_host();
     if let Some(problem) = settings_problem(&config) {
-        return Err(plugin_error(PluginErrorCode::InvalidConfig, problem));
+        return Err(typed_error(PluginErrorCode::InvalidConfig, problem));
     }
 
     // `GetClientVersion(settings, force: true)` (`TransmissionProxy.cs:139-149`):
@@ -819,7 +825,7 @@ fn test_connection() -> Result<String, PluginError> {
             test_get_torrents(&config)?;
             Ok(version.to_string())
         }
-        Some(version) => Err(plugin_error(
+        Some(version) => Err(typed_error(
             PluginErrorCode::InvalidConfig,
             format!(
                 "Transmission {version} is not supported; version {MINIMUM_SUPPORTED_VERSION} or newer is required."
@@ -838,7 +844,7 @@ fn test_connection() -> Result<String, PluginError> {
                     test_get_torrents(&config)?;
                     Ok(format!("RPC {protocol}"))
                 }
-                _ => Err(plugin_error(
+                _ => Err(typed_error(
                     PluginErrorCode::InvalidConfig,
                     format!(
                         "Transmission reported the version \"{reported}\", which is neither a client version {MINIMUM_SUPPORTED_VERSION} or newer nor an RPC protocol version {VUZE_MINIMUM_PROTOCOL_VERSION} or newer."
@@ -850,12 +856,10 @@ fn test_connection() -> Result<String, PluginError> {
 }
 
 fn test_get_torrents(config: &TransmissionConfig) -> Result<(), PluginError> {
-    list_torrents(config)
-        .map(|_| ())
-        .map_err(|error| PluginError {
-            public_message: format!("Failed to get torrents: {}", error.public_message),
-            ..error
-        })
+    list_torrents(config).map(|_| ()).map_err(|mut error| {
+        error.public_message = format!("Failed to get torrents: {}", error.public_message);
+        error
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1065,7 @@ fn rpc(
     let mut response = rpc_once(config, &encoded, cached_var(SESSION_VAR_KEY))?;
     if response.status_code() == 409 {
         let session_id = extract_session_id(&response).ok_or_else(|| {
-            plugin_error(
+            typed_error(
                 PluginErrorCode::InvalidConfig,
                 "Remote host did not return a Session Id; check that the URL base points at Transmission's RPC endpoint.",
             )
@@ -1075,68 +1079,120 @@ fn rpc(
     if let Some(error) = classify_http_status(
         status,
         header_value(&response, "location").as_deref(),
+        header_value(&response, "retry-after").as_deref(),
         &body_text,
     ) {
         return Err(error);
     }
 
     let parsed: RpcResponse = serde_json::from_str(&body_text).map_err(|error| {
+        // A web page where the RPC endpoint should be is the wrong URL base;
+        // anything else is Transmission answering with something unreadable.
+        let code = if looks_like_html(&body_text) {
+            codes::ENDPOINT_NOT_FOUND
+        } else {
+            codes::INVALID_RESPONSE
+        };
         detailed_error(
-            PluginErrorCode::InvalidConfig,
+            code,
             "The configured URL did not answer with a Transmission RPC response; check host, port and URL base.",
             format!("{error}: {}", truncate(&body_text)),
         )
     })?;
     if parsed.result != "success" {
-        return Err(detailed_error(
-            PluginErrorCode::Permanent,
-            format!("Transmission rejected {method}: {}", parsed.result),
-            truncate(&body_text),
-        ));
+        return Err(rpc_result_error(method, &parsed.result, &body_text));
     }
     Ok(parsed)
+}
+
+/// Transmission's `result` string is free text; it names the few refusals an
+/// operator can act on.
+fn rpc_result_error(method: &str, result: &str, body: &str) -> PluginError {
+    let lowered = result.to_ascii_lowercase();
+    let debug = format!(
+        "Transmission rejected {method}: {result}: {}",
+        truncate(body)
+    );
+    if lowered.contains("permission denied") || lowered.contains("read-only") {
+        detailed_error(
+            codes::PATH_NOT_WRITABLE,
+            "Transmission cannot write to the download directory.",
+            debug,
+        )
+    } else if method == "torrent-add" {
+        detailed_error(
+            codes::DOWNLOAD_REJECTED,
+            "Transmission refused to add the torrent.",
+            debug,
+        )
+    } else {
+        detailed_error(
+            PluginErrorCode::Permanent,
+            format!("Transmission rejected {method}."),
+            debug,
+        )
+    }
+}
+
+fn looks_like_html(body: &str) -> bool {
+    let start = body.trim_start();
+    let start = &start[..start.len().min(64)];
+    let start = start.to_ascii_lowercase();
+    start.starts_with("<!doctype html") || start.starts_with("<html")
 }
 
 /// The host runs plugin HTTP with `redirect::Policy::none()`
 /// (`scryer-outbound-http::prepare_plugin_blocking_http_target`), which is
 /// Sonarr's `AllowAutoRedirect = false` (`TransmissionProxy.cs:258`): a login
 /// page behind a redirect arrives here as a 3xx, not as a JSON parse failure.
-fn classify_http_status(status: u16, location: Option<&str>, body: &str) -> Option<PluginError> {
+fn classify_http_status(
+    status: u16,
+    location: Option<&str>,
+    retry_after: Option<&str>,
+    body: &str,
+) -> Option<PluginError> {
     match status {
         200..=299 => None,
-        300..=399 => Some(plugin_error(
-            PluginErrorCode::InvalidConfig,
+        // The location can carry credentials or internal hosts, so it is
+        // logged, never shown.
+        300..=399 => Some(detailed_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "Remote site redirected the RPC request; check host, port and URL base.",
             match location.map(str::trim).filter(|value| !value.is_empty()) {
-                Some(location) => format!("Remote site redirected to {location}"),
-                None => "Remote site redirected the RPC request; check host, port and URL base."
-                    .to_string(),
+                Some(location) => format!("HTTP {status} redirect to {location}"),
+                None => format!("HTTP {status} redirect without a location"),
             },
         )),
-        401 => Some(plugin_error(
-            PluginErrorCode::AuthFailed,
+        401 => Some(typed_error(
+            codes::INVALID_USERNAME_PASSWORD,
             "Failed to authenticate with Transmission: user authentication failed.",
         )),
-        403 => Some(plugin_error(
+        403 => Some(typed_error(
             PluginErrorCode::AuthFailed,
             "Failed to authenticate with Transmission. It may be necessary to add Scryer's IP address to the RPC whitelist.",
         )),
-        404 => Some(plugin_error(
-            PluginErrorCode::InvalidConfig,
+        404 => Some(typed_error(
+            codes::ENDPOINT_NOT_FOUND,
             "Transmission's RPC endpoint was not found; check the URL base.",
         )),
-        409 => Some(plugin_error(
+        409 => Some(typed_error(
             PluginErrorCode::InvalidConfig,
             "Transmission kept rejecting the session id; check the URL base and any reverse proxy in front of it.",
         )),
-        429 => Some(PluginError {
-            retry_after_seconds: Some(60),
-            ..plugin_error(
-                PluginErrorCode::Temporary,
+        429 => Some(
+            plugin_error(
+                PluginErrorCode::RateLimited,
                 "Transmission is rate limiting Scryer.",
             )
-        }),
+            .retry_after_seconds(
+                retry_after
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+                    .unwrap_or(60),
+            )
+            .build(),
+        ),
         500..=599 => Some(detailed_error(
-            PluginErrorCode::Temporary,
+            PluginErrorCode::UpstreamUnavailable,
             format!("Transmission returned HTTP {status}."),
             truncate(body),
         )),
@@ -1174,40 +1230,26 @@ fn rpc_once(
         request = request.with_header("X-Transmission-Session-Id", session_id);
     }
     http::request::<Vec<u8>>(&request, Some(body.to_vec()))
-        .map_err(|error| classify_transport_error(&error.to_string()))
+        .map_err(|error| classify_transport_error(&error))
 }
 
-/// The host hands transport failures back as a string, so classification is by
-/// substring. It reports a timeout as the literal `timeout`
-/// (`crates/scryer-plugins/src/plugin_http_host.rs:911-916`); a TLS trust
-/// failure is only distinguishable by the text reqwest produced, which is the
-/// closest this surface gets to Sonarr's `WebExceptionStatus.TrustFailure`
-/// (`TransmissionProxy.cs:365-372`).
-fn classify_transport_error(detail: &str) -> PluginError {
-    let lowered = detail.to_ascii_lowercase();
-    if lowered.contains("timeout") || lowered.contains("timed out") {
-        detailed_error(
-            PluginErrorCode::Temporary,
-            "Transmission did not answer in time.",
-            detail,
-        )
-    } else if lowered.contains("certificate")
-        || lowered.contains("tls")
-        || lowered.contains("ssl")
-        || lowered.contains("trust")
-    {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to connect to Transmission: certificate validation failed.",
-            detail,
-        )
+/// The PDK reads the host's own failure detail — which the error's `Display`
+/// does not carry — so it decides the code: a TLS trust failure is
+/// `tls_error` (Sonarr's `WebExceptionStatus.TrustFailure`,
+/// `TransmissionProxy.cs:365-372`), a refused connection or DNS failure is
+/// `UpstreamUnavailable`, and a timeout is `Temporary`. The sentence stays this
+/// plugin's.
+fn classify_transport_error(error: &Error) -> PluginError {
+    let mut classified = scryer_plugin_pdk::error::plugin_error_from(error);
+    let code = &classified.code;
+    classified.public_message = if *code == PluginErrorCode::from(codes::TLS_ERROR) {
+        "Unable to connect to Transmission: certificate validation failed.".to_string()
+    } else if *code == PluginErrorCode::UpstreamUnavailable {
+        "Unable to connect to Transmission, please check your settings.".to_string()
     } else {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to connect to Transmission, please check your settings.",
-            detail,
-        )
-    }
+        "Transmission did not answer in time.".to_string()
+    };
+    classified
 }
 
 fn encode_error(error: serde_json::Error) -> PluginError {
@@ -1261,7 +1303,7 @@ fn session_get(config: &TransmissionConfig) -> Result<SessionConfig, PluginError
     let response = rpc(config, "session-get", None)?;
     let session: SessionConfig = serde_json::from_value(response.arguments).map_err(|error| {
         detailed_error(
-            PluginErrorCode::InvalidConfig,
+            codes::INVALID_RESPONSE,
             "Transmission returned a session payload this plugin could not read.",
             error.to_string(),
         )
@@ -1316,6 +1358,7 @@ fn list_torrents(config: &TransmissionConfig) -> Result<Vec<TransmissionTorrent>
         "rateDownload",
         "rateUpload",
         "doneDate",
+        "addedDate",
         "seedRatioLimit",
         "seedRatioMode",
         "seedIdleLimit",
@@ -1343,7 +1386,7 @@ fn parse_torrents(response: &RpcResponse) -> Result<Vec<TransmissionTorrent>, Pl
     )
     .map_err(|error| {
         detailed_error(
-            PluginErrorCode::InvalidConfig,
+            codes::INVALID_RESPONSE,
             "Transmission returned a torrent listing this plugin could not read.",
             error.to_string(),
         )
@@ -1389,7 +1432,9 @@ fn source_url(request: &PluginDownloadClientAddRequest) -> Option<String> {
             .clone()
             .or_else(|| request.source.download_url.clone())
             .or_else(|| request.source.magnet_uri.clone()),
-        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl => None,
+        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl | DownloadInputKind::HttpResource => {
+            None
+        }
     }
 }
 
@@ -1577,6 +1622,8 @@ fn torrent_to_item(
         removed: Some(false),
         raw_state: Some(torrent.status.to_string()),
         completed_at: unix_to_rfc3339(torrent.done_date),
+        added_at: unix_to_rfc3339(torrent.added_date),
+        http: None,
     }
 }
 
@@ -1603,6 +1650,7 @@ fn torrent_to_completed(
         completed_at: unix_to_rfc3339(torrent.done_date),
         parameters: Vec::new(),
         release_name: None,
+        subtitle_paths: Vec::new(),
     }
 }
 
@@ -2748,15 +2796,18 @@ mod tests {
 
     #[test]
     fn http_statuses_carry_sonarrs_distinctions_as_typed_codes() {
-        let classify = |status| classify_http_status(status, None, "");
+        let classify = |status| classify_http_status(status, None, None, "");
         for (status, code) in [
-            (401_u16, PluginErrorCode::AuthFailed),
+            (
+                401_u16,
+                PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD),
+            ),
             (403, PluginErrorCode::AuthFailed),
-            (404, PluginErrorCode::InvalidConfig),
+            (404, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)),
             (409, PluginErrorCode::InvalidConfig),
-            (429, PluginErrorCode::Temporary),
-            (500, PluginErrorCode::Temporary),
-            (503, PluginErrorCode::Temporary),
+            (429, PluginErrorCode::RateLimited),
+            (500, PluginErrorCode::UpstreamUnavailable),
+            (503, PluginErrorCode::UpstreamUnavailable),
             (418, PluginErrorCode::Permanent),
         ] {
             let error = classify(status).unwrap_or_else(|| panic!("status {status} is an error"));
@@ -2764,6 +2815,14 @@ mod tests {
         }
         assert!(classify(200).is_none());
         assert!(classify(204).is_none());
+
+        assert_eq!(classify(429).unwrap().retry_after_seconds, Some(60));
+        assert_eq!(
+            classify_http_status(429, None, Some("15"), "")
+                .unwrap()
+                .retry_after_seconds,
+            Some(15)
+        );
 
         // Sonarr's 403 names the RPC whitelist, which is the actual fix.
         assert!(
@@ -2775,42 +2834,74 @@ mod tests {
     }
 
     #[test]
+    fn rpc_refusals_name_what_transmission_refused() {
+        assert_eq!(
+            rpc_result_error("torrent-add", "invalid or corrupt torrent file", "{}").code,
+            PluginErrorCode::from(codes::DOWNLOAD_REJECTED)
+        );
+        assert_eq!(
+            rpc_result_error("torrent-add", "Permission denied", "{}").code,
+            PluginErrorCode::from(codes::PATH_NOT_WRITABLE)
+        );
+        let other = rpc_result_error("torrent-set", "no such torrent", "{}");
+        assert_eq!(other.code, PluginErrorCode::Permanent);
+        assert!(!other.public_message.contains("no such torrent"));
+        assert!(looks_like_html("<!DOCTYPE html><html>"));
+        assert!(!looks_like_html("{\"result\":\"success\"}"));
+    }
+
+    #[test]
     fn a_redirect_reports_where_it_went_instead_of_a_parse_failure() {
         // The host never follows redirects for plugin HTTP, so a login page
         // arrives as a 3xx and must not be mistaken for a broken RPC response.
         let redirected =
-            classify_http_status(301, Some("http://downloader.example/login"), "").unwrap();
-        assert_eq!(redirected.code, PluginErrorCode::InvalidConfig);
+            classify_http_status(301, Some("http://downloader.example/login"), None, "").unwrap();
         assert_eq!(
-            redirected.public_message,
-            "Remote site redirected to http://downloader.example/login"
+            redirected.code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        assert!(!redirected.public_message.contains("downloader.example"));
+        assert!(
+            redirected
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("http://downloader.example/login")
         );
         assert_eq!(
-            classify_http_status(302, None, "").unwrap().code,
-            PluginErrorCode::InvalidConfig
+            classify_http_status(302, None, None, "").unwrap().code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
         );
     }
 
     #[test]
     fn transport_failures_are_classified_by_what_the_host_could_tell_us() {
+        // The host's HTTP service reports every transport failure as a
+        // `Temporary` service error whose debug detail is the transport text.
+        let host_failure = |detail: &str| {
+            Error::new(scryer_plugin_pdk::host::HostCallError::Service(
+                plugin_error(PluginErrorCode::Temporary, "plugin HTTP request failed")
+                    .debug(detail)
+                    .build(),
+            ))
+        };
         assert_eq!(
-            classify_transport_error("timeout").code,
+            classify_transport_error(&host_failure("operation timed out")).code,
             PluginErrorCode::Temporary
         );
-        assert_eq!(
-            classify_transport_error("invalid peer certificate: UnknownIssuer").code,
-            PluginErrorCode::UpstreamUnavailable
-        );
-        assert!(
-            classify_transport_error("invalid peer certificate: UnknownIssuer")
-                .public_message
-                .contains("certificate validation failed")
-        );
-        let refused = classify_transport_error("error sending request: connection refused");
+        let tls =
+            classify_transport_error(&host_failure("invalid peer certificate: UnknownIssuer"));
+        assert_eq!(tls.code, PluginErrorCode::from(codes::TLS_ERROR));
+        assert!(tls.public_message.contains("certificate validation failed"));
+        let refused =
+            classify_transport_error(&host_failure("error sending request: connection refused"));
         assert_eq!(refused.code, PluginErrorCode::UpstreamUnavailable);
-        assert_eq!(
-            refused.debug_message.as_deref(),
-            Some("error sending request: connection refused")
+        assert!(
+            refused
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("connection refused")
         );
     }
 

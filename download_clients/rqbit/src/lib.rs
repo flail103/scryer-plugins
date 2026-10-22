@@ -7,8 +7,8 @@ use scryer_plugin_sdk::{
     DownloadItemState, DownloadTorrentCapabilities, PluginCompletedDownload, PluginDescriptor,
     PluginDownloadClientAddRequest, PluginDownloadClientAddResponse,
     PluginDownloadClientControlRequest, PluginDownloadClientMarkImportedRequest,
-    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadOutputKind, PluginError,
-    PluginErrorCode, PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
+    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadOutputKind, PluginErrorCode,
+    PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,14 +102,11 @@ struct RqbitSeedConfig {
     seed_time_seconds: Option<i64>,
 }
 
-fn plugin_error<T>(code: PluginErrorCode, public_message: impl Into<String>) -> PluginResult<T> {
-    PluginResult::Err(PluginError {
-        code,
-        public_message: public_message.into(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    })
+fn error_result<T>(
+    code: impl Into<PluginErrorCode>,
+    public_message: impl Into<String>,
+) -> PluginResult<T> {
+    PluginResult::Err(plugin_error(code, public_message).build())
 }
 
 pub fn scryer_describe(_input: String) -> FnResult<String> {
@@ -120,6 +117,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "rqbit".to_string(),
             provider_aliases: vec!["rqbit-web".to_string()],
@@ -148,6 +146,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
                 per_download_directory: false,
                 host_fs_required: false,
                 test_connection: true,
+                // rqbit only fetches torrents.
+                http: None,
                 torrent: Some(DownloadTorrentCapabilities {
                     supported_sources: vec![
                         DownloadInputKind::MagnetUri,
@@ -195,13 +195,14 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
     let request: PluginDownloadClientAddRequest = serde_json::from_str(&input)?;
     let config = RqbitConfig::from_config()?;
     let body = if let Some(bytes) = request.source.torrent_bytes_base64.as_deref() {
-        STANDARD
-            .decode(bytes)
-            .map_err(|error| Error::msg(format!("invalid torrent_bytes_base64: {error}")))?
+        STANDARD.decode(bytes).or_plugin_error(
+            PluginErrorCode::Permanent,
+            "Scryer sent torrent bytes RQBit could not accept.",
+        )?
     } else if let Some(source) = source_url(&request) {
         source.into_bytes()
     } else {
-        return Ok(serde_json::to_string(&plugin_error::<
+        return Ok(serde_json::to_string(&error_result::<
             PluginDownloadClientAddResponse,
         >(
             PluginErrorCode::Permanent,
@@ -210,8 +211,7 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
     };
 
     let response = post_bytes(&config, &add_torrent_path(&config), body)?;
-    let parsed: PostTorrentResponse = serde_json::from_str(&response)
-        .map_err(|error| Error::msg(format!("RQBit add response parse failed: {error}")))?;
+    let parsed: PostTorrentResponse = parse_json(&response)?;
     let hash = parsed
         .details
         .map(|details| normalize_hash(&details.info_hash))
@@ -224,7 +224,13 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
                 .as_deref()
                 .map(normalize_hash)
         })
-        .ok_or_else(|| Error::msg("RQBit did not return an info hash"))?;
+        .ok_or_else(|| {
+            plugin_error(
+                codes::INVALID_RESPONSE,
+                "RQBit did not return an info hash for the added torrent.",
+            )
+            .into_error()
+        })?;
     store_seed_config(&hash, &request)?;
 
     Ok(serde_json::to_string(&PluginResult::Ok(
@@ -271,7 +277,7 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
     let config = RqbitConfig::from_config()?;
     let hash = normalize_hash(&request.client_item_id);
     if hash.is_empty() {
-        return Ok(serde_json::to_string(&plugin_error::<()>(
+        return Ok(serde_json::to_string(&error_result::<()>(
             PluginErrorCode::Permanent,
             "client_item_id is required",
         ))?);
@@ -288,7 +294,7 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
         DownloadControlAction::Pause
         | DownloadControlAction::Resume
         | DownloadControlAction::ForceStart => {
-            return Ok(serde_json::to_string(&plugin_error::<()>(
+            return Ok(serde_json::to_string(&error_result::<()>(
                 PluginErrorCode::Unsupported,
                 "RQBit does not support this control action through Scryer's client",
             ))?);
@@ -299,7 +305,7 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
 
 pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
     let _: PluginDownloadClientMarkImportedRequest = serde_json::from_str(&input)?;
-    Ok(serde_json::to_string(&plugin_error::<()>(
+    Ok(serde_json::to_string(&error_result::<()>(
         PluginErrorCode::Unsupported,
         "RQBit has no category, label, or imported view to mark after import",
     ))?)
@@ -307,8 +313,7 @@ pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
 
 pub fn scryer_download_status(_input: String) -> FnResult<String> {
     let config = RqbitConfig::from_config()?;
-    let root: RootResponse = serde_json::from_str(&get_text(&config, "")?)
-        .map_err(|error| Error::msg(format!("RQBit root response parse failed: {error}")))?;
+    let root: RootResponse = parse_json(&get_text(&config, "")?)?;
     Ok(serde_json::to_string(&PluginResult::Ok(
         PluginDownloadClientStatus {
             version: Some(root.version),
@@ -323,10 +328,9 @@ pub fn scryer_download_status(_input: String) -> FnResult<String> {
 
 pub fn scryer_download_test_connection(_input: String) -> FnResult<String> {
     let config = RqbitConfig::from_config()?;
-    let root: RootResponse = serde_json::from_str(&get_text(&config, "")?)
-        .map_err(|error| Error::msg(format!("RQBit root response parse failed: {error}")))?;
+    let root: RootResponse = parse_json(&get_text(&config, "")?)?;
     if version_lt(&root.version, "8.0.0") {
-        return Ok(serde_json::to_string(&plugin_error::<String>(
+        return Ok(serde_json::to_string(&error_result::<String>(
             PluginErrorCode::Permanent,
             format!(
                 "RQBit {} is older than Scryer's required 8.0.0",
@@ -460,8 +464,7 @@ fn config_fields() -> Vec<ConfigFieldDef> {
 
 fn list_torrents(config: &RqbitConfig) -> Result<Vec<TorrentWithStats>, Error> {
     let response: ListTorrentsResponse =
-        serde_json::from_str(&get_text(config, "/torrents?with_stats=true")?)
-            .map_err(|error| Error::msg(format!("RQBit torrent list parse failed: {error}")))?;
+        parse_json(&get_text(config, "/torrents?with_stats=true")?)?;
     Ok(response.torrents)
 }
 
@@ -469,13 +472,8 @@ fn get_text(config: &RqbitConfig, path: &str) -> Result<String, Error> {
     let request = HttpRequest::new(api_url(config, path))
         .with_header("User-Agent", "scryer-rqbit-plugin/0.1");
     let response = http::request::<Vec<u8>>(&request, None)
-        .map_err(|error| Error::msg(format!("RQBit request failed: {error}")))?;
-    let status = response.status_code();
-    let body = String::from_utf8_lossy(&response.body()).to_string();
-    if status >= 400 {
-        return Err(Error::msg(format!("RQBit returned HTTP {status}: {body}")));
-    }
-    Ok(body)
+        .map_err(|error| error.context("RQBit request failed"))?;
+    checked_body("GET", path, &response)
 }
 
 fn post_bytes(config: &RqbitConfig, path: &str, body: Vec<u8>) -> Result<String, Error> {
@@ -483,13 +481,81 @@ fn post_bytes(config: &RqbitConfig, path: &str, body: Vec<u8>) -> Result<String,
         .with_method("POST")
         .with_header("User-Agent", "scryer-rqbit-plugin/0.1");
     let response = http::request::<Vec<u8>>(&request, Some(body))
-        .map_err(|error| Error::msg(format!("RQBit request failed: {error}")))?;
+        .map_err(|error| error.context("RQBit request failed"))?;
+    checked_body("POST", path, &response)
+}
+
+fn checked_body(method: &str, path: &str, response: &HttpResponse) -> Result<String, Error> {
     let status = response.status_code();
     let body = String::from_utf8_lossy(&response.body()).to_string();
     if status >= 400 {
-        return Err(Error::msg(format!("RQBit returned HTTP {status}: {body}")));
+        let retry_after = response
+            .headers()
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.clone());
+        return Err(http_failure(
+            method,
+            path,
+            status,
+            retry_after.as_deref(),
+            &body,
+        ));
     }
     Ok(body)
+}
+
+/// What an HTTP failure from rqbit's REST API means. rqbit has no credential
+/// of its own, so a 401/403 comes from whatever sits in front of it and cannot
+/// name a setting.
+fn http_failure(
+    method: &str,
+    path: &str,
+    status: u16,
+    retry_after: Option<&str>,
+    body: &str,
+) -> Error {
+    let debug = format!("{method} {path} returned HTTP {status}: {body}");
+    let on_torrent = path.starts_with("/torrents/");
+    let is_add = method == "POST" && path.starts_with("/torrents?");
+    match status {
+        401 | 403 => plugin_error(
+            PluginErrorCode::AuthFailed,
+            "RQBit rejected the request as unauthorized.",
+        ),
+        404 if on_torrent => {
+            plugin_error(codes::ITEM_NOT_FOUND, "RQBit no longer has that torrent.")
+        }
+        404 => plugin_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "No RQBit API was found at this address; check host, port and URL base.",
+        ),
+        400 | 422 if is_add => plugin_error(
+            codes::DOWNLOAD_REJECTED,
+            "RQBit refused to add the torrent.",
+        ),
+        _ => {
+            return check_http_status(status, retry_after)
+                .err()
+                .map(|error| error.context(debug.clone()))
+                .unwrap_or_else(|| Error::msg(debug.clone()));
+        }
+    }
+    .debug(debug)
+    .into_error()
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, Error> {
+    serde_json::from_str(body).map_err(|error| {
+        let code = if body.trim_start().starts_with('<') {
+            codes::ENDPOINT_NOT_FOUND
+        } else {
+            codes::INVALID_RESPONSE
+        };
+        plugin_error(code, "RQBit returned a response Scryer could not read.")
+            .debug(format!("{error}: {body}"))
+            .into_error()
+    })
 }
 
 fn api_url(config: &RqbitConfig, path: &str) -> String {
@@ -572,6 +638,9 @@ fn torrent_to_item(torrent: TorrentWithStats) -> PluginDownloadItem {
         removed: Some(false),
         raw_state: Some(torrent.stats.state.clone()),
         completed_at,
+        // rqbit's REST API does not report when a torrent was added.
+        added_at: None,
+        http: None,
     }
 }
 
@@ -596,6 +665,7 @@ fn torrent_to_completed(torrent: TorrentWithStats) -> PluginCompletedDownload {
         completed_at,
         parameters: Vec::new(),
         release_name: None,
+        subtitle_paths: Vec::new(),
     }
 }
 
@@ -751,7 +821,9 @@ fn source_url(request: &PluginDownloadClientAddRequest) -> Option<String> {
             .clone()
             .or_else(|| request.source.download_url.clone())
             .or_else(|| request.source.magnet_uri.clone()),
-        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl => None,
+        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl | DownloadInputKind::HttpResource => {
+            None
+        }
     }
 }
 
@@ -926,6 +998,58 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    fn classified(error: Error) -> PluginError {
+        scryer_plugin_pdk::error::plugin_error_from(&error)
+    }
+
+    /// rqbit has no credential setting, so an unauthorized answer from a
+    /// proxy in front of it is an auth failure that names no setting rather
+    /// than a retried generic error.
+    #[test]
+    fn an_unauthorized_answer_is_an_auth_failure() {
+        let error = classified(http_failure("GET", "", 401, None, "Unauthorized"));
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert!(!error.public_message.contains("Unauthorized"));
+    }
+
+    #[test]
+    fn http_failures_carry_the_code_the_operator_can_act_on() {
+        assert_eq!(
+            classified(http_failure("GET", "", 404, None, "")).code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        assert_eq!(
+            classified(http_failure("POST", "/torrents/abc/delete", 404, None, "")).code,
+            PluginErrorCode::from(codes::ITEM_NOT_FOUND)
+        );
+        assert_eq!(
+            classified(http_failure(
+                "POST",
+                "/torrents?overwrite=true",
+                400,
+                None,
+                "bad torrent"
+            ))
+            .code,
+            PluginErrorCode::from(codes::DOWNLOAD_REJECTED)
+        );
+        let limited = classified(http_failure("GET", "/torrents", 429, Some("30"), ""));
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(30));
+        assert_eq!(
+            classified(http_failure("GET", "/torrents", 503, None, "")).code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+    }
+
+    #[test]
+    fn unreadable_bodies_are_invalid_responses_and_html_is_the_wrong_endpoint() {
+        let error = classified(parse_json::<serde_json::Value>("{\"version\":").unwrap_err());
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
+        let error = classified(parse_json::<serde_json::Value>("<html></html>").unwrap_err());
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
     }
 
     fn parse_torrent(json: &str) -> TorrentWithStats {

@@ -34,9 +34,9 @@ fn animetosho_release_wasm_conforms_to_the_subtitle_host_contract() {
         .download_expects_filename("animetosho-xyz-619135-94001-eng.ass.xz")
         .download_expects_content_type("application/x-xz")
         .download_expects_call(&format!("http:{SUBTITLE_DOWNLOAD_URL}"))
-        // This provider reports the transport failure it saw rather than a
-        // code of its own.
-        .refused_expects_message_contains("request failed")
+        // This provider reports the transport failure it saw as an unreachable
+        // upstream; the host's own text goes to the debug detail.
+        .refused_expects_message_contains("could not be reached")
         .run();
 }
 

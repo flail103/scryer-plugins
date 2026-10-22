@@ -11,8 +11,8 @@ use scryer_plugin_sdk::{
     PluginDownloadClientStatus, PluginDownloadFeedbackScope, PluginDownloadItem,
     PluginDownloadListRecentCompletedRequest, PluginDownloadOutputKind,
     PluginDownloadScopedListRequest, PluginDownloadScopedListResponse,
-    PluginDownloadScopedRecentCompletedRequest, PluginError, PluginErrorCode, PluginResult,
-    PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
+    PluginDownloadScopedRecentCompletedRequest, PluginErrorCode, PluginResult, PluginTorrentItem,
+    ProviderDescriptor, SDK_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -50,6 +50,8 @@ struct RTorrentTorrent {
     finished_time: i64,
     /// `d.is_private=`; `None` when the rTorrent build did not return the column.
     is_private: Option<bool>,
+    /// `d.timestamp.started=`; `0` until the torrent has been started.
+    started_time: i64,
 }
 
 impl RTorrentTorrent {
@@ -75,14 +77,16 @@ enum XmlValue {
     Base64(Vec<u8>),
 }
 
-fn plugin_error<T>(code: PluginErrorCode, public_message: impl Into<String>) -> PluginResult<T> {
-    PluginResult::Err(PluginError {
-        code,
-        public_message: public_message.into(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    })
+fn error_result<T>(
+    code: impl Into<PluginErrorCode>,
+    public_message: impl Into<String>,
+) -> PluginResult<T> {
+    PluginResult::Err(plugin_error(code, public_message).build())
+}
+
+/// A failure the bridge delivers with its own code instead of `Temporary`.
+fn rtorrent_error(code: impl Into<PluginErrorCode>, public_message: &str) -> Error {
+    plugin_error(code, public_message).into_error()
 }
 
 pub fn scryer_describe(_input: String) -> FnResult<String> {
@@ -93,6 +97,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "rtorrent".to_string(),
             provider_aliases: vec!["rTorrent".to_string()],
@@ -123,6 +128,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
                 per_download_directory: true,
                 host_fs_required: false,
                 test_connection: true,
+                // rTorrent only fetches torrents.
+                http: None,
                 torrent: Some(DownloadTorrentCapabilities {
                     supported_sources: vec![
                         DownloadInputKind::MagnetUri,
@@ -182,9 +189,10 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
     };
     let mut args = vec![XmlValue::String(String::new())];
     let method = if let Some(bytes) = request.source.torrent_bytes_base64.as_deref() {
-        let decoded = STANDARD
-            .decode(bytes)
-            .map_err(|error| Error::msg(format!("invalid torrent_bytes_base64: {error}")))?;
+        let decoded = STANDARD.decode(bytes).or_plugin_error(
+            PluginErrorCode::Permanent,
+            "Scryer sent torrent bytes rTorrent could not accept.",
+        )?;
         args.push(XmlValue::Base64(decoded));
         if config.add_stopped {
             "load.raw"
@@ -199,7 +207,7 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
             "load.start"
         }
     } else {
-        return Ok(serde_json::to_string(&plugin_error::<
+        return Ok(serde_json::to_string(&error_result::<
             PluginDownloadClientAddResponse,
         >(
             PluginErrorCode::Permanent,
@@ -213,14 +221,21 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
     );
     let response = call_document(&config, method, &args)?;
     if int_response(&response)? != 0 {
-        return Err(Error::msg("rTorrent did not accept the torrent"));
+        return Err(rtorrent_error(
+            codes::DOWNLOAD_REJECTED,
+            "rTorrent did not accept the torrent",
+        ));
     }
     // rTorrent has already taken the torrent by this point, so refusing here
     // would leave the daemon downloading something Scryer has no handle on.
     // Fall back to the magnet's btih and then to the torrent itself before
     // giving up.
-    let hash = derive_info_hash(&request)
-        .ok_or_else(|| Error::msg("rTorrent add could not determine the torrent's info hash"))?;
+    let hash = derive_info_hash(&request).ok_or_else(|| {
+        rtorrent_error(
+            PluginErrorCode::Temporary,
+            "rTorrent add could not determine the torrent's info hash",
+        )
+    })?;
     store_seed_config(&hash, &request)?;
     Ok(serde_json::to_string(&PluginResult::Ok(
         PluginDownloadClientAddResponse {
@@ -329,7 +344,7 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
     match request.action {
         DownloadControlAction::Remove => {
             if request.remove_data {
-                return Ok(serde_json::to_string(&plugin_error::<()>(
+                return Ok(serde_json::to_string(&error_result::<()>(
                     PluginErrorCode::Unsupported,
                     "Scryer deletes rTorrent data through host filesystem access; this ABI only supports d.erase",
                 ))?);
@@ -340,13 +355,16 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
                 &[XmlValue::String(normalize_hash(&request.client_item_id))],
             )?;
             if int_response(&response)? != 0 {
-                return Err(Error::msg("rTorrent did not remove the torrent"));
+                return Err(rtorrent_error(
+                    PluginErrorCode::Temporary,
+                    "rTorrent did not remove the torrent",
+                ));
             }
         }
         DownloadControlAction::Pause
         | DownloadControlAction::Resume
         | DownloadControlAction::ForceStart => {
-            return Ok(serde_json::to_string(&plugin_error::<()>(
+            return Ok(serde_json::to_string(&error_result::<()>(
                 PluginErrorCode::Unsupported,
                 "rTorrent control action is not implemented by Scryer's rTorrent client",
             ))?);
@@ -380,7 +398,8 @@ pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
                 ],
             )?;
             if int_response(&response)? != 0 {
-                return Err(Error::msg(
+                return Err(rtorrent_error(
+                    PluginErrorCode::Temporary,
                     "rTorrent did not preserve the routing category before moving the imported torrent",
                 ));
             }
@@ -394,7 +413,8 @@ pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
             ],
         )?;
         if int_response(&response)? != 0 {
-            return Err(Error::msg(
+            return Err(rtorrent_error(
+                PluginErrorCode::Temporary,
                 "rTorrent did not update the imported torrent category",
             ));
         }
@@ -408,7 +428,8 @@ pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
         ],
     )?;
     if int_response(&response)? != 0 {
-        return Err(Error::msg(
+        return Err(rtorrent_error(
+            PluginErrorCode::Temporary,
             "rTorrent did not add the imported torrent to the imported view",
         ));
     }
@@ -443,7 +464,7 @@ pub fn scryer_download_test_connection(_input: String) -> FnResult<String> {
     let config = RTorrentConfig::from_config()?;
     let version = get_version(&config)?;
     if version_lt(&version, "0.9.0") {
-        return Ok(serde_json::to_string(&plugin_error::<String>(
+        return Ok(serde_json::to_string(&error_result::<String>(
             PluginErrorCode::Permanent,
             format!("rTorrent {version} is older than Scryer's required 0.9.0"),
         ))?);
@@ -627,6 +648,10 @@ fn list_torrents(config: &RTorrentConfig) -> Result<Vec<RTorrentTorrent>, Error>
             XmlValue::String("d.timestamp.finished=".to_string()),
             // Appended last so older rTorrent builds that omit it keep parsing.
             XmlValue::String("d.is_private=".to_string()),
+            // When the torrent was started in this session; rTorrent 0.9's
+            // nearest thing to an add time (`d.creation_date` is the
+            // metainfo's own creation date, not the add).
+            XmlValue::String("d.timestamp.started=".to_string()),
         ],
     )?;
     parse_torrents(&response)
@@ -655,22 +680,80 @@ fn call_document(
         request = request.with_header("Authorization", format!("Basic {auth}"));
     }
     let response = http::request::<Vec<u8>>(&request, Some(body.into_bytes()))
-        .map_err(|error| Error::msg(format!("rTorrent XML-RPC request failed: {error}")))?;
+        .map_err(|error| error.context("rTorrent XML-RPC request failed"))?;
     let status = response.status_code();
     let text = String::from_utf8_lossy(&response.body()).to_string();
-    if status >= 400 {
-        return Err(Error::msg(format!(
-            "rTorrent XML-RPC returned HTTP {status}: {text}"
-        )));
+    if status >= 300 {
+        let retry_after = response
+            .headers()
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.clone());
+        return Err(http_failure(config, status, retry_after.as_deref(), &text));
     }
-    check_fault(&text)?;
+    check_fault(method, &text)?;
     Ok(text)
 }
 
+/// The XML-RPC endpoint sits behind a web server (SCGI mount or a ruTorrent
+/// `RPC2`), so its HTTP status is about that server: a 401 there is the
+/// configured basic-auth username and password being refused.
+fn http_failure(
+    config: &RTorrentConfig,
+    status: u16,
+    retry_after: Option<&str>,
+    body: &str,
+) -> Error {
+    let debug = format!("rTorrent XML-RPC returned HTTP {status}: {body}");
+    let error = match status {
+        401 | 403 if !config.username.is_empty() || !config.password.is_empty() => plugin_error(
+            codes::INVALID_USERNAME_PASSWORD,
+            "rTorrent rejected the configured username or password.",
+        ),
+        401 | 403 => plugin_error(
+            PluginErrorCode::AuthFailed,
+            "rTorrent's XML-RPC endpoint requires credentials.",
+        ),
+        300..=399 | 404 => plugin_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "No rTorrent XML-RPC endpoint was found at this address; check the URL path.",
+        ),
+        _ => {
+            return match check_http_status(status, retry_after) {
+                Err(error) => error.context(debug),
+                Ok(()) => plugin_error(
+                    PluginErrorCode::Temporary,
+                    "rTorrent returned an unexpected HTTP status.",
+                )
+                .debug(debug)
+                .into_error(),
+            };
+        }
+    };
+    error.debug(debug).into_error()
+}
+
+fn parse_xml(xml: &str) -> Result<Document<'_>, Error> {
+    Document::parse(xml).map_err(|error| {
+        let code = if xml.trim_start().starts_with("<!") || xml.contains("<html") {
+            codes::ENDPOINT_NOT_FOUND
+        } else {
+            codes::INVALID_RESPONSE
+        };
+        plugin_error(code, "rTorrent returned a response Scryer could not read.")
+            .debug(format!("invalid XML: {error}"))
+            .into_error()
+    })
+}
+
 fn parse_torrents(xml: &str) -> Result<Vec<RTorrentTorrent>, Error> {
-    let doc = Document::parse(xml).map_err(|error| Error::msg(format!("invalid XML: {error}")))?;
-    let response_value = first_response_value(&doc)
-        .ok_or_else(|| Error::msg("rTorrent response missing torrent array"))?;
+    let doc = parse_xml(xml)?;
+    let response_value = first_response_value(&doc).ok_or_else(|| {
+        rtorrent_error(
+            codes::INVALID_RESPONSE,
+            "rTorrent response missing torrent array",
+        )
+    })?;
     let mut out = Vec::new();
     for row in array_values(response_value) {
         let values = array_values(row);
@@ -691,6 +774,7 @@ fn parse_torrents(xml: &str) -> Result<Vec<RTorrentTorrent>, Error> {
             is_finished: parse_i64(values[11]) != 0,
             finished_time: parse_i64(values[12]),
             is_private: values.get(13).map(|value| parse_i64(*value) != 0),
+            started_time: values.get(14).map(|value| parse_i64(*value)).unwrap_or(0),
         });
     }
     Ok(out)
@@ -757,6 +841,8 @@ fn torrent_to_item(torrent: RTorrentTorrent) -> PluginDownloadItem {
             torrent.is_active, torrent.is_finished
         )),
         completed_at: (torrent.finished_time > 0).then(|| torrent.finished_time.to_string()),
+        added_at: (torrent.started_time > 0).then(|| torrent.started_time.to_string()),
+        http: None,
     }
 }
 
@@ -902,6 +988,7 @@ fn torrent_to_completed(torrent: RTorrentTorrent) -> PluginCompletedDownload {
         size_bytes: Some(torrent.total_size),
         completed_at: (torrent.finished_time > 0).then(|| torrent.finished_time.to_string()),
         parameters: Vec::new(),
+        subtitle_paths: Vec::new(),
     }
 }
 
@@ -1013,37 +1100,70 @@ fn command_list(label: &str, priority: i64, directory: &str) -> Vec<String> {
 }
 
 fn int_response(xml: &str) -> Result<i64, Error> {
-    let doc = Document::parse(xml).map_err(|error| Error::msg(format!("invalid XML: {error}")))?;
+    let doc = parse_xml(xml)?;
     Ok(first_response_value(&doc)
         .map(parse_i64)
         .unwrap_or_default())
 }
 
 fn string_response(xml: &str) -> Result<String, Error> {
-    let doc = Document::parse(xml).map_err(|error| Error::msg(format!("invalid XML: {error}")))?;
+    let doc = parse_xml(xml)?;
     Ok(first_response_value(&doc)
         .and_then(node_text)
         .unwrap_or_default())
 }
 
-fn check_fault(xml: &str) -> Result<(), Error> {
+fn check_fault(method: &str, xml: &str) -> Result<(), Error> {
     if !xml.contains("<fault>") {
         return Ok(());
     }
-    let doc = Document::parse(xml).map_err(|error| Error::msg(format!("invalid XML: {error}")))?;
+    let doc = parse_xml(xml)?;
     let fault = doc
         .descendants()
         .find(|node| node.has_tag_name("fault"))
-        .ok_or_else(|| Error::msg("rTorrent returned an XML-RPC fault"))?;
+        .ok_or_else(|| {
+            rtorrent_error(
+                codes::INVALID_RESPONSE,
+                "rTorrent returned an XML-RPC fault",
+            )
+        })?;
     let code = member_value(fault, "faultCode")
         .and_then(node_text)
         .unwrap_or_default();
     let message = member_value(fault, "faultString")
         .and_then(node_text)
         .unwrap_or_default();
-    Err(Error::msg(format!(
-        "rTorrent returned error code {code}: {message}"
-    )))
+    Err(fault_error(method, &code, &message))
+}
+
+/// rTorrent's fault text is its own wording and goes to the debug detail; the
+/// code is read from the faults whose cause is unambiguous.
+fn fault_error(method: &str, code: &str, message: &str) -> Error {
+    let lowered = message.to_ascii_lowercase();
+    let error = if lowered.contains("could not find info-hash") {
+        plugin_error(
+            codes::ITEM_NOT_FOUND,
+            "rTorrent no longer has that torrent.",
+        )
+    } else if lowered.contains("permission denied") || lowered.contains("read-only") {
+        plugin_error(
+            codes::PATH_NOT_WRITABLE,
+            "rTorrent cannot write to the download directory.",
+        )
+    } else if method.starts_with("load.") {
+        plugin_error(
+            codes::DOWNLOAD_REJECTED,
+            "rTorrent refused to add the torrent.",
+        )
+    } else {
+        plugin_error(
+            PluginErrorCode::Temporary,
+            "rTorrent returned an XML-RPC fault.",
+        )
+    };
+    error
+        .debug(format!("rTorrent returned error code {code}: {message}"))
+        .into_error()
 }
 
 fn first_response_value<'a>(doc: &'a Document<'a>) -> Option<Node<'a, 'a>> {
@@ -1122,7 +1242,9 @@ fn source_url(request: &PluginDownloadClientAddRequest) -> Option<String> {
             .clone()
             .or_else(|| request.source.download_url.clone())
             .or_else(|| request.source.magnet_uri.clone()),
-        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl => None,
+        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl | DownloadInputKind::HttpResource => {
+            None
+        }
     }
 }
 
@@ -1926,6 +2048,80 @@ mod tests {
         let torrents = parse_torrents(without_private).unwrap();
         assert_eq!(torrents.len(), 1);
         assert_eq!(torrents[0].is_private, None);
+    }
+    fn code_of(error: &Error) -> PluginErrorCode {
+        scryer_plugin_pdk::error::plugin_error_from(error).code
+    }
+
+    #[test]
+    fn a_refused_basic_auth_login_is_an_invalid_username_or_password() {
+        let mut config = config_with_categories("");
+        config.username = "fixture-user".to_string();
+        config.password = "fixture-pass".to_string();
+        let error = http_failure(&config, 401, None, "<html>401 Unauthorized</html>");
+        let report = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(
+            report.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        assert!(!report.public_message.contains("fixture-pass"));
+        assert!(!report.public_message.contains("Unauthorized"));
+
+        let anonymous = http_failure(&config_with_categories(""), 401, None, "");
+        assert_eq!(code_of(&anonymous), PluginErrorCode::AuthFailed);
+    }
+
+    #[test]
+    fn http_failures_carry_the_code_the_operator_can_act_on() {
+        let config = config_with_categories("");
+        assert_eq!(
+            code_of(&http_failure(&config, 404, None, "")),
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        assert_eq!(
+            code_of(&http_failure(&config, 302, None, "")),
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        let limited = scryer_plugin_pdk::error::plugin_error_from(&http_failure(
+            &config,
+            429,
+            Some("30"),
+            "",
+        ));
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(30));
+        assert_eq!(
+            code_of(&http_failure(&config, 503, None, "")),
+            PluginErrorCode::UpstreamUnavailable
+        );
+    }
+
+    #[test]
+    fn faults_and_unreadable_bodies_map_to_their_codes() {
+        assert_eq!(
+            code_of(&fault_error(
+                "load.raw_start",
+                "-503",
+                "Could not create download"
+            )),
+            PluginErrorCode::from(codes::DOWNLOAD_REJECTED)
+        );
+        assert_eq!(
+            code_of(&fault_error("d.erase", "-501", "Could not find info-hash.")),
+            PluginErrorCode::from(codes::ITEM_NOT_FOUND)
+        );
+        assert_eq!(
+            code_of(&fault_error("system.client_version", "-1", "boom")),
+            PluginErrorCode::Temporary
+        );
+        assert_eq!(
+            code_of(&parse_xml("not xml <").unwrap_err()),
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
+        assert_eq!(
+            code_of(&parse_xml("<!DOCTYPE html><html><body>").unwrap_err()),
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
     }
 }
 

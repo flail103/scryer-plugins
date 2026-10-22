@@ -48,25 +48,24 @@ macro_rules! warn_log {
 /// failure this plugin can name carries its own code instead (`00-common.md`
 /// rule 4, mirroring `FreeboxDownloadProxy.cs:222-275` and
 /// `TorrentFreeboxDownload.cs:168-188`).
-fn plugin_error(code: PluginErrorCode, public_message: impl Into<String>) -> PluginError {
-    PluginError {
-        code,
-        public_message: public_message.into(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+fn typed_error(code: impl Into<PluginErrorCode>, public_message: impl Into<String>) -> PluginError {
+    plugin_error(code, public_message).build()
 }
 
 fn detailed_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: impl Into<String>,
     debug_message: impl Into<String>,
 ) -> PluginError {
-    PluginError {
-        debug_message: Some(debug_message.into()),
-        ..plugin_error(code, public_message)
-    }
+    plugin_error(code, public_message)
+        .debug(debug_message.into())
+        .build()
+}
+
+/// The codes that mean the box refused this app's credentials, after which a
+/// cached session token is worthless.
+fn is_auth_rejection(code: &PluginErrorCode) -> bool {
+    *code == PluginErrorCode::AuthFailed || *code == PluginErrorCode::from(codes::INVALID_API_KEY)
 }
 
 /// A failure from the Freebox API, keeping the `error_code` the box sent so a
@@ -208,6 +207,8 @@ struct FreeboxDownloadTask {
     transmitted_bytes: i64,
     #[serde(default, rename = "tx_rate")]
     transmitted_rate: i64,
+    #[serde(default, rename = "created_ts")]
+    created_ts: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +345,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "freebox".to_string(),
             provider_aliases: vec!["freebox-download".to_string()],
@@ -380,6 +382,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
                 per_download_directory: true,
                 host_fs_required: false,
                 test_connection: true,
+                // The box's HTTP downloader is not wired up in this plugin.
+                http: None,
                 torrent: Some(DownloadTorrentCapabilities {
                     supported_sources: vec![
                         DownloadInputKind::MagnetUri,
@@ -542,7 +546,7 @@ fn add(input: &str) -> Result<PluginDownloadClientAddResponse, PluginError> {
     let request: PluginDownloadClientAddRequest = parse_request(input)?;
     let config = FreeboxConfig::from_host();
     if let Some(problem) = add_settings_problem(&config) {
-        return Err(plugin_error(PluginErrorCode::InvalidConfig, problem));
+        return Err(typed_error(PluginErrorCode::InvalidConfig, problem));
     }
 
     let directory = download_directory(&config, &request)?;
@@ -566,7 +570,7 @@ fn add(input: &str) -> Result<PluginDownloadClientAddResponse, PluginError> {
     } else if let Some(source) = source_url(&request) {
         add_url(&config, &source, &directory)
     } else {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Permanent,
             "download source is missing",
         ));
@@ -679,7 +683,7 @@ fn control(input: &str) -> Result<(), PluginError> {
         }
         // Freebox has an `io_priority` and a queue position, but nothing that
         // starts a task outside its download slots.
-        DownloadControlAction::ForceStart => Err(plugin_error(
+        DownloadControlAction::ForceStart => Err(typed_error(
             PluginErrorCode::Unsupported,
             "Freebox cannot force-start a download task.",
         )),
@@ -778,14 +782,14 @@ pub fn scryer_download_test_connection(_input: String) -> FnResult<String> {
 fn test_connection() -> Result<String, PluginError> {
     let config = FreeboxConfig::from_host();
     if let Some(problem) = settings_problem(&config) {
-        return Err(plugin_error(PluginErrorCode::InvalidConfig, problem));
+        return Err(typed_error(PluginErrorCode::InvalidConfig, problem));
     }
 
     let discovery = api_version(&config).ok();
     if let Some(discovery) = discovery.as_ref()
         && let Some(problem) = api_version_problem(&config, discovery)
     {
-        return Err(plugin_error(PluginErrorCode::InvalidConfig, problem));
+        return Err(typed_error(PluginErrorCode::InvalidConfig, problem));
     }
 
     // A test must never pass on a cached session token.
@@ -907,7 +911,7 @@ fn add_file(
 /// new Download task*).
 fn added_task_id(task: FreeboxDownloadTask) -> Result<String, ApiError> {
     if task.id.is_empty() {
-        return Err(ApiError::new(plugin_error(
+        return Err(ApiError::new(typed_error(
             PluginErrorCode::Temporary,
             "Freebox accepted the download but did not return a task id.",
         )));
@@ -1148,6 +1152,12 @@ fn torrent_to_item(config: &FreeboxConfig, torrent: FreeboxDownloadTask) -> Plug
         // timestamp to hand over, and inventing one from the creation time
         // would be worse than saying nothing.
         completed_at: None,
+        // `created_ts` is when the task was added, in Unix seconds.
+        added_at: torrent
+            .created_ts
+            .filter(|created| *created > 0)
+            .map(|created| created.to_string()),
+        http: None,
     }
 }
 
@@ -1171,6 +1181,7 @@ fn torrent_to_completed(
         completed_at: None,
         parameters: Vec::new(),
         release_name: None,
+        subtitle_paths: Vec::new(),
     }
 }
 
@@ -1347,14 +1358,14 @@ fn api_result<T: DeserializeOwned>(
     auth: bool,
 ) -> Result<T, ApiError> {
     let value = api_envelope(config, method, path, body, auth)?.ok_or_else(|| {
-        ApiError::new(plugin_error(
-            PluginErrorCode::Temporary,
+        ApiError::new(typed_error(
+            codes::INVALID_RESPONSE,
             "The Freebox API answered without a result.",
         ))
     })?;
     serde_json::from_value(value).map_err(|error| {
         ApiError::new(detailed_error(
-            PluginErrorCode::Temporary,
+            codes::INVALID_RESPONSE,
             "The Freebox API answered with a result this plugin could not read.",
             error.to_string(),
         ))
@@ -1398,7 +1409,7 @@ fn api_envelope(
         match interpret(&response) {
             Ok(result) => return Ok(result),
             Err(error) => {
-                if auth && error.error.code == PluginErrorCode::AuthFailed {
+                if auth && is_auth_rejection(&error.error.code) {
                     // The cached token is worthless either way.
                     forget_var(SESSION_VAR_KEY);
                     if !renewed && is_session_expired(&error) {
@@ -1481,7 +1492,7 @@ fn send(
     };
 
     let response = http::request::<Vec<u8>>(&request, payload)
-        .map_err(|error| ApiError::new(classify_transport_error(&error.to_string())))?;
+        .map_err(|error| ApiError::new(classify_transport_error(&error)))?;
     Ok(RawResponse {
         status: response.status_code(),
         location: header_value(&response, "Location"),
@@ -1497,7 +1508,11 @@ fn interpret(response: &RawResponse) -> Result<Option<serde_json::Value>, ApiErr
         200..=299 => {
             let Some(envelope) = envelope else {
                 return Err(ApiError::new(detailed_error(
-                    PluginErrorCode::InvalidConfig,
+                    if response.body.trim_start().starts_with('<') {
+                        codes::ENDPOINT_NOT_FOUND
+                    } else {
+                        codes::INVALID_RESPONSE
+                    },
                     "The configured URL did not answer with a Freebox API response; verify 'API URL'.",
                     truncate(&response.body),
                 )));
@@ -1511,38 +1526,38 @@ fn interpret(response: &RawResponse) -> Result<Option<serde_json::Value>, ApiErr
         // The host runs plugin HTTP without following redirects, so a captive
         // portal or a reverse proxy in front of the box shows up here rather
         // than as an unreadable body.
-        300..=399 => Err(ApiError::new(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            match response.location.as_deref() {
-                Some(location) => format!(
-                    "The Freebox API redirected to {location}; verify 'Host', 'Port' and 'API URL'."
-                ),
-                None => {
-                    "The Freebox API redirected the request; verify 'Host', 'Port' and 'API URL'."
-                        .to_string()
-                }
-            },
+        300..=399 => Err(ApiError::new(detailed_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "The Freebox API redirected the request; verify 'Host', 'Port' and 'API URL'.",
+            format!(
+                "HTTP {} redirect to {}",
+                response.status,
+                response.location.as_deref().unwrap_or_default()
+            ),
         ))),
         // "in case of [an authentication error] the HTTP 403 return code will
         // be used as well" (dev.freebox.fr/sdk/os/login/).
         401 | 403 => {
             let mut failure = envelope.as_ref().map(api_failure).unwrap_or_else(|| {
-                ApiError::new(plugin_error(
-                    PluginErrorCode::AuthFailed,
+                ApiError::new(typed_error(
+                    codes::INVALID_API_KEY,
                     "Authentication to the Freebox API failed; verify 'App ID' and 'App Token'.",
                 ))
             });
             // Whatever the body says, the box refused the credentials
-            // (`FreeboxDownloadProxy.cs:242-251`).
-            failure.error.code = PluginErrorCode::AuthFailed;
+            // (`FreeboxDownloadProxy.cs:242-251`); a body that names which
+            // credential keeps its own code.
+            if !is_auth_rejection(&failure.error.code) {
+                failure.error.code = PluginErrorCode::AuthFailed;
+            }
             Err(failure)
         }
-        404 => Err(ApiError::new(plugin_error(
-            PluginErrorCode::InvalidConfig,
+        404 => Err(ApiError::new(typed_error(
+            codes::ENDPOINT_NOT_FOUND,
             "Unable to reach Freebox API. Verify 'API URL' setting for base URL and version.",
         ))),
         500..=599 => Err(ApiError::new(detailed_error(
-            PluginErrorCode::Temporary,
+            PluginErrorCode::UpstreamUnavailable,
             format!("The Freebox API returned HTTP {}.", response.status),
             truncate(&response.body),
         ))),
@@ -1559,24 +1574,29 @@ fn interpret(response: &RawResponse) -> Result<Option<serde_json::Value>, ApiErr
 fn api_failure(envelope: &FreeboxResponse) -> ApiError {
     let code = envelope.error_code.as_deref().unwrap_or_default();
     let description = api_error_description(code);
-    let message = match envelope.msg.as_deref().map(str::trim) {
-        Some(msg) if !msg.is_empty() && description.is_empty() => msg.to_string(),
-        _ if description.is_empty() => format!("{code} - Unknown error"),
-        _ => description.to_string(),
+    // The box's own `msg` is upstream text (often French) and stays in the
+    // debug detail; the public sentence comes from the documented table.
+    let upstream = envelope
+        .msg
+        .as_deref()
+        .map(str::trim)
+        .filter(|msg| !msg.is_empty())
+        .unwrap_or_default();
+    let message = if description.is_empty() {
+        "The Freebox API returned an error.".to_string()
+    } else {
+        format!("The Freebox API returned an error: {description}")
     };
     if code.is_empty() {
-        return ApiError::new(plugin_error(
+        return ApiError::new(detailed_error(
             PluginErrorCode::Temporary,
-            format!("The Freebox API returned an error: {message}"),
+            message,
+            upstream,
         ));
     }
     ApiError::with_code(
         code,
-        detailed_error(
-            api_error_code(code),
-            format!("The Freebox API returned an error: {message}"),
-            code,
-        ),
+        detailed_error(api_error_code(code), message, format!("{code}: {upstream}")),
     )
 }
 
@@ -1627,13 +1647,18 @@ fn api_error_description(code: &str) -> &'static str {
 /// Which of Scryer's codes each Freebox `error_code` is (`00-common.md` rule 4).
 fn api_error_code(code: &str) -> PluginErrorCode {
     match code {
-        "auth_required"
-        | "invalid_token"
-        | "pending_token"
+        // The app token is this client's API key: a session the box will not
+        // accept, or a revoked token, means the configured token is wrong.
+        "auth_required" | "invalid_token" => codes::INVALID_API_KEY.into(),
+        "pending_token"
         | "insufficient_rights"
         | "denied_from_external_ip"
         | "new_apps_denied"
         | "apps_denied" => PluginErrorCode::AuthFailed,
+        "task_not_found" => codes::ITEM_NOT_FOUND.into(),
+        "invalid_file" | "invalid_url" | "invalid_task_type" | "exists" => {
+            codes::DOWNLOAD_REJECTED.into()
+        }
         "ratelimited" => PluginErrorCode::RateLimited,
         "invalid_api_version" | "port_conflict" | "port_outside_range" => {
             PluginErrorCode::InvalidConfig
@@ -1647,31 +1672,17 @@ fn api_error_code(code: &str) -> PluginErrorCode {
     }
 }
 
-fn classify_transport_error(detail: &str) -> PluginError {
-    let lowered = detail.to_ascii_lowercase();
-    if lowered.contains("timeout") || lowered.contains("timed out") {
-        detailed_error(
-            PluginErrorCode::Temporary,
-            "The Freebox API did not answer in time.",
-            detail,
-        )
-    } else if lowered.contains("certificate")
-        || lowered.contains("tls")
-        || lowered.contains("ssl")
-        || lowered.contains("trust")
-    {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to reach the Freebox API: certificate validation failed. The Freebox uses its own root CA.",
-            detail,
-        )
+fn classify_transport_error(error: &Error) -> PluginError {
+    let mut classified = scryer_plugin_pdk::error::plugin_error_from(error);
+    classified.public_message = if classified.code == PluginErrorCode::from(codes::TLS_ERROR) {
+        "Unable to reach the Freebox API: certificate validation failed. The Freebox uses its own root CA."
+            .to_string()
+    } else if classified.code == PluginErrorCode::UpstreamUnavailable {
+        "Unable to reach Freebox API. Verify 'Host', 'Port' or 'Use SSL' settings.".to_string()
     } else {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to reach Freebox API. Verify 'Host', 'Port' or 'Use SSL' settings.",
-            detail,
-        )
-    }
+        "The Freebox API did not answer in time.".to_string()
+    };
+    classified
 }
 
 // ---------------------------------------------------------------------------
@@ -1697,7 +1708,7 @@ fn session_token(config: &FreeboxConfig) -> Result<String, ApiError> {
 fn authenticate(config: &FreeboxConfig) -> Result<String, PluginError> {
     let challenge: FreeboxLogin = api_result(config, "GET", "/login", RequestBody::None, false)?;
     if challenge.challenge.is_empty() {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::InvalidConfig,
             "The Freebox API did not return a login challenge; verify 'API URL'.",
         ));
@@ -1723,8 +1734,8 @@ fn authenticate(config: &FreeboxConfig) -> Result<String, PluginError> {
         false,
     )?;
     if session.session_token.is_empty() {
-        return Err(plugin_error(
-            PluginErrorCode::AuthFailed,
+        return Err(typed_error(
+            codes::INVALID_RESPONSE,
             "The Freebox API did not return a session token; verify 'App ID' and 'App Token'.",
         ));
     }
@@ -1733,7 +1744,7 @@ fn authenticate(config: &FreeboxConfig) -> Result<String, PluginError> {
     // looks, so a token without the downloader right fails later as an opaque
     // `insufficient_rights` on the first listing.
     if let Some(problem) = permission_problem(session.permissions.as_ref()) {
-        return Err(plugin_error(PluginErrorCode::AuthFailed, problem));
+        return Err(typed_error(PluginErrorCode::AuthFailed, problem));
     }
     let _ = var::set(SESSION_VAR_KEY, session.session_token.clone());
     Ok(session.session_token)
@@ -1769,11 +1780,15 @@ fn api_version(config: &FreeboxConfig) -> Result<FreeboxApiVersion, PluginError>
         .with_header("User-Agent", USER_AGENT)
         .with_header("Accept", "application/json");
     let response = http::request::<Vec<u8>>(&request, None)
-        .map_err(|error| classify_transport_error(&error.to_string()))?;
+        .map_err(|error| classify_transport_error(&error))?;
     let body = String::from_utf8_lossy(&response.body()).to_string();
     if response.status_code() >= 400 {
         return Err(detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
+            if response.status_code() == 404 {
+                PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+            } else {
+                PluginErrorCode::UpstreamUnavailable
+            },
             format!(
                 "The Freebox returned HTTP {} for /api_version.",
                 response.status_code()
@@ -1783,7 +1798,7 @@ fn api_version(config: &FreeboxConfig) -> Result<FreeboxApiVersion, PluginError>
     }
     serde_json::from_str(&body).map_err(|error| {
         detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
+            codes::ENDPOINT_NOT_FOUND,
             "The configured host did not answer /api_version like a Freebox.",
             format!("{error}: {}", truncate(&body)),
         )
@@ -1890,7 +1905,9 @@ fn source_url(request: &PluginDownloadClientAddRequest) -> Option<String> {
             .clone()
             .or_else(|| request.source.download_url.clone())
             .or_else(|| request.source.magnet_uri.clone()),
-        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl => None,
+        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl | DownloadInputKind::HttpResource => {
+            None
+        }
     }
 }
 
@@ -2655,19 +2672,28 @@ mod tests {
         .expect_err("an error")
     }
 
+    fn host_failure(detail: &str) -> Error {
+        scryer_plugin_pdk::host::HostCallError::Service(
+            plugin_error(PluginErrorCode::Temporary, "request failed")
+                .debug(detail)
+                .build(),
+        )
+        .into()
+    }
+
     #[test]
     fn an_unreachable_api_is_upstream_unavailable() {
         assert_eq!(
-            classify_transport_error("connection refused").code,
+            classify_transport_error(&host_failure("dns error: connection refused")).code,
             PluginErrorCode::UpstreamUnavailable
         );
         assert_eq!(
-            classify_transport_error("request timeout").code,
+            classify_transport_error(&host_failure("request timeout")).code,
             PluginErrorCode::Temporary
         );
         assert_eq!(
-            classify_transport_error("invalid peer certificate").code,
-            PluginErrorCode::UpstreamUnavailable
+            classify_transport_error(&host_failure("tls: invalid peer certificate")).code,
+            PluginErrorCode::from(codes::TLS_ERROR)
         );
     }
 
@@ -2677,7 +2703,21 @@ mod tests {
             403,
             r#"{"success":false,"error_code":"invalid_token","msg":"Erreur"}"#,
         );
-        assert_eq!(error.error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            error.error.code,
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
+        assert!(!error.error.public_message.contains("Erreur"));
+        let rights = failure(
+            403,
+            r#"{"success":false,"error_code":"insufficient_rights"}"#,
+        );
+        assert_eq!(rights.error.code, PluginErrorCode::AuthFailed);
+        let bare = failure(403, "");
+        assert_eq!(
+            bare.error.code,
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
         assert!(
             error
                 .error
@@ -2701,7 +2741,10 @@ mod tests {
     #[test]
     fn a_404_points_at_the_api_url() {
         let error = failure(404, "");
-        assert_eq!(error.error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(
+            error.error.code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
         assert!(error.error.public_message.contains("API URL"));
     }
 
@@ -2713,17 +2756,30 @@ mod tests {
             body: String::new(),
         })
         .expect_err("an error");
-        assert_eq!(error.error.code, PluginErrorCode::InvalidConfig);
-        assert!(error.error.public_message.contains("login.php"));
+        assert_eq!(
+            error.error.code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        assert!(!error.error.public_message.contains("login.php"));
     }
 
     #[test]
     fn the_download_api_error_table_maps_to_typed_codes() {
         let cases = [
-            ("task_not_found", PluginErrorCode::Permanent),
-            ("invalid_file", PluginErrorCode::Permanent),
-            ("invalid_url", PluginErrorCode::Permanent),
-            ("exists", PluginErrorCode::Permanent),
+            (
+                "task_not_found",
+                PluginErrorCode::from(codes::ITEM_NOT_FOUND),
+            ),
+            (
+                "invalid_file",
+                PluginErrorCode::from(codes::DOWNLOAD_REJECTED),
+            ),
+            (
+                "invalid_url",
+                PluginErrorCode::from(codes::DOWNLOAD_REJECTED),
+            ),
+            ("exists", PluginErrorCode::from(codes::DOWNLOAD_REJECTED)),
+            ("invalid_request", PluginErrorCode::Permanent),
             ("too_many_tasks", PluginErrorCode::Temporary),
             ("hibernating", PluginErrorCode::Temporary),
             ("out_of_memory", PluginErrorCode::Temporary),
@@ -2745,15 +2801,26 @@ mod tests {
     }
 
     #[test]
-    fn a_5xx_is_temporary_and_an_unknown_4xx_is_permanent() {
-        assert_eq!(failure(503, "").error.code, PluginErrorCode::Temporary);
+    fn a_5xx_is_upstream_unavailable_and_an_unknown_4xx_is_permanent() {
+        assert_eq!(
+            failure(503, "").error.code,
+            PluginErrorCode::UpstreamUnavailable
+        );
         assert_eq!(failure(418, "").error.code, PluginErrorCode::Permanent);
     }
 
     #[test]
     fn a_body_that_is_not_a_freebox_response_names_the_api_url() {
         let error = failure(200, "<html>login</html>");
-        assert_eq!(error.error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(
+            error.error.code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        let error = failure(200, "{\"success\": tr");
+        assert_eq!(
+            error.error.code,
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
     }
 
     #[test]

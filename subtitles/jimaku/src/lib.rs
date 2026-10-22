@@ -42,7 +42,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use scryer_plugin_pdk::sdk::command::{PluginSubtitleCommand, PluginSubtitleCommandResult};
-use scryer_plugin_pdk::{HttpRequest, HttpResponse, config, http};
+use scryer_plugin_pdk::{HttpRequest, HttpResponse, codes, config, http, plugin_error};
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldType, ConfigFieldValueSource, PluginDescriptor, PluginError,
@@ -193,34 +193,28 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         // `SubtitleCapabilities::mode` and never routes a generate here, so
         // this arm answers in-band rather than trapping.
         PluginSubtitleCommand::Generate(_) => {
-            PluginSubtitleCommandResult::Generate(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "Jimaku is a catalog subtitle provider and cannot generate \
-                                 subtitles"
-                    .to_string(),
-                debug_message: Some(
-                    "SubtitleProviderMode::Catalog advertises no generate capability".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
+            PluginSubtitleCommandResult::Generate(PluginResult::Err(
+                plugin_error(
+                    PluginErrorCode::Unsupported,
+                    "Jimaku is a catalog subtitle provider and cannot generate subtitles",
+                )
+                .debug("SubtitleProviderMode::Catalog advertises no generate capability")
+                .build(),
+            ))
         }
         // Alignment moved into this envelope when the subtitle-sync plugin
         // migrated off its own transport, so every subtitle provider now sees
         // the operation whether or not it can serve one. Jimaku cannot: it has
         // no audio decoder and advertises no `sync` capability. Same in-band
         // refusal as `Generate`, for the same reason.
-        PluginSubtitleCommand::Sync(_) => {
-            PluginSubtitleCommandResult::Sync(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "Jimaku cannot align subtitles".to_string(),
-                debug_message: Some(
-                    "SubtitleCapabilities::sync is None for this provider".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
-        }
+        PluginSubtitleCommand::Sync(_) => PluginSubtitleCommandResult::Sync(PluginResult::Err(
+            plugin_error(
+                PluginErrorCode::Unsupported,
+                "Jimaku cannot align subtitles",
+            )
+            .debug("SubtitleCapabilities::sync is None for this provider")
+            .build(),
+        )),
     }
 }
 
@@ -253,11 +247,11 @@ fn validate_config(
 fn search(request: &SubtitlePluginSearchRequest) -> PluginResult<SubtitlePluginSearchResponse> {
     let config = match JimakuConfig::from_host() {
         Ok(config) => config,
-        Err(error) => return PluginResult::Err(plugin_error(error)),
+        Err(error) => return PluginResult::Err(classify_error(error)),
     };
     match search_subtitles_impl(&config, request) {
         Ok(results) => PluginResult::Ok(SubtitlePluginSearchResponse { results }),
-        Err(error) => PluginResult::Err(plugin_error(error)),
+        Err(error) => PluginResult::Err(classify_error(error)),
     }
 }
 
@@ -267,45 +261,76 @@ fn download(
     let reference: JimakuDownloadRef = match serde_json::from_str(&request.provider_file_id) {
         Ok(reference) => reference,
         Err(error) => {
-            return PluginResult::Err(plugin_error(format!(
+            return PluginResult::Err(classify_error(format!(
                 "Jimaku subtitle reference is not valid: {error}"
             )));
         }
     };
     match download_subtitle_impl(&reference) {
         Ok(response) => PluginResult::Ok(response),
-        Err(error) => PluginResult::Err(plugin_error(error)),
+        Err(error) => PluginResult::Err(classify_error(error)),
     }
 }
 
 /// Map this provider's string failures onto the SDK's typed error.
 ///
-/// The classification is the same one `validation_error_response` already
-/// applied to the very same messages, so a search failure and a validation
-/// failure now agree about what kind of problem they saw.
-fn plugin_error(error: String) -> PluginError {
-    let (code, retry_after_seconds) = if error.contains("authentication failed") {
-        (PluginErrorCode::AuthFailed, None)
-    } else if is_rate_limit_error(&error) {
+/// The classification is the same one `validation_error_response` applies to
+/// the very same messages, so a search failure and a validation failure agree
+/// about what kind of problem they saw. The message can carry Jimaku's own
+/// response text, so it goes to the debug detail behind a fixed public
+/// sentence; configuration messages are the plugin's own wording and stay
+/// public.
+fn classify_error(error: String) -> PluginError {
+    let (code, public_message): (PluginErrorCode, &str) = if error.contains("authentication failed")
+    {
         (
-            PluginErrorCode::RateLimited,
-            retry_after_from_message(&error),
+            codes::INVALID_API_KEY.into(),
+            "Jimaku rejected the API key.",
         )
+    } else if is_rate_limit_error(&error) {
+        let mut builder = plugin_error(
+            PluginErrorCode::RateLimited,
+            "Jimaku is rate limiting requests.",
+        )
+        .debug(&error);
+        if let Some(seconds) = retry_after_from_message(&error) {
+            builder = builder.retry_after_seconds(seconds);
+        }
+        return builder.build();
     } else if error.contains("required") || error.contains("missing") {
-        (PluginErrorCode::InvalidConfig, None)
+        return plugin_error(PluginErrorCode::InvalidConfig, error).build();
+    } else if error.contains(TLS_FAILED) {
+        (
+            codes::TLS_ERROR.into(),
+            "A secure connection to Jimaku could not be established.",
+        )
     } else if error.contains("request failed") {
-        (PluginErrorCode::UpstreamUnavailable, None)
+        (
+            PluginErrorCode::UpstreamUnavailable,
+            "Jimaku could not be reached.",
+        )
+    } else if error.contains("JSON parse error") {
+        (
+            codes::INVALID_RESPONSE.into(),
+            "Jimaku returned a response Scryer could not read.",
+        )
+    } else if error.contains(SERVER_ERROR) {
+        (
+            PluginErrorCode::UpstreamUnavailable,
+            "Jimaku answered with a server error.",
+        )
     } else {
-        (PluginErrorCode::Temporary, None)
+        (
+            PluginErrorCode::Temporary,
+            "The Jimaku request could not be completed.",
+        )
     };
-    PluginError {
-        code,
-        public_message: error,
-        debug_message: None,
-        retry_after_seconds,
-        details: None,
-    }
+    plugin_error(code, public_message).debug(error).build()
 }
+
+/// Phrases the transport and `http_error` write and `classify_error` reads back.
+const TLS_FAILED: &str = "request failed (tls)";
+const SERVER_ERROR: &str = "server error";
 
 fn retry_after_from_message(error: &str) -> Option<i64> {
     let (_, tail) = error.split_once("retry after ")?;
@@ -329,6 +354,7 @@ fn descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Subtitle(SubtitleDescriptor {
             provider_type: "jimaku".to_string(),
             provider_aliases: vec![],
@@ -967,8 +993,15 @@ fn http_get(url: &str, api_key: Option<&str>) -> Result<JimakuHttpResponse, Stri
         api_key,
         Duration::from_secs(MAX_RATE_LIMIT_TOTAL_WAIT_SECONDS),
         |request| {
-            let response = http::request::<Vec<u8>>(request, None)
-                .map_err(|error| format!("Jimaku request failed: {error}"))?;
+            let response = http::request::<Vec<u8>>(request, None).map_err(|error| {
+                let tls = scryer_plugin_pdk::error::plugin_error_from(&error).code
+                    == PluginErrorCode::from(codes::TLS_ERROR);
+                if tls {
+                    format!("Jimaku {TLS_FAILED}: {error}")
+                } else {
+                    format!("Jimaku request failed: {error}")
+                }
+            })?;
             Ok(JimakuHttpResponse::from_host(response))
         },
         std::thread::sleep,
@@ -1024,6 +1057,7 @@ fn http_error(provider: &str, response: &JimakuHttpResponse) -> String {
             "{provider} rate limited — retry after {}s",
             retry_after_seconds(response).unwrap_or(1)
         ),
+        500..=599 => format!("{provider} returned HTTP {status} ({SERVER_ERROR}): {body}"),
         _ => format!("{provider} returned HTTP {status}: {body}"),
     }
 }
@@ -1042,7 +1076,7 @@ fn validation_error_response(error: &str) -> SubtitlePluginValidateConfigRespons
     };
     SubtitlePluginValidateConfigResponse {
         status,
-        message: Some(error.to_string()),
+        message: Some(classify_error(error.to_string()).public_message),
         retry_after_seconds: None,
     }
 }
@@ -1216,6 +1250,47 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host_response(status: u16, body: &str) -> JimakuHttpResponse {
+        JimakuHttpResponse {
+            status,
+            headers: BTreeMap::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_rejected_api_key_reports_invalid_api_key_without_jimakus_text() {
+        let error = classify_error(http_error(
+            "Jimaku",
+            &host_response(401, r#"{"error":"fixture upstream text"}"#),
+        ));
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+        assert!(!error.public_message.contains("fixture upstream text"));
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("fixture upstream text")
+        );
+    }
+
+    #[test]
+    fn server_errors_and_unreadable_bodies_carry_their_codes() {
+        assert_eq!(
+            classify_error(http_error("Jimaku", &host_response(503, "busy"))).code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            classify_error("Jimaku JSON parse error: expected value".to_string()).code,
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
+        assert_eq!(
+            classify_error("Jimaku api_key is required".to_string()).code,
+            PluginErrorCode::InvalidConfig
+        );
+    }
 
     fn episode_request() -> SubtitlePluginSearchRequest {
         SubtitlePluginSearchRequest {

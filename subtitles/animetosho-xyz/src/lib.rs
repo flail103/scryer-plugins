@@ -40,7 +40,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use scryer_plugin_pdk::sdk::command::{PluginSubtitleCommand, PluginSubtitleCommandResult};
-use scryer_plugin_pdk::{HttpRequest, HttpResponse, config, http};
+use scryer_plugin_pdk::{HttpRequest, HttpResponse, codes, config, http, plugin_error};
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource, PluginDescriptor,
@@ -150,34 +150,28 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         // `SubtitleCapabilities::mode` and never routes a generate here, so
         // this arm answers in-band rather than trapping.
         PluginSubtitleCommand::Generate(_) => {
-            PluginSubtitleCommandResult::Generate(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "AnimeTosho.net is a catalog subtitle provider and cannot \
-                                 generate subtitles"
-                    .to_string(),
-                debug_message: Some(
-                    "SubtitleProviderMode::Catalog advertises no generate capability".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
+            PluginSubtitleCommandResult::Generate(PluginResult::Err(
+                plugin_error(
+                    PluginErrorCode::Unsupported,
+                    "AnimeTosho.net is a catalog subtitle provider and cannot generate subtitles",
+                )
+                .debug("SubtitleProviderMode::Catalog advertises no generate capability")
+                .build(),
+            ))
         }
         // Alignment moved into this envelope when the subtitle-sync plugin
         // migrated off its own transport, so every subtitle provider now sees
         // the operation whether or not it can serve one. AnimeTosho.net cannot: it has
         // no audio decoder and advertises no `sync` capability. Same in-band
         // refusal as `Generate`, for the same reason.
-        PluginSubtitleCommand::Sync(_) => {
-            PluginSubtitleCommandResult::Sync(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "AnimeTosho.net cannot align subtitles".to_string(),
-                debug_message: Some(
-                    "SubtitleCapabilities::sync is None for this provider".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
-        }
+        PluginSubtitleCommand::Sync(_) => PluginSubtitleCommandResult::Sync(PluginResult::Err(
+            plugin_error(
+                PluginErrorCode::Unsupported,
+                "AnimeTosho.net cannot align subtitles",
+            )
+            .debug("SubtitleCapabilities::sync is None for this provider")
+            .build(),
+        )),
     }
 }
 
@@ -194,7 +188,7 @@ fn validate_config(
                 },
                 Err(error) => SubtitlePluginValidateConfigResponse {
                     status: SubtitleValidateConfigStatus::InvalidConfig,
-                    message: Some(error),
+                    message: Some(classify_error(error).public_message),
                     retry_after_seconds: None,
                 },
             }
@@ -214,11 +208,11 @@ fn validate_config(
 fn search(request: &SubtitlePluginSearchRequest) -> PluginResult<SubtitlePluginSearchResponse> {
     let config = match AnimeToshoConfig::from_host() {
         Ok(config) => config,
-        Err(error) => return PluginResult::Err(plugin_error(error)),
+        Err(error) => return PluginResult::Err(classify_error(error)),
     };
     match search_subtitles_impl(&config, request) {
         Ok(results) => PluginResult::Ok(SubtitlePluginSearchResponse { results }),
-        Err(error) => PluginResult::Err(plugin_error(error)),
+        Err(error) => PluginResult::Err(classify_error(error)),
     }
 }
 
@@ -227,44 +221,77 @@ fn download(
 ) -> PluginResult<SubtitlePluginDownloadResponse> {
     let config = match AnimeToshoConfig::from_host() {
         Ok(config) => config,
-        Err(error) => return PluginResult::Err(plugin_error(error)),
+        Err(error) => return PluginResult::Err(classify_error(error)),
     };
     let reference: AnimeToshoDownloadRef = match serde_json::from_str(&request.provider_file_id) {
         Ok(reference) => reference,
         Err(error) => {
-            return PluginResult::Err(plugin_error(format!(
+            return PluginResult::Err(classify_error(format!(
                 "AnimeTosho subtitle reference is not valid: {error}"
             )));
         }
     };
     match download_subtitle_impl(&config, &reference) {
         Ok(response) => PluginResult::Ok(response),
-        Err(error) => PluginResult::Err(plugin_error(error)),
+        Err(error) => PluginResult::Err(classify_error(error)),
     }
 }
 
 /// Map this provider's string failures onto the SDK's typed error.
 ///
 /// The rate-limit branch reads the message the provider already produced, so
-/// the retry hint the upstream sent survives the migration rather than being
-/// flattened into a generic temporary failure.
-fn plugin_error(error: String) -> PluginError {
-    let (code, retry_after_seconds) = if error.contains("rate limited") {
-        (
+/// the retry hint the upstream sent survives. The message can carry the
+/// request URL (with the API key in its query) or AnimeTosho's own response
+/// text, so it goes to the debug detail behind a fixed public sentence.
+fn classify_error(error: String) -> PluginError {
+    let (code, public_message): (PluginErrorCode, &str) = if error.contains("rate limited") {
+        let mut builder = plugin_error(
             PluginErrorCode::RateLimited,
-            retry_after_from_message(&error),
+            "AnimeTosho is rate limiting requests.",
+        )
+        .debug(&error);
+        if let Some(seconds) = retry_after_from_message(&error) {
+            builder = builder.retry_after_seconds(seconds);
+        }
+        return builder.build();
+    } else if error.contains(AUTH_REJECTED) {
+        (
+            PluginErrorCode::AuthFailed,
+            "AnimeTosho refused the request; check the API key.",
+        )
+    } else if error.contains(TLS_FAILED) {
+        (
+            codes::TLS_ERROR.into(),
+            "A secure connection to AnimeTosho could not be established.",
+        )
+    } else if error.contains("request failed") {
+        (
+            PluginErrorCode::UpstreamUnavailable,
+            "AnimeTosho could not be reached.",
+        )
+    } else if error.contains("JSON parse error") {
+        (
+            codes::INVALID_RESPONSE.into(),
+            "AnimeTosho returned a response Scryer could not read.",
+        )
+    } else if error.contains(SERVER_ERROR) {
+        (
+            PluginErrorCode::UpstreamUnavailable,
+            "AnimeTosho answered with a server error.",
         )
     } else {
-        (PluginErrorCode::Temporary, None)
+        (
+            PluginErrorCode::Temporary,
+            "The AnimeTosho request could not be completed.",
+        )
     };
-    PluginError {
-        code,
-        public_message: error,
-        debug_message: None,
-        retry_after_seconds,
-        details: None,
-    }
+    plugin_error(code, public_message).debug(error).build()
 }
+
+/// Phrases the transport and `http_error` write and `classify_error` reads back.
+const AUTH_REJECTED: &str = "refused the request";
+const TLS_FAILED: &str = "request failed (tls)";
+const SERVER_ERROR: &str = "server error";
 
 fn retry_after_from_message(error: &str) -> Option<i64> {
     let (_, tail) = error.split_once("retry after ")?;
@@ -307,6 +334,7 @@ fn descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Subtitle(SubtitleDescriptor {
             provider_type: "animetosho-xyz".to_string(),
             provider_aliases: vec![],
@@ -645,8 +673,15 @@ fn http_get_with_rate_limit_retry(url: &str, accept: &str) -> Result<HttpRespons
             .with_header("Accept", accept)
             .with_header("Accept-Language", "en-US,en;q=0.9")
             .with_header("User-Agent", USER_AGENT);
-        let response = http::request::<Vec<u8>>(&request, None)
-            .map_err(|error| format!("AnimeTosho request failed: {error}"))?;
+        let response = http::request::<Vec<u8>>(&request, None).map_err(|error| {
+            let tls = scryer_plugin_pdk::error::plugin_error_from(&error).code
+                == PluginErrorCode::from(codes::TLS_ERROR);
+            if tls {
+                format!("AnimeTosho {TLS_FAILED}: {error}")
+            } else {
+                format!("AnimeTosho request failed: {error}")
+            }
+        })?;
         if response.status_code() != 429 {
             return Ok(response);
         }
@@ -665,21 +700,37 @@ fn http_get_with_rate_limit_retry(url: &str, accept: &str) -> Result<HttpRespons
 }
 
 fn http_error(provider: &str, response: &HttpResponse) -> String {
-    if response.status_code() == 429 {
+    let body = String::from_utf8_lossy(&response.body()).trim().to_string();
+    describe_http_failure(
+        provider,
+        response.status_code(),
+        retry_after_seconds(response),
+        &body,
+    )
+}
+
+fn describe_http_failure(
+    provider: &str,
+    status: u16,
+    retry_after: Option<u64>,
+    body: &str,
+) -> String {
+    if status == 429 {
         return format!(
             "{provider} rate limited; retry after {}s",
-            retry_after_seconds(response).unwrap_or(1)
+            retry_after.unwrap_or(1)
         );
     }
-
-    let body = String::from_utf8_lossy(&response.body()).trim().to_string();
+    if matches!(status, 401 | 403) {
+        return format!("{provider} {AUTH_REJECTED} with HTTP {status}: {body}");
+    }
+    if status >= 500 {
+        return format!("{provider} returned HTTP {status} ({SERVER_ERROR}): {body}");
+    }
     if body.is_empty() {
-        format!("{provider} returned HTTP {}", response.status_code())
+        format!("{provider} returned HTTP {status}")
     } else {
-        format!(
-            "{provider} returned HTTP {}: {body}",
-            response.status_code()
-        )
+        format!("{provider} returned HTTP {status}: {body}")
     }
 }
 
@@ -950,6 +1001,38 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_failures_carry_their_codes_without_upstream_text() {
+        let refused = classify_error(describe_http_failure(
+            "AnimeTosho JSON API",
+            403,
+            None,
+            "fixture upstream text",
+        ));
+        assert_eq!(refused.code, PluginErrorCode::AuthFailed);
+        assert!(!refused.public_message.contains("fixture upstream text"));
+        assert!(
+            refused
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("fixture upstream text")
+        );
+
+        let limited = classify_error(describe_http_failure("AnimeTosho", 429, Some(40), ""));
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(40));
+
+        assert_eq!(
+            classify_error(describe_http_failure("AnimeTosho", 502, None, "")).code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            classify_error("AnimeTosho JSON parse error: expected value".to_string()).code,
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
+    }
     use std::collections::BTreeMap;
 
     #[test]
