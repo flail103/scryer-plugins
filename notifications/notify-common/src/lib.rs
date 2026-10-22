@@ -36,6 +36,8 @@ use scryer_plugin_sdk::current_sdk_constraint;
 /// Re-exported so `use notify_common::*;` keeps supplying `config::get`,
 /// `http::request`, `HttpRequest` and friends to every channel body.
 pub use scryer_plugin_pdk::{Error, FnResult, HttpRequest, HttpResponse, config, http, var};
+/// The shared open error codes and the PDK's error builder, for channel bodies.
+pub use scryer_plugin_pdk::{PluginErrorBuilder, PluginResultExt, codes};
 pub use scryer_plugin_sdk::command::{
     PluginActionRequest, PluginActionResponse, PluginNotificationCommand,
     PluginNotificationCommandResult,
@@ -70,6 +72,7 @@ pub fn build_notification_descriptor(
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(scryer_plugin_sdk::NotificationDescriptor {
             provider_type: provider_type.to_string(),
             provider_aliases: vec![],
@@ -575,7 +578,7 @@ pub fn process_exec(request: ProcessExecRequest) -> Result<ProcessExecResponse, 
 fn process_error(error: scryer_plugin_pdk::host::HostCallError) -> ProcessError {
     match error {
         scryer_plugin_pdk::host::HostCallError::Service(error) => ProcessError {
-            code: process_error_code(error.code).to_string(),
+            code: process_error_code(error.code),
             message: error.public_message,
         },
         scryer_plugin_pdk::host::HostCallError::Unavailable => ProcessError {
@@ -589,8 +592,8 @@ fn process_error(error: scryer_plugin_pdk::host::HostCallError) -> ProcessError 
     }
 }
 
-fn process_error_code(code: PluginErrorCode) -> &'static str {
-    match code {
+fn process_error_code(code: PluginErrorCode) -> String {
+    let code = match code {
         PluginErrorCode::InvalidConfig => "invalid_config",
         PluginErrorCode::AuthFailed => "permission_denied",
         PluginErrorCode::RateLimited => "rate_limited",
@@ -598,7 +601,10 @@ fn process_error_code(code: PluginErrorCode) -> &'static str {
         PluginErrorCode::Unsupported => "unsupported",
         PluginErrorCode::Temporary => "temporary",
         PluginErrorCode::Permanent => "permanent",
-    }
+        // An open code from a newer host keeps its own spelling.
+        PluginErrorCode::Other(code) => return code,
+    };
+    code.to_string()
 }
 
 /// The in-band answer a channel with no action operation gives.
@@ -609,13 +615,13 @@ fn process_error_code(code: PluginErrorCode) -> &'static str {
 /// a guest trap would cost the host the plugin's own diagnosis and, under a
 /// component, the whole instance.
 pub fn unsupported_action(provider: &str) -> PluginResult<PluginActionResponse> {
-    PluginResult::Err(PluginError {
-        code: PluginErrorCode::Unsupported,
-        public_message: format!("{provider} does not implement notification actions"),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    })
+    PluginResult::Err(
+        scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::Unsupported,
+            format!("{provider} does not implement notification actions"),
+        )
+        .build(),
+    )
 }
 
 /// Turn a configuration-resolution failure into a typed plugin error.
@@ -625,13 +631,110 @@ pub fn unsupported_action(provider: &str) -> PluginResult<PluginActionResponse> 
 /// own result, which is what lets Scryer surface "this channel is not
 /// configured" to the operator instead of "the plugin crashed".
 pub fn config_error(error: impl std::fmt::Display) -> PluginError {
-    PluginError {
-        code: PluginErrorCode::InvalidConfig,
-        public_message: error.to_string(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
+    scryer_plugin_pdk::plugin_error(PluginErrorCode::InvalidConfig, error.to_string()).build()
+}
+
+/// Which configured credential a channel's service checks, so a rejection can
+/// name the one the operator has to fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Credential {
+    /// An API key, token or webhook secret.
+    ApiKey,
+    /// A username and password.
+    UsernamePassword,
+    /// The service rejected the request without saying which credential.
+    Unknown,
+}
+
+impl Credential {
+    /// The error code a rejection of this credential carries.
+    pub fn code(self) -> PluginErrorCode {
+        match self {
+            Self::ApiKey => codes::INVALID_API_KEY.into(),
+            Self::UsernamePassword => codes::INVALID_USERNAME_PASSWORD.into(),
+            Self::Unknown => PluginErrorCode::AuthFailed,
+        }
     }
+
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::ApiKey => "the service rejected the configured key or token",
+            Self::UsernamePassword => "the service rejected the configured username or password",
+            Self::Unknown => "the service rejected the configured credentials",
+        }
+    }
+}
+
+/// The service rejected `credential`. `debug` goes to the host log only.
+pub fn rejected_credential(credential: Credential, debug: impl std::fmt::Display) -> PluginError {
+    scryer_plugin_pdk::plugin_error(credential.code(), credential.public_message())
+        .debug(debug)
+        .build()
+}
+
+/// The typed error for a non-success HTTP answer a channel has no more
+/// specific reading of.
+///
+/// | Status | Code |
+/// |---|---|
+/// | 401, 403 | `credential`'s code |
+/// | 404 | `endpoint_not_found` |
+/// | 429 | `RateLimited`, with `retry_after_seconds` |
+/// | 5xx | `UpstreamUnavailable` |
+/// | any other | `Permanent` |
+///
+/// The public sentence never carries the status or the service's own text;
+/// `debug` (for example the status and response body) goes to the host log.
+pub fn http_failure(
+    status: u16,
+    retry_after_seconds: Option<i64>,
+    credential: Credential,
+    debug: impl std::fmt::Display,
+) -> PluginError {
+    let builder = match status {
+        401 | 403 => {
+            scryer_plugin_pdk::plugin_error(credential.code(), credential.public_message())
+        }
+        404 => scryer_plugin_pdk::plugin_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "the configured address does not answer as this service",
+        ),
+        429 => {
+            let builder = scryer_plugin_pdk::plugin_error(
+                PluginErrorCode::RateLimited,
+                "the service is rate limiting requests",
+            );
+            match retry_after_seconds {
+                Some(seconds) => builder.retry_after_seconds(seconds),
+                None => builder,
+            }
+        }
+        500..=599 => scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "the service answered with a server error",
+        ),
+        _ => scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::Permanent,
+            "the service refused the notification",
+        ),
+    };
+    builder.debug(debug).build()
+}
+
+/// The typed error for a request that never got an HTTP answer (refused
+/// egress, DNS, connection or TLS failure, timeout), classified by the PDK.
+pub fn request_failure(error: &Error) -> PluginError {
+    scryer_plugin_pdk::error::plugin_error_from(error)
+}
+
+/// A `Retry-After` header in delta-seconds, if the response carried one.
+pub fn retry_after_header(headers: &std::collections::BTreeMap<String, String>) -> Option<i64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (seconds.ceil() as i64).max(1))
 }
 
 #[cfg(test)]
@@ -647,6 +750,55 @@ mod tests {
             "title_move": title_move,
         }))
         .expect("title_moved request deserializes")
+    }
+
+    #[test]
+    fn credential_rejections_name_the_configured_credential() {
+        let key = http_failure(401, None, Credential::ApiKey, "HTTP 401: bad token");
+        assert_eq!(key.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+        assert_eq!(key.debug_message.as_deref(), Some("HTTP 401: bad token"));
+        assert!(!key.public_message.contains("bad token"));
+
+        let login = http_failure(403, None, Credential::UsernamePassword, "HTTP 403");
+        assert_eq!(
+            login.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        assert_eq!(
+            http_failure(401, None, Credential::Unknown, "").code,
+            PluginErrorCode::AuthFailed
+        );
+    }
+
+    #[test]
+    fn http_failures_map_to_the_shared_codes() {
+        assert_eq!(
+            http_failure(404, None, Credential::ApiKey, "").code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        let limited = http_failure(429, Some(30), Credential::ApiKey, "");
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(30));
+        assert_eq!(
+            http_failure(503, None, Credential::ApiKey, "").code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            http_failure(400, None, Credential::ApiKey, "").code,
+            PluginErrorCode::Permanent
+        );
+    }
+
+    #[test]
+    fn retry_after_reads_delta_seconds_only() {
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("Retry-After".to_string(), "12".to_string());
+        assert_eq!(retry_after_header(&headers), Some(12));
+        headers.insert(
+            "Retry-After".to_string(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        );
+        assert_eq!(retry_after_header(&headers), None);
     }
 
     #[test]
