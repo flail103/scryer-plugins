@@ -11,7 +11,7 @@ use scryer_plugin_pdk::component;
 use scryer_plugin_sdk::host::PluginHttpRequest;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldType, ConfigFieldValueSource, IndexerProtocol, IndexerSourceKind,
-    PluginSearchRequest, PluginSearchResponse, PluginSearchResult,
+    PluginError, PluginErrorCode, PluginSearchRequest, PluginSearchResponse, PluginSearchResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,6 +115,37 @@ pub enum Step {
         message: String,
         retryable: bool,
     },
+    /// A failure the operator has to act on — the tracker refused the login,
+    /// or the login needs a setting that is not set — carried to the component
+    /// boundary as the SDK's typed error instead of a generic one.
+    Rejected {
+        error: PluginError,
+    },
+}
+
+/// Why an engine operation did not complete.
+#[derive(Debug)]
+pub enum EngineError {
+    /// An engine, transport or definition failure. The component reports it
+    /// as its generic error, with this text as the debug detail.
+    Message(String),
+    /// A typed SDK error whose `public_message` is safe to show the operator.
+    Plugin(PluginError),
+}
+
+impl From<String> for EngineError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Plugin(error) => formatter.write_str(&error.public_message),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,7 +277,7 @@ pub async fn search_with_host<H: EngineHost>(
     definition: Definition,
     request: PluginSearchRequest,
     config: BTreeMap<String, String>,
-) -> Result<PluginSearchResponse, String> {
+) -> Result<PluginSearchResponse, EngineError> {
     let output = drive_operation(
         host,
         definition,
@@ -255,8 +286,9 @@ pub async fn search_with_host<H: EngineHost>(
         false,
     )
     .await?;
-    serde_json::from_value(output)
-        .map_err(|error| format!("search produced an invalid response: {error}"))
+    serde_json::from_value(output).map_err(|error| {
+        EngineError::Message(format!("search produced an invalid response: {error}"))
+    })
 }
 
 pub async fn action_with_host<H: EngineHost>(
@@ -264,7 +296,7 @@ pub async fn action_with_host<H: EngineHost>(
     definition: Definition,
     action: EngineAction,
     config: BTreeMap<String, String>,
-) -> Result<Value, String> {
+) -> Result<Value, EngineError> {
     let wants_captcha = matches!(action, EngineAction::CheckCaptcha);
     let operation = match action {
         EngineAction::CheckCaptcha => Operation::TestConnection,
@@ -277,7 +309,7 @@ pub async fn search(
     definition: Definition,
     request: PluginSearchRequest,
     config: BTreeMap<String, String>,
-) -> Result<PluginSearchResponse, String> {
+) -> Result<PluginSearchResponse, EngineError> {
     let mut host = ComponentEngineHost;
     search_with_host(&mut host, definition, request, config).await
 }
@@ -286,7 +318,7 @@ pub async fn action(
     definition: Definition,
     action: EngineAction,
     config: BTreeMap<String, String>,
-) -> Result<Value, String> {
+) -> Result<Value, EngineError> {
     let mut host = ComponentEngineHost;
     action_with_host(&mut host, definition, action, config).await
 }
@@ -368,7 +400,7 @@ async fn drive_operation<H: EngineHost>(
     operation: Operation,
     mut config: BTreeMap<String, String>,
     wants_captcha: bool,
-) -> Result<Value, String> {
+) -> Result<Value, EngineError> {
     let state_key = session_state_key(&definition, &config)?;
     let mut session: EngineSession = host
         .state_get(&state_key)
@@ -409,7 +441,8 @@ async fn drive_operation<H: EngineHost>(
             return Err(format!(
                 "unsupported Cardigann CAPTCHA type `{}`",
                 captcha.captcha_type
-            ));
+            )
+            .into());
         }
         config.remove("CAPTCHA");
     }
@@ -481,12 +514,13 @@ async fn drive_operation<H: EngineHost>(
                 persist_session(host, &state_key, &session).await?;
                 return Ok(output);
             }
-            Step::Failed { message, .. } => return Err(message),
+            Step::Failed { message, .. } => return Err(EngineError::Message(message)),
+            Step::Rejected { error } => return Err(EngineError::Plugin(error)),
         }
     }
-    Err(format!(
+    Err(EngineError::Message(format!(
         "Cardigann operation exceeded the {MAX_OPERATION_STEPS}-step limit"
-    ))
+    )))
 }
 
 fn session_state_key(
@@ -543,7 +577,12 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(request) = follow_redirect(&definition, &mut context, &response, true)? {
                 return need_redirect(request, Continuation::LoginLanding(context));
             }
-            require_success(&response, "login landing page")?;
+            // The landing page is the login form itself, so the definition's
+            // error blocks — which often match a link back to it — only run on
+            // the submit response.
+            if !(200..300).contains(&response.status) {
+                return Ok(login_http_failure(response.status, "login landing page"));
+            }
             submit_form_login(context, &response)
         }
         (Continuation::SimpleCaptcha(mut context), ResumeInput::Http(response)) => {
@@ -582,8 +621,9 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(request) = follow_redirect(&definition, &mut context, &response, true)? {
                 return need_redirect(request, Continuation::LoginSubmit(context));
             }
-            require_success(&response, "login")?;
-            check_login_errors(&definition, &response)?;
+            if let Some(step) = login_failure(&definition, &context, &response)? {
+                return Ok(step);
+            }
             continue_operation(&definition, context)
         }
         (Continuation::CaptchaImage(mut context), ResumeInput::Http(response)) => {
@@ -2843,20 +2883,121 @@ fn parse_selector(selector: &str) -> Result<CardigannSelector, String> {
         .map_err(|error| format!("invalid CSS selector `{selector}`: {error:?}"))
 }
 
-fn check_login_errors(
+/// Prowlarr's `CheckForError` for a login response.
+///
+/// Prowlarr sends every login request with `SuppressHttpError`, so a non-2xx
+/// response still reaches the definition's `error:` blocks. They run first
+/// here for every status, which keeps the definition's own explanation of a
+/// rejected login whatever status the tracker answered it with. A non-2xx
+/// response no block explains is reported as the HTTP failure it is.
+fn login_failure(
     definition: &Definition,
+    context: &Context,
     response: &PluginHttpResponse,
-) -> Result<(), String> {
-    let Some(login) = definition.login.as_ref() else {
-        return Ok(());
+) -> Result<Option<Step>, String> {
+    if let Some(login) = definition.login.as_ref()
+        && let Some(message) = error_block_message(
+            definition,
+            &login.error,
+            response,
+            &context.variables,
+            "login",
+        )?
+    {
+        let message = mask_credentials(context, &message);
+        return Ok(Some(rejected(
+            PluginErrorCode::AuthFailed,
+            format!("Tracker login failed: {}", public_text(&message)),
+            format!(
+                "Cardigann login returned HTTP {} and matched the definition's error block: {}",
+                response.status,
+                message.trim()
+            ),
+        )));
+    }
+    if !(200..300).contains(&response.status) {
+        return Ok(Some(login_http_failure(response.status, "login")));
+    }
+    Ok(None)
+}
+
+/// A login request the tracker answered with an HTTP error and nothing the
+/// definition explains.
+fn login_http_failure(status: u16, phase: &str) -> Step {
+    let (code, public_message) = match status {
+        401 | 403 => (
+            PluginErrorCode::AuthFailed,
+            format!("Tracker login was rejected (HTTP {status}). Check the indexer's credentials."),
+        ),
+        408 | 429 => (
+            PluginErrorCode::Temporary,
+            format!("Tracker login was temporarily refused (HTTP {status}). Try again later."),
+        ),
+        _ => (
+            PluginErrorCode::UpstreamUnavailable,
+            format!("Tracker login failed: the tracker returned HTTP {status}."),
+        ),
     };
-    check_error_blocks(
-        definition,
-        &login.error,
-        response,
-        &Variables::new(),
-        "login",
+    rejected(
+        code,
+        public_message,
+        format!("Cardigann {phase} returned HTTP {status}"),
     )
+}
+
+fn rejected(code: PluginErrorCode, public_message: String, debug_message: String) -> Step {
+    Step::Rejected {
+        error: PluginError {
+            code,
+            public_message,
+            debug_message: Some(debug_message),
+            retry_after_seconds: None,
+            details: None,
+        },
+    }
+}
+
+/// Upper bound on tracker-supplied text in an operator-facing message. An
+/// error block without a `message:` reports the matched element's text, which
+/// for a `:root:contains(…)` selector is the whole page.
+const PUBLIC_TEXT_LIMIT: usize = 200;
+
+/// Tracker or definition text with every credential-bearing setting value the
+/// operator configured masked, in case a definition's message template or the
+/// tracker's page echoes one back.
+fn mask_credentials(context: &Context, text: &str) -> String {
+    let mut text = text.to_string();
+    let mut secrets = ["username", "password", "cookie", "cardigannCaptcha"]
+        .into_iter()
+        .chain(
+            context
+                .definition
+                .settings
+                .iter()
+                .filter(|setting| matches!(setting.setting_type.as_str(), "text" | "password"))
+                .map(|setting| setting.name.as_str()),
+        )
+        .filter_map(|key| context.config.get(key))
+        .map(|value| value.trim())
+        .filter(|value| value.len() >= 4)
+        .collect::<Vec<_>>();
+    // Longest first, so a value that contains another is masked whole.
+    secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    for secret in secrets {
+        text = text.replace(secret, "[redacted]");
+    }
+    text
+}
+
+/// Masked text made fit for a `public_message`: whitespace collapsed and
+/// length bounded.
+fn public_text(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > PUBLIC_TEXT_LIMIT {
+        text.chars().take(PUBLIC_TEXT_LIMIT).collect::<String>() + "…"
+    } else {
+        text
+    }
 }
 
 fn check_error_blocks(
@@ -2866,6 +3007,20 @@ fn check_error_blocks(
     variables: &Variables,
     phase: &str,
 ) -> Result<(), String> {
+    match error_block_message(definition, errors, response, variables, phase)? {
+        Some(message) => Err(format!("tracker {phase} failed: {message}")),
+        None => Ok(()),
+    }
+}
+
+/// The message of the first `error:` block that matches the response.
+fn error_block_message(
+    definition: &Definition,
+    errors: &[crate::definition::ErrorBlock],
+    response: &PluginHttpResponse,
+    variables: &Variables,
+    phase: &str,
+) -> Result<Option<String>, String> {
     let mut document = Html::parse_document(&decode_body(definition, &response.body));
     mark_contains(&mut document, &error_needles(errors, variables));
     for error in errors {
@@ -2884,10 +3039,10 @@ fn check_error_blocks(
                     select_element_value(definition, &element, field, variables, false).ok()
                 })
                 .unwrap_or_else(|| element.text().collect::<String>().trim().to_string());
-            return Err(format!("tracker {phase} failed: {message}"));
+            return Ok(Some(message));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn select_download_value(
@@ -6005,6 +6160,138 @@ search:
             "login:\n  path: api/torrents\n  method: get\n  headers: {}\n",
         ));
         assert!(!request.headers.contains_key("authorization"));
+    }
+
+    const API_LOGIN_WITH_ERRORS: &str = "login:\n  path: api/torrents\n  method: get\n  error:\n    - selector: a[href*=\"/login\"]\n      message:\n        text: \"The API key was not accepted by {{ .Config.sitelink }}.\"\n    - selector: :root:contains(\"Account is Banned\")\n";
+
+    /// Answer the definition's login request with `response` and return the
+    /// typed error the flow ends with.
+    fn login_rejection(definition: &str, response: PluginHttpResponse) -> PluginError {
+        let Step::NeedHttp { continuation, .. } = begin(
+            compiled(definition),
+            Operation::Search(Box::default()),
+            api_key_config(),
+        )
+        .unwrap() else {
+            panic!("login request expected")
+        };
+        match resume(&continuation, ResumeInput::Http(response)).unwrap() {
+            Step::Rejected { error } => error,
+            step => panic!("login rejection expected, got {step:?}"),
+        }
+    }
+
+    fn html_response(status: u16, body: &str) -> PluginHttpResponse {
+        PluginHttpResponse {
+            status,
+            headers: BTreeMap::from([("content-type".to_string(), "text/html".to_string())]),
+            set_cookie_headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// Login `error:` messages render with the definition's variables, so a
+    /// `{{ .Config.sitelink }}` names the configured site instead of rendering
+    /// empty, and the message reaches the operator as a typed auth failure.
+    #[test]
+    fn login_error_block_message_renders_config_variables() {
+        let error = login_rejection(
+            &api_definition(API_LOGIN_WITH_ERRORS),
+            html_response(200, "<html><a href='/login'>Sign in</a></html>"),
+        );
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            error.public_message,
+            "Tracker login failed: The API key was not accepted by https://tracker.example/."
+        );
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("HTTP 200"))
+        );
+    }
+
+    /// Prowlarr sends logins with `SuppressHttpError`, so the definition's own
+    /// explanation survives an error status; a status no block explains is
+    /// reported by what the status means.
+    #[test]
+    fn login_error_status_prefers_the_definitions_message() {
+        let definition = api_definition(API_LOGIN_WITH_ERRORS);
+        let error = login_rejection(
+            &definition,
+            html_response(403, "<html><a href='/login'>Sign in</a></html>"),
+        );
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert!(
+            error
+                .public_message
+                .starts_with("Tracker login failed: The API key was not accepted"),
+            "{}",
+            error.public_message
+        );
+
+        for (status, code) in [
+            (401, PluginErrorCode::AuthFailed),
+            (403, PluginErrorCode::AuthFailed),
+            (429, PluginErrorCode::Temporary),
+            (503, PluginErrorCode::UpstreamUnavailable),
+        ] {
+            let error = login_rejection(&definition, html_response(status, "<html></html>"));
+            assert_eq!(error.code, code, "HTTP {status}");
+            assert!(
+                error.public_message.contains(&format!("HTTP {status}")),
+                "{}",
+                error.public_message
+            );
+            assert_eq!(
+                error.debug_message.as_deref(),
+                Some(format!("Cardigann login returned HTTP {status}").as_str())
+            );
+        }
+
+        // A matching block on a successful status still rejects the login.
+        let error = login_rejection(
+            &definition,
+            html_response(200, "<html><p>Account is Banned</p></html>"),
+        );
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            error.public_message,
+            "Tracker login failed: Account is Banned"
+        );
+    }
+
+    /// The public message never carries a configured credential back out, and
+    /// a block without a `message:` cannot dump a whole page into it.
+    #[test]
+    fn login_error_public_message_masks_credentials_and_stays_short() {
+        let definition = api_definition(
+            "login:\n  path: api/torrents\n  method: get\n  error:\n    - selector: p.denied\n      message:\n        text: \"Key {{ .Config.apikey }} refused\"\n    - selector: :root:contains(\"Account is Banned\")\n",
+        );
+        let error = login_rejection(
+            &definition,
+            html_response(200, "<html><p class=denied>no</p></html>"),
+        );
+        assert_eq!(
+            error.public_message,
+            "Tracker login failed: Key [redacted] refused"
+        );
+        assert!(
+            !error
+                .debug_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("synthetic-key")
+        );
+
+        let page = format!(
+            "<html><p>Account is Banned</p>{}</html>",
+            "filler ".repeat(200)
+        );
+        let error = login_rejection(&definition, html_response(200, &page));
+        assert!(error.public_message.chars().count() <= 230);
+        assert!(error.public_message.ends_with('…'));
     }
 
     /// Prowlarr re-logs in on any unfollowed redirect and any HTTP error, not

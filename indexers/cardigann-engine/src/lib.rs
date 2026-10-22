@@ -255,7 +255,17 @@ async fn search(request: sdk::PluginSearchRequest) -> FnResult<sdk::PluginSearch
     let (definition, config) = load_definition_and_config().map_err(Error::msg)?;
     runtime::search(definition, request, config)
         .await
-        .map_err(Error::msg)
+        .map_err(engine_error)
+}
+
+/// The engine's failure as the component reports it: a typed SDK error keeps
+/// its code and operator-facing message through the PDK's result adapter, and
+/// anything else stays the generic component failure with the text as detail.
+fn engine_error(error: runtime::EngineError) -> Error {
+    match error {
+        runtime::EngineError::Message(message) => Error::msg(message),
+        runtime::EngineError::Plugin(error) => component::structured_plugin_error(error),
+    }
 }
 
 /// The component's named-action surface.
@@ -289,7 +299,7 @@ async fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> 
     Ok(PluginActionResponse {
         payload: runtime::action(definition, action, config)
             .await
-            .map_err(Error::msg)?,
+            .map_err(engine_error)?,
     })
 }
 
@@ -491,6 +501,37 @@ search:
   paths:
     - path: /search
 "#;
+
+    /// A typed engine failure keeps its code and operator message through the
+    /// PDK's result adapter; anything else stays the generic component error.
+    #[test]
+    fn engine_errors_reach_the_host_with_their_sdk_code() {
+        let typed = sdk::PluginError {
+            code: sdk::PluginErrorCode::AuthFailed,
+            public_message: "Tracker login failed: synthetic reason".to_string(),
+            debug_message: Some("detail".to_string()),
+            retry_after_seconds: None,
+            details: None,
+        };
+        let result = component::to_plugin_result::<()>(Err(engine_error(
+            runtime::EngineError::Plugin(typed.clone()),
+        )));
+        let sdk::PluginResult::Err(error) = result else {
+            panic!("typed error expected")
+        };
+        assert_eq!(error.code, typed.code);
+        assert_eq!(error.public_message, typed.public_message);
+        assert_eq!(error.debug_message, typed.debug_message);
+
+        let result = component::to_plugin_result::<()>(Err(engine_error(
+            runtime::EngineError::Message("engine detail".to_string()),
+        )));
+        let sdk::PluginResult::Err(error) = result else {
+            panic!("generic error expected")
+        };
+        assert_eq!(error.code, sdk::PluginErrorCode::Temporary);
+        assert_eq!(error.debug_message.as_deref(), Some("engine detail"));
+    }
 
     #[test]
     fn descriptor_is_a_connection_scoped_component_indexer() {
