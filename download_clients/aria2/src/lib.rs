@@ -93,25 +93,18 @@ struct Aria2Status {
 /// aria2 — a version validation failure and a `Host` "unable to connect"
 /// (`Aria2.cs:231-258`) — plus the XML-RPC fault text its proxy raises as a
 /// `DownloadClientException` (`Aria2Proxy.cs:167-174`).
-fn plugin_error(code: PluginErrorCode, public_message: impl Into<String>) -> PluginError {
-    PluginError {
-        code,
-        public_message: public_message.into(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+fn typed_error(code: impl Into<PluginErrorCode>, public_message: impl Into<String>) -> PluginError {
+    plugin_error(code, public_message).build()
 }
 
 fn detailed_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: impl Into<String>,
     debug_message: impl Into<String>,
 ) -> PluginError {
-    PluginError {
-        debug_message: Some(debug_message.into()),
-        ..plugin_error(code, public_message)
-    }
+    plugin_error(code, public_message)
+        .debug(debug_message.into())
+        .build()
 }
 
 fn respond<T: serde::Serialize>(result: Result<T, PluginError>) -> FnResult<String> {
@@ -149,22 +142,21 @@ fn truncate(value: &str) -> String {
 /// The host runs plugin HTTP with redirects disabled, which is how a reverse
 /// proxy bouncing `/rpc` to a login page arrives as a 3xx instead of an
 /// unparseable body.
-fn classify_http_status(status: u16, location: Option<&str>, body: &str) -> Option<PluginError> {
+fn classify_http_status(
+    status: u16,
+    location: Option<&str>,
+    retry_after: Option<i64>,
+    body: &str,
+) -> Option<PluginError> {
     match status {
         200..=299 => None,
-        300..=399 => Some(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            match location.map(str::trim).filter(|value| !value.is_empty()) {
-                Some(location) => {
-                    format!(
-                        "Aria2's RPC endpoint redirected to {location}; check host, port and RPC path."
-                    )
-                }
-                None => {
-                    "Aria2's RPC endpoint redirected the request; check host, port and RPC path."
-                        .to_string()
-                }
-            },
+        300..=399 => Some(detailed_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "Aria2's RPC endpoint redirected the request; check host, port and RPC path.",
+            format!(
+                "HTTP {status} redirect to {}",
+                location.map(str::trim).unwrap_or_default()
+            ),
         )),
         // aria2 itself never answers 401/403 — it reports a bad secret token as
         // an XML-RPC fault (see `classify_fault`) — so these come from a proxy
@@ -174,12 +166,23 @@ fn classify_http_status(status: u16, location: Option<&str>, body: &str) -> Opti
             "Aria2's RPC endpoint rejected the request as unauthorized.",
             truncate(body),
         )),
-        404 => Some(plugin_error(
-            PluginErrorCode::InvalidConfig,
+        404 => Some(typed_error(
+            codes::ENDPOINT_NOT_FOUND,
             "No Aria2 RPC endpoint was found at this address; check the RPC path.",
         )),
+        429 => {
+            let error = plugin_error(PluginErrorCode::RateLimited, "Aria2 rate-limited Scryer.")
+                .debug(truncate(body));
+            Some(
+                match retry_after {
+                    Some(seconds) => error.retry_after_seconds(seconds),
+                    None => error,
+                }
+                .build(),
+            )
+        }
         500..=599 => Some(detailed_error(
-            PluginErrorCode::Temporary,
+            PluginErrorCode::UpstreamUnavailable,
             format!("Aria2 returned HTTP {status}."),
             truncate(body),
         )),
@@ -191,35 +194,20 @@ fn classify_http_status(status: u16, location: Option<&str>, body: &str) -> Opti
     }
 }
 
-/// The host hands transport failures back as a string, so classification is by
-/// substring. This is the closest this surface gets to the exception Sonarr
+/// The PDK classifies the host's transport error; this keeps aria2's own
+/// sentences. It is the closest this surface gets to the exception Sonarr
 /// turns into its `Host` "unable to connect" validation failure
 /// (`Aria2.cs:247-255`).
-fn classify_transport_error(detail: &str) -> PluginError {
-    let lowered = detail.to_ascii_lowercase();
-    if lowered.contains("timeout") || lowered.contains("timed out") {
-        detailed_error(
-            PluginErrorCode::Temporary,
-            "Aria2 did not answer in time.",
-            detail,
-        )
-    } else if lowered.contains("certificate")
-        || lowered.contains("tls")
-        || lowered.contains("ssl")
-        || lowered.contains("trust")
-    {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to connect to Aria2: certificate validation failed.",
-            detail,
-        )
+fn classify_transport_error(error: &Error) -> PluginError {
+    let mut classified = scryer_plugin_pdk::error::plugin_error_from(error);
+    classified.public_message = if classified.code == PluginErrorCode::from(codes::TLS_ERROR) {
+        "Unable to connect to Aria2: certificate validation failed.".to_string()
+    } else if classified.code == PluginErrorCode::UpstreamUnavailable {
+        "Unable to connect to Aria2, please check your settings.".to_string()
     } else {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to connect to Aria2, please check your settings.",
-            detail,
-        )
-    }
+        "Aria2 did not answer in time.".to_string()
+    };
+    classified
 }
 
 /// aria2 stamps **every** method failure with `faultCode` 1
@@ -232,18 +220,34 @@ fn classify_transport_error(detail: &str) -> PluginError {
 /// Sonarr flattens all of these into one `DownloadClientException`
 /// (`Aria2Proxy.cs:173`); Scryer's contract wants the wrong-token case
 /// distinguishable from a bad request.
-fn classify_fault(code: &str, message: &str) -> PluginError {
+fn classify_fault(method: &str, code: &str, message: &str) -> PluginError {
     let detail = format!("Aria2 returned error code {code}: {message}");
-    if message.to_ascii_lowercase().contains("unauthorized") {
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("unauthorized") {
+        // The RPC secret is aria2's only credential: an API token.
         return detailed_error(
-            PluginErrorCode::AuthFailed,
+            codes::INVALID_API_KEY,
             "Aria2 rejected the secret token.",
+            detail,
+        );
+    }
+    if lowered.contains("no such download") || lowered.contains("is not found") {
+        return detailed_error(
+            codes::ITEM_NOT_FOUND,
+            "Aria2 no longer has that download.",
+            detail,
+        );
+    }
+    if matches!(method, "aria2.addUri" | "aria2.addTorrent") {
+        return detailed_error(
+            codes::DOWNLOAD_REJECTED,
+            "Aria2 refused to add the download.",
             detail,
         );
     }
     detailed_error(
         PluginErrorCode::Permanent,
-        format!("Aria2 rejected the request: {message}"),
+        "Aria2 rejected the request.",
         detail,
     )
 }
@@ -256,6 +260,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "aria2".to_string(),
             provider_aliases: vec!["aria2c".to_string()],
@@ -297,6 +302,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
                 per_download_directory: true,
                 host_fs_required: false,
                 test_connection: true,
+                // Only torrents are offered; plain-HTTP fetches are not wired up.
+                http: None,
                 torrent: Some(DownloadTorrentCapabilities {
                     supported_sources: vec![
                         DownloadInputKind::MagnetUri,
@@ -374,7 +381,7 @@ fn add(input: &str) -> Result<PluginDownloadClientAddResponse, PluginError> {
             &[xml_array(vec![xml_string(&source)]), xml_struct(&options)],
         )?
     } else {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Permanent,
             "download source is missing",
         ));
@@ -443,7 +450,7 @@ fn control(input: &str) -> Result<(), PluginError> {
     // Answered before the daemon is contacted: aria2 has no notion of forcing a
     // download past the queue, and no configuration changes that.
     if matches!(request.action, DownloadControlAction::ForceStart) {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Unsupported,
             "Aria2 does not support force_start through this plugin",
         ));
@@ -458,8 +465,8 @@ fn control(input: &str) -> Result<(), PluginError> {
         if matches!(request.action, DownloadControlAction::Remove) {
             return Ok(());
         }
-        return Err(plugin_error(
-            PluginErrorCode::Permanent,
+        return Err(typed_error(
+            codes::ITEM_NOT_FOUND,
             "download item was not found",
         ));
     };
@@ -582,7 +589,7 @@ fn test_connection() -> Result<String, PluginError> {
         // Sonarr's `DownloadClientValidationErrorVersion`, which names both the
         // required and the reported version (`Aria2.cs:237-244`). It is a
         // settings problem, not a transient one.
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::InvalidConfig,
             format!("Aria2 {version} is older than the required version {MIN_SUPPORTED_VERSION}."),
         ));
@@ -765,13 +772,18 @@ fn call_document(
         .with_header("Content-Type", "text/xml")
         .with_header("User-Agent", user_agent());
     let response = http::request::<Vec<u8>>(&request, Some(body.into_bytes()))
-        .map_err(|error| classify_transport_error(&error.to_string()))?;
+        .map_err(|error| classify_transport_error(&error))?;
     let status = response.status_code();
     let text = String::from_utf8_lossy(&response.body()).to_string();
-    if let Some(error) = classify_http_status(status, response.header("Location"), &text) {
+    let retry_after = response
+        .header("Retry-After")
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    if let Some(error) =
+        classify_http_status(status, response.header("Location"), retry_after, &text)
+    {
         return Err(error);
     }
-    check_fault(&text)?;
+    check_fault(method, &text)?;
     Ok(text)
 }
 
@@ -790,7 +802,7 @@ fn call_string(
 fn parse_document(xml: &str) -> Result<Document<'_>, PluginError> {
     Document::parse(xml).map_err(|error| {
         detailed_error(
-            PluginErrorCode::Permanent,
+            codes::INVALID_RESPONSE,
             "Aria2 returned a response Scryer could not parse.",
             format!("invalid XML: {error}"),
         )
@@ -799,7 +811,7 @@ fn parse_document(xml: &str) -> Result<Document<'_>, PluginError> {
 
 fn malformed(detail: &str) -> PluginError {
     detailed_error(
-        PluginErrorCode::Permanent,
+        codes::INVALID_RESPONSE,
         "Aria2 returned a response Scryer could not parse.",
         detail,
     )
@@ -1041,7 +1053,7 @@ fn node_text(node: Node<'_, '_>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn check_fault(xml: &str) -> Result<(), PluginError> {
+fn check_fault(method: &str, xml: &str) -> Result<(), PluginError> {
     if !xml.contains("<fault>") {
         return Ok(());
     }
@@ -1056,7 +1068,7 @@ fn check_fault(xml: &str) -> Result<(), PluginError> {
     let message = member_value(fault, "faultString")
         .and_then(node_text)
         .unwrap_or_default();
-    Err(classify_fault(&code, &message))
+    Err(classify_fault(method, &code, &message))
 }
 
 // ---------------------------------------------------------------------------
@@ -1466,6 +1478,9 @@ fn torrent_to_item(torrent: Aria2Status) -> PluginDownloadItem {
         // aria2's status carries no completion timestamp — `tellStatus` has no
         // such member — so there is nothing honest to report here.
         completed_at: None,
+        // Nor does it record when a download was added.
+        added_at: None,
+        http: None,
     }
 }
 
@@ -1513,6 +1528,7 @@ fn torrent_to_completed(torrent: Aria2Status) -> PluginCompletedDownload {
         completed_at: None,
         parameters: Vec::new(),
         release_name: torrent.bittorrent_name,
+        subtitle_paths: Vec::new(),
     }
 }
 
@@ -1657,7 +1673,9 @@ fn source_url(request: &PluginDownloadClientAddRequest) -> Option<String> {
             .clone()
             .or_else(|| request.source.download_url.clone())
             .or_else(|| request.source.magnet_uri.clone()),
-        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl => None,
+        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl | DownloadInputKind::HttpResource => {
+            None
+        }
     }
 }
 
@@ -2195,8 +2213,8 @@ mod tests {
             <member><name>faultCode</name><value><int>1</int></value></member>
             <member><name>faultString</name><value><string>Unauthorized</string></value></member>
         </struct></value></fault></methodResponse>"#;
-        let error = check_fault(fault).expect_err("a fault must not be Ok");
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        let error = check_fault("aria2.getVersion", fault).expect_err("a fault must not be Ok");
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
         assert_eq!(
             error.debug_message.as_deref(),
             Some("Aria2 returned error code 1: Unauthorized")
@@ -2204,13 +2222,14 @@ mod tests {
     }
 
     #[test]
-    fn any_other_fault_is_permanent_and_keeps_sonarrs_wording_in_the_debug_message() {
+    fn a_missing_gid_is_item_not_found_and_keeps_aria2s_wording_in_the_debug_message() {
         let fault = r#"<?xml version="1.0"?><methodResponse><fault><value><struct>
             <member><name>faultCode</name><value><int>1</int></value></member>
             <member><name>faultString</name><value><string>No such download for GID#2089b05ecca3d829</string></value></member>
         </struct></value></fault></methodResponse>"#;
-        let error = check_fault(fault).expect_err("a fault must not be Ok");
-        assert_eq!(error.code, PluginErrorCode::Permanent);
+        let error = check_fault("aria2.pause", fault).expect_err("a fault must not be Ok");
+        assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+        assert!(!error.public_message.contains("GID#"));
         assert!(
             error
                 .debug_message
@@ -2222,48 +2241,77 @@ mod tests {
 
     #[test]
     fn a_successful_response_is_not_mistaken_for_a_fault() {
-        assert!(check_fault(&tell_stopped_response()).is_ok());
+        assert!(check_fault("aria2.tellStatus", &tell_stopped_response()).is_ok());
+    }
+
+    #[test]
+    fn a_refused_add_is_download_rejected_and_any_other_fault_is_permanent() {
+        let fault = r#"<?xml version="1.0"?><methodResponse><fault><value><struct>
+            <member><name>faultCode</name><value><int>1</int></value></member>
+            <member><name>faultString</name><value><string>Bad URI</string></value></member>
+        </struct></value></fault></methodResponse>"#;
+        assert_eq!(
+            check_fault("aria2.addUri", fault).unwrap_err().code,
+            PluginErrorCode::from(codes::DOWNLOAD_REJECTED)
+        );
+        let other = check_fault("aria2.changeOption", fault).unwrap_err();
+        assert_eq!(other.code, PluginErrorCode::Permanent);
+        assert!(!other.public_message.contains("Bad URI"));
     }
 
     #[test]
     fn http_statuses_map_to_the_codes_the_operator_can_act_on() {
-        assert!(classify_http_status(200, None, "").is_none());
+        assert!(classify_http_status(200, None, None, "").is_none());
         assert_eq!(
-            classify_http_status(302, Some("/login"), "")
+            classify_http_status(302, Some("/login"), None, "")
                 .expect("a redirect is a configuration problem")
                 .code,
-            PluginErrorCode::InvalidConfig
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
         );
         assert_eq!(
-            classify_http_status(401, None, "").expect("401").code,
+            classify_http_status(401, None, None, "").expect("401").code,
             PluginErrorCode::AuthFailed
         );
         assert_eq!(
-            classify_http_status(404, None, "").expect("404").code,
-            PluginErrorCode::InvalidConfig
+            classify_http_status(404, None, None, "").expect("404").code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
         );
         assert_eq!(
-            classify_http_status(503, None, "busy").expect("503").code,
-            PluginErrorCode::Temporary
+            classify_http_status(503, None, None, "busy")
+                .expect("503")
+                .code,
+            PluginErrorCode::UpstreamUnavailable
         );
         assert_eq!(
-            classify_http_status(418, None, "").expect("418").code,
+            classify_http_status(418, None, None, "").expect("418").code,
             PluginErrorCode::Permanent
         );
+        let limited = classify_http_status(429, None, Some(12), "").expect("429");
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(12));
+    }
+
+    fn host_failure(detail: &str) -> Error {
+        scryer_plugin_pdk::host::HostCallError::Service(
+            plugin_error(PluginErrorCode::Temporary, "request failed")
+                .debug(detail)
+                .build(),
+        )
+        .into()
     }
 
     #[test]
     fn transport_failures_separate_timeouts_from_unreachable_hosts() {
         assert_eq!(
-            classify_transport_error("operation timed out").code,
+            classify_transport_error(&host_failure("operation timed out")).code,
             PluginErrorCode::Temporary
         );
         assert_eq!(
-            classify_transport_error("certificate verify failed").code,
-            PluginErrorCode::UpstreamUnavailable
+            classify_transport_error(&host_failure("tls: certificate verify failed")).code,
+            PluginErrorCode::from(codes::TLS_ERROR)
         );
         assert_eq!(
-            classify_transport_error("connection refused").code,
+            classify_transport_error(&host_failure("dns error: connection refused")).code,
             PluginErrorCode::UpstreamUnavailable
         );
     }
