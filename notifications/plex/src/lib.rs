@@ -549,10 +549,23 @@ fn refresh_targets(
 
     let sections = plex_sections(section_types)?;
     if sections.is_empty() {
-        return Err(Error::msg("Plex returned no matching library sections"));
+        return Err(no_matching_sections_error());
     }
 
     Ok(targets_for_sections(path, &sections))
+}
+
+/// Plex has no library section of the kind this title belongs in: the
+/// operator has to name the sections to refresh.
+fn no_matching_sections_error() -> Error {
+    structured_plugin_error(
+        scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::InvalidConfig,
+            "Plex has no library section for this kind of title; set the section IDs to refresh in the Plex settings.",
+        )
+        .debug("Plex returned no matching library sections")
+        .build(),
+    )
 }
 
 fn targets_for_sections(path: Option<&str>, sections: &[PlexSection]) -> Vec<PlexRefreshTarget> {
@@ -1124,6 +1137,13 @@ mod tests {
         PluginNotificationApp, PluginNotificationExternalIds, PluginNotificationFile,
         PluginNotificationTitle,
     };
+
+    #[test]
+    fn no_matching_library_section_is_a_setting_to_fix() {
+        let error = scryer_plugin_pdk::error::plugin_error_from(&no_matching_sections_error());
+        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert!(error.public_message.contains("section IDs"));
+    }
 
     fn request_with_title(facet: &str, path: Option<&str>) -> PluginNotificationRequest {
         PluginNotificationRequest {
