@@ -8,7 +8,7 @@
 //! endpoint a delivery has to reach.
 
 use scryer_plugin_conformance::notification::{
-    Check, NotificationConformance, call_notification, instantiate, test_request,
+    NotificationConformance, call_notification, instantiate, test_request,
 };
 use scryer_plugin_conformance::{HttpScript, Script};
 use scryer_plugin_sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
@@ -18,8 +18,8 @@ const WEBHOOK_URL: &str = "https://slack.test.invalid/services/T/B/token";
 
 // A send is one request, so a non-success answer from Slack is a typed plugin
 // error carrying its code (`UpstreamUnavailable` for a 5xx) rather than an
-// unsuccessful delivery; the suite's in-band-delivery-failure check is
-// replaced by the typed check below.
+// unsuccessful delivery; the shared suite accepts that typed answer, and the
+// check below pins this channel's codes.
 
 #[test]
 fn slack_release_wasm_conforms_to_the_notification_host_contract() {
@@ -27,8 +27,7 @@ fn slack_release_wasm_conforms_to_the_notification_host_contract() {
         .wasm("slack_notification.wasm")
         .config("webhook_url", WEBHOOK_URL)
         .expects_url_prefix(WEBHOOK_URL)
-        .required_setting("webhook_url")
-        .without(Check::UpstreamFailureIsReported);
+        .required_setting("webhook_url");
     conformance.run();
 
     let wasm = conformance.wasm_path();

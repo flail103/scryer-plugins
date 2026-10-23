@@ -25,8 +25,8 @@ fn plex_release_wasm_conforms_to_the_notification_host_contract() {
     // action arm is wired rather than unsupported, so that check is replaced
     // by the stronger one below rather than dropped. A single refresh is a
     // single request, so its server error is a typed plugin error rather than
-    // an unsuccessful delivery; the suite's in-band-delivery-failure check is
-    // replaced by the typed one below.
+    // an unsuccessful delivery; the shared suite accepts that typed answer, and
+    // the check below pins it.
     let conformance = NotificationConformance::new(env!("CARGO_MANIFEST_DIR"), "plex")
         .wasm("plex_notification.wasm")
         .config("base_url", "http://plex.test.invalid:32400")
@@ -39,7 +39,6 @@ fn plex_release_wasm_conforms_to_the_notification_host_contract() {
         .event_type(NotificationEventType::Download)
         .required_setting("base_url")
         .required_setting_mentions("host")
-        .without(Check::UpstreamFailureIsReported)
         .without(Check::ActionIsUnsupported);
     conformance.run();
 

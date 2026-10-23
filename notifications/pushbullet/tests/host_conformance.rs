@@ -9,7 +9,7 @@
 // conformance: bespoke
 
 use scryer_plugin_conformance::notification::{
-    Check, NotificationConformance, call_notification, instantiate, test_request,
+    NotificationConformance, call_notification, instantiate, test_request,
 };
 use scryer_plugin_conformance::{HttpReply, HttpRoute, HttpScript, Script};
 use scryer_plugin_sdk::command::{
@@ -25,12 +25,10 @@ fn conformance() -> NotificationConformance {
         .wasm("pushbullet_notification.wasm")
         .config("api_key", ACCESS_TOKEN)
         .expects_url(PUSHES_URL)
-        .required_setting("api_key")
         // A send with no target configured is one push, so a non-success
         // answer is a typed plugin error carrying its code rather than an
-        // unsuccessful delivery; the typed check below replaces the suite's
-        // in-band one.
-        .without(Check::UpstreamFailureIsReported)
+        // unsuccessful delivery; the shared suite accepts that typed answer.
+        .required_setting("api_key")
 }
 
 /// A single push that Pushbullet refuses reports the code the answer means,

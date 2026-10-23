@@ -35,15 +35,14 @@ fn ntfy_release_wasm_conforms_to_the_notification_host_contract() {
     //
     // A single topic is a single request, so its server error is a typed
     // plugin error carrying `UpstreamUnavailable` rather than an unsuccessful
-    // delivery; the suite's in-band-delivery-failure check is replaced by the
-    // typed check at the end of this test.
+    // delivery; the shared suite accepts that typed answer, and the check at
+    // the end of this test pins it.
     let conformance = NotificationConformance::new(env!("CARGO_MANIFEST_DIR"), "ntfy")
         .wasm("ntfy_notification.wasm")
         .config("server_url", "https://ntfy.test.invalid")
         .config("topics", EXPECTED_TOPIC)
         .expects_url(EXPECTED_URL)
-        .without(Check::MissingRequiredSetting)
-        .without(Check::UpstreamFailureIsReported);
+        .without(Check::MissingRequiredSetting);
     let outcome = conformance.run();
 
     // The topic travels in the JSON body, and the notification text with it.

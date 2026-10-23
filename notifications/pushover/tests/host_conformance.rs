@@ -8,7 +8,7 @@
 //! endpoint a delivery has to reach.
 
 use scryer_plugin_conformance::notification::{
-    Check, NotificationConformance, call_notification, instantiate, test_request,
+    NotificationConformance, call_notification, instantiate, test_request,
 };
 use scryer_plugin_conformance::{HttpScript, Script};
 use scryer_plugin_sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
@@ -18,8 +18,8 @@ const API_KEY: &str = "pushoverkey";
 
 // A send is one request, so a non-success answer from Pushover is a typed
 // plugin error carrying its code (`UpstreamUnavailable` for a 5xx) rather than
-// an unsuccessful delivery; the suite's in-band-delivery-failure check is
-// replaced by the typed check below.
+// an unsuccessful delivery; the shared suite accepts that typed answer, and
+// the check below pins this channel's codes.
 
 #[test]
 fn pushover_release_wasm_conforms_to_the_notification_host_contract() {
@@ -28,8 +28,7 @@ fn pushover_release_wasm_conforms_to_the_notification_host_contract() {
         .config("api_key", API_KEY)
         .config("user_key", "pushoveruser")
         .expects_url_prefix("https://api.pushover.net/1/messages.json")
-        .required_setting("api_key")
-        .without(Check::UpstreamFailureIsReported);
+        .required_setting("api_key");
     conformance.run();
 
     let wasm = conformance.wasm_path();

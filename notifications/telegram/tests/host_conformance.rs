@@ -8,7 +8,7 @@
 //! endpoint a delivery has to reach.
 
 use scryer_plugin_conformance::notification::{
-    Check, NotificationConformance, call_notification, instantiate, test_request,
+    NotificationConformance, call_notification, instantiate, test_request,
 };
 use scryer_plugin_conformance::{HttpScript, Script};
 use scryer_plugin_sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
@@ -18,8 +18,8 @@ const BOT_TOKEN: &str = "bottoken";
 
 // A send is one request, so a non-success answer from Telegram is a typed
 // plugin error carrying its code (`UpstreamUnavailable` for a 5xx) rather than
-// an unsuccessful delivery; the suite's in-band-delivery-failure check is
-// replaced by the typed check below.
+// an unsuccessful delivery; the shared suite accepts that typed answer, and
+// the check below pins this channel's codes.
 
 #[test]
 fn telegram_release_wasm_conforms_to_the_notification_host_contract() {
@@ -28,8 +28,7 @@ fn telegram_release_wasm_conforms_to_the_notification_host_contract() {
         .config("chat_id", "123456")
         .config("bot_token", BOT_TOKEN)
         .expects_url_prefix("https://api.telegram.org/botbottoken/sendmessage")
-        .required_setting("chat_id")
-        .without(Check::UpstreamFailureIsReported);
+        .required_setting("chat_id");
     conformance.run();
 
     let wasm = conformance.wasm_path();

@@ -8,7 +8,7 @@
 //! endpoint a delivery has to reach.
 
 use scryer_plugin_conformance::notification::{
-    Check, NotificationConformance, call_notification, instantiate, test_request,
+    NotificationConformance, call_notification, instantiate, test_request,
 };
 use scryer_plugin_conformance::{HttpScript, Script};
 use scryer_plugin_sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
@@ -16,8 +16,8 @@ use scryer_plugin_sdk::{NotificationEventType, PluginErrorCode, PluginResult};
 
 // One recipient is one request, so a non-success answer is a typed plugin
 // error carrying its code (`UpstreamUnavailable` for a 5xx) rather than an
-// unsuccessful delivery; the suite's in-band-delivery-failure check is
-// replaced by the typed check below.
+// unsuccessful delivery; the shared suite accepts that typed answer, and the
+// check below pins this channel's codes.
 
 #[test]
 fn signal_release_wasm_conforms_to_the_notification_host_contract() {
@@ -36,8 +36,7 @@ fn signal_release_wasm_conforms_to_the_notification_host_contract() {
         .expects_url_prefix("http://signal.test.invalid:8080/v2/send")
         .required_setting("server_url")
         // The operator has to be told about the legacy fallback too.
-        .required_setting_mentions("host")
-        .without(Check::UpstreamFailureIsReported);
+        .required_setting_mentions("host");
     conformance.run();
 
     let wasm = conformance.wasm_path();

@@ -8,7 +8,7 @@
 // conformance: bespoke
 
 use scryer_plugin_conformance::notification::{
-    Check, NotificationConformance, call_notification, instantiate, test_request,
+    NotificationConformance, call_notification, instantiate, test_request,
 };
 use scryer_plugin_conformance::{HttpScript, Script};
 use scryer_plugin_sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
@@ -27,9 +27,7 @@ const EXPECTED_TOKEN_HEADER: (&str, &str) = ("x-gotify-key", "apptoken");
 
 #[test]
 fn gotify_release_wasm_conforms_to_the_notification_host_contract() {
-    let outcome = conformance()
-        .without(Check::UpstreamFailureIsReported)
-        .run();
+    let outcome = conformance().run();
 
     // The application token is a header, not a query parameter: it must never
     // appear in the URL, and it must be sent under the name Gotify documents.
@@ -50,8 +48,9 @@ fn gotify_release_wasm_conforms_to_the_notification_host_contract() {
         outcome.send.urls
     );
 
-    // A 5xx is now a typed `UpstreamUnavailable` error rather than an in-band
-    // failed delivery, so the family's in-band check is replaced by this one.
+    // The shared suite accepts a 5xx answered as a typed `UpstreamUnavailable`
+    // error; this pins that answer and keeps the upstream text out of the
+    // public message.
     assert_a_server_error_is_upstream_unavailable(&conformance());
 }
 
