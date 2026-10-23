@@ -76,10 +76,10 @@ pub(crate) fn plain_text(html: &str) -> String {
             ("li", false) => out.push_str("\n- "),
             ("a", false) => href = attribute(tag, "href"),
             ("a", true) => {
-                if let Some(url) = href.take() {
-                    if !out.trim_end().ends_with(url.as_str()) {
-                        out.push_str(&format!(" ({url})"));
-                    }
+                if let Some(url) = href.take()
+                    && !out.trim_end().ends_with(url.as_str())
+                {
+                    out.push_str(&format!(" ({url})"));
                 }
             }
             _ => {}
