@@ -482,7 +482,10 @@ fn classify_response(response: &PluginHttpResponse, what: &str) -> Result<Value,
                 "{what}: HTTP {status} body is not valid JSON: {error}"
             ))
         }),
-        404 | 410 => Err(not_found(what)),
+        404 | 410 => Err(with_debug(
+            not_found(what),
+            format_args!("{what}: HTTP {status}"),
+        )),
         _ => Err(permanent("AniList answered with an unexpected HTTP status")),
     }
 }

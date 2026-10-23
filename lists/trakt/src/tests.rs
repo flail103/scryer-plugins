@@ -787,7 +787,10 @@ fn errors_map_to_host_failure_classes() {
     };
 
     let private = public(401, &[], "");
-    assert_eq!(private.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        private.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(private.public_message.contains("not found"));
     let lapsed = member(401);
     assert_eq!(lapsed.code, PluginErrorCode::AuthFailed);
@@ -795,7 +798,10 @@ fn errors_map_to_host_failure_classes() {
     // Trakt names a private or deleted list in its 403; a bad client id gets
     // a bare "Forbidden", and a missing one Cloudflare's HTML page.
     let gone = public(403, &[], r#""List is private or does not exist""#);
-    assert_eq!(gone.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        gone.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(gone.public_message.contains("not found"));
     for app_rejected in [
         public(403, &[], r#""Forbidden""#),
@@ -817,7 +823,10 @@ fn errors_map_to_host_failure_classes() {
     assert_eq!(gone_owner.code, PluginErrorCode::Permanent);
     assert!(!gone_owner.public_message.contains("not found"));
     let missing = public(404, &[], "");
-    assert_eq!(missing.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        missing.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(missing.public_message.contains("not found"));
     let limited = public(429, &[("Retry-After", "30")], "");
     assert_eq!(
@@ -939,7 +948,10 @@ fn a_list_id_that_names_no_list_is_not_found() {
         CLIENT,
         request("list", &[("list_id", "7700404")], None),
     ));
-    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        error.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(error.public_message.contains("not found"));
     assert_eq!(http.urls(), vec![api("/lists/7700404")]);
 }

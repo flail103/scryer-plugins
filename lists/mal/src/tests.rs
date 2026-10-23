@@ -554,7 +554,10 @@ fn errors_map_to_host_failure_classes() {
     );
 
     let missing = list(404, &[], r#"{"error": "not_found", "message": ""}"#);
-    assert_eq!(missing.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        missing.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(missing.public_message.contains("not found"));
 
     let limited = list(429, &[("Retry-After", "30")], "");

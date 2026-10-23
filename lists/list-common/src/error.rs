@@ -1,17 +1,17 @@
 //! Plugin errors shaped for the host's list failure classes.
 //!
 //! The host reads the error code, the public message and the retry hint:
-//! `AuthFailed` asks the operator to fix the key (and expires a linked member
-//! account), `RateLimited` pauses the provider for `retry_after_seconds`,
-//! `UpstreamUnavailable` and `Temporary` retry on the next interval, and a
-//! `Permanent` error whose message says "not found" marks the list as gone.
-//! Every other code, including the shared open codes, is a plain failure.
+//! `AuthFailed` and the open `invalid_api_key` code ask the operator to fix
+//! the credential (and expire a linked member account), `RateLimited` and the
+//! open `quota_exceeded` code pause the provider for `retry_after_seconds`,
+//! `UpstreamUnavailable` and `Temporary` retry on the next interval, and the
+//! open `item_not_found` code marks the list as gone. Every other code is a
+//! plain failure.
 //!
-//! The host's list classes key on the well-known `AuthFailed` code and on a
-//! `Permanent` "not found" sentence, so credential rejections and missing
-//! lists keep those shapes rather than the open `invalid_api_key` and
-//! `item_not_found` codes. Every error is built through the PDK builder; raw
-//! upstream detail goes to `debug_message` only.
+//! A rejected server or member API key sends `invalid_api_key`; a rejected
+//! OAuth token stays `AuthFailed`. Every error is built through the PDK
+//! builder; raw upstream detail, including what was requested, goes to
+//! `debug_message` only.
 
 use std::fmt;
 
@@ -34,12 +34,32 @@ pub fn with_debug(mut error: PluginError, debug: impl fmt::Display) -> PluginErr
     error
 }
 
+/// The public sentence for a missing list. It names neither the list nor the
+/// account, so the operator sees the same words whatever was asked for.
+pub const NOT_FOUND_MESSAGE: &str = "the list was not found, or it is not visible to this account";
+
 /// The list, person, company or feed does not exist (or is not visible).
+/// `what` names it in the debug text only.
 pub fn not_found(what: impl AsRef<str>) -> PluginError {
-    plugin_error(
-        PluginErrorCode::Permanent,
-        format!("{} not found", what.as_ref()),
+    with_debug(
+        plugin_error(codes::ITEM_NOT_FOUND, NOT_FOUND_MESSAGE),
+        format_args!("{} not found", what.as_ref()),
     )
+}
+
+/// The provider refused the API key the request carried.
+pub fn invalid_api_key(message: impl Into<String>) -> PluginError {
+    plugin_error(codes::INVALID_API_KEY, message)
+}
+
+/// The provider's request allowance for the account or app is used up.
+/// Carries the provider's retry hint when it gave one.
+pub fn quota_exceeded(message: impl Into<String>, retry_after_seconds: Option<i64>) -> PluginError {
+    let builder = scryer_plugin_pdk::plugin_error(codes::QUOTA_EXCEEDED, message);
+    match retry_after_seconds.filter(|seconds| *seconds > 0) {
+        Some(seconds) => builder.retry_after_seconds(seconds).build(),
+        None => builder.build(),
+    }
 }
 
 pub fn rate_limited(retry_after_seconds: Option<i64>) -> PluginError {
@@ -109,7 +129,7 @@ pub fn retry_after_seconds(response: &PluginHttpResponse) -> Option<i64> {
 }
 
 /// Map a non-success status onto the error the host expects. `what` names
-/// the thing that was requested, for the not-found message.
+/// the thing that was requested, for the debug text.
 pub fn check_status(
     response: &PluginHttpResponse,
     access: Access,
@@ -118,7 +138,7 @@ pub fn check_status(
     let status = response.status;
     let error = match status {
         200..=299 => return Ok(()),
-        401 if access == Access::ServerKey => auth_failed("the provider rejected the API key"),
+        401 if access == Access::ServerKey => invalid_api_key("the provider rejected the API key"),
         401 | 403 => not_found(format!("{what} (private or unavailable)")),
         404 | 410 => not_found(what),
         429 => rate_limited(retry_after_seconds(response)),
@@ -152,10 +172,15 @@ mod tests {
                 .unwrap_err()
                 .code
         };
-        assert_eq!(code(401, Access::ServerKey), PluginErrorCode::AuthFailed);
-        assert_eq!(code(401, Access::Public), PluginErrorCode::Permanent);
-        assert_eq!(code(403, Access::ServerKey), PluginErrorCode::Permanent);
-        assert_eq!(code(404, Access::Public), PluginErrorCode::Permanent);
+        let not_found = PluginErrorCode::from(codes::ITEM_NOT_FOUND);
+        assert_eq!(
+            code(401, Access::ServerKey),
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
+        assert_eq!(code(401, Access::Public), not_found);
+        assert_eq!(code(403, Access::ServerKey), not_found);
+        assert_eq!(code(404, Access::Public), not_found);
+        assert_eq!(code(410, Access::Public), not_found);
         assert_eq!(code(429, Access::Public), PluginErrorCode::RateLimited);
         assert_eq!(
             code(503, Access::Public),
@@ -166,13 +191,29 @@ mod tests {
     }
 
     #[test]
-    fn not_found_messages_are_recognised_by_the_host() {
-        for status in [403, 404, 410] {
+    fn a_missing_list_has_a_neutral_public_message() {
+        for status in [401, 403, 404, 410] {
             let error = check_status(&response(status, &[]), Access::Public, "list 7").unwrap_err();
-            assert!(error.public_message.contains("not found"), "{status}");
+            assert_eq!(error.public_message, NOT_FOUND_MESSAGE, "{status}");
+            assert!(!error.public_message.contains("list 7"), "{status}");
+            assert_eq!(
+                error.debug_message.as_deref(),
+                Some(format!("list 7: HTTP {status}").as_str())
+            );
         }
-        let unexpected = check_status(&response(418, &[]), Access::Public, "x").unwrap_err();
-        assert!(!unexpected.public_message.contains("not found"));
+        let direct = not_found("person 9");
+        assert_eq!(direct.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+        assert_eq!(direct.public_message, NOT_FOUND_MESSAGE);
+        assert_eq!(direct.debug_message.as_deref(), Some("person 9 not found"));
+    }
+
+    #[test]
+    fn a_used_up_allowance_is_a_quota_with_the_retry_hint() {
+        let error = quota_exceeded("the daily allowance is used up", Some(3600));
+        assert_eq!(error.code, PluginErrorCode::from(codes::QUOTA_EXCEEDED));
+        assert_eq!(error.retry_after_seconds, Some(3600));
+        let unhinted = quota_exceeded("the daily allowance is used up", None);
+        assert_eq!(unhinted.retry_after_seconds, None);
     }
 
     #[test]
@@ -197,7 +238,7 @@ mod tests {
     #[test]
     fn the_status_goes_to_debug_and_stays_out_of_the_public_message() {
         let error = check_status(&response(401, &[]), Access::ServerKey, "list 7").unwrap_err();
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
         assert!(!error.public_message.contains("401"));
         assert_eq!(error.debug_message.as_deref(), Some("list 7: HTTP 401"));
     }

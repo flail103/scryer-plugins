@@ -557,7 +557,10 @@ fn a_missing_custom_list_is_not_found_but_an_empty_one_is_empty() {
         &["Fixture Queue"],
     );
     let error = block_on(fetch(&answering(&body), &custom_request("Fixture Archive"))).unwrap_err();
-    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        error.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(error.public_message.contains("not found"));
     assert!(
         !error.public_message.contains("Fixture Archive"),
@@ -822,7 +825,11 @@ fn http_failures_map_to_host_classes() {
     let cases = [
         (401, PluginErrorCode::AuthFailed, false),
         (403, PluginErrorCode::UpstreamUnavailable, false),
-        (404, PluginErrorCode::Permanent, true),
+        (
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
         (429, PluginErrorCode::RateLimited, false),
         (500, PluginErrorCode::UpstreamUnavailable, false),
         (502, PluginErrorCode::UpstreamUnavailable, false),
@@ -880,10 +887,34 @@ fn graphql_errors_map_to_host_classes_even_with_http_200() {
             PluginErrorCode::RateLimited,
             false,
         ),
-        (404, "Not Found.", 404, PluginErrorCode::Permanent, true),
-        (404, "User not found", 404, PluginErrorCode::Permanent, true),
-        (404, "Private User", 404, PluginErrorCode::Permanent, true),
-        (200, "User not found", 404, PluginErrorCode::Permanent, true),
+        (
+            404,
+            "Not Found.",
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
+        (
+            404,
+            "User not found",
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
+        (
+            404,
+            "Private User",
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
+        (
+            200,
+            "User not found",
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
         (
             403,
             "The AniList API has been temporarily disabled due to severe stability issues.",

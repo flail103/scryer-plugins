@@ -246,8 +246,16 @@ fn non_plex_urls_are_rejected_before_any_request() {
 #[test]
 fn upstream_failures_map_to_host_classes() {
     let cases = [
-        (404, PluginErrorCode::Permanent, true),
-        (403, PluginErrorCode::Permanent, true),
+        (
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
+        (
+            403,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
         (429, PluginErrorCode::RateLimited, false),
         (502, PluginErrorCode::UpstreamUnavailable, false),
     ];

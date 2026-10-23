@@ -203,9 +203,13 @@ fn a_refused_feed_reads_as_private_without_leaking_the_address() {
     for refused in [401, 403] {
         let http = RecordedHttp::new().with(RSS_URL, refused, "denied for fixture-user");
         let error = block_on(fetch(&http, &request(SOURCE_RSS, Some(RSS_URL), None))).unwrap_err();
-        // The host's list classes read a permanent "not found" as a list that
-        // is gone or private.
-        assert_eq!(error.code, PluginErrorCode::Permanent, "{refused}");
+        // The host's list classes read `item_not_found` as a list that is gone
+        // or private.
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            "{refused}"
+        );
         assert!(error.public_message.contains("not found"), "{refused}");
         assert!(!error.public_message.contains("example.test"), "{refused}");
         assert!(!error.public_message.contains("fixture-user"), "{refused}");

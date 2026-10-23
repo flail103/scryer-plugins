@@ -285,15 +285,21 @@ fn errors_map_to_host_failure_classes() {
     };
     assert_eq!(
         with_key(401, &[], r#"{"error":"Invalid API key"}"#).code,
-        PluginErrorCode::AuthFailed
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_API_KEY)
     );
     // A refusal on a member's own list is their key, and the list is not gone.
     let denied = with_key(403, &[], r#"{"error":"Permission denied"}"#);
-    assert_eq!(denied.code, PluginErrorCode::AuthFailed);
+    assert_eq!(
+        denied.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_API_KEY)
+    );
     assert!(!denied.public_message.contains("not found"));
     let missing = with_key(404, &[], r#"{"error":"Not found"}"#);
-    assert_eq!(missing.code, PluginErrorCode::Permanent);
-    assert!(missing.public_message.contains("not found"));
+    assert_eq!(
+        missing.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
+    assert!(!missing.public_message.contains("5101"));
     let limited = with_key(
         429,
         &[("Retry-After", "3600")],
@@ -301,7 +307,19 @@ fn errors_map_to_host_failure_classes() {
     );
     assert_eq!(
         (limited.code, limited.retry_after_seconds),
-        (PluginErrorCode::RateLimited, Some(3600))
+        (
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::QUOTA_EXCEEDED),
+            Some(3600)
+        )
+    );
+    let burst = with_key(
+        429,
+        &[("Retry-After", "30")],
+        r#"{"error":"Too many requests"}"#,
+    );
+    assert_eq!(
+        (burst.code, burst.retry_after_seconds),
+        (PluginErrorCode::RateLimited, Some(30))
     );
     assert_eq!(
         with_key(500, &[], "").code,
@@ -316,11 +334,13 @@ fn errors_map_to_host_failure_classes() {
         ))
         .unwrap_err()
     };
-    assert_eq!(public(401, "").code, PluginErrorCode::Permanent);
-    assert!(
-        public(200, r#"{"error":"List not found"}"#)
-            .public_message
-            .contains("not found")
+    assert_eq!(
+        public(401, "").code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
+    assert_eq!(
+        public(200, r#"{"error":"List not found"}"#).code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
     );
     assert_eq!(
         public(200, "<html></html>").code,
@@ -423,18 +443,20 @@ fn a_members_key_names_their_account_and_their_lists() {
 }
 
 #[test]
-fn a_key_mdblist_refuses_is_an_auth_failure_and_other_trouble_is_not() {
+fn a_key_mdblist_refuses_is_an_invalid_key_and_other_trouble_is_not() {
     let user_url = format!("{API_BASE}/user?apikey={MEMBER_KEY}");
     let refused = |status: u16| {
         let http = RecordedHttp::new().with(&user_url, status, r#"{"error":"Invalid API key"}"#);
         account_of(&http, MEMBER_KEY).unwrap_err()
     };
-    // `auth_failed`, not `invalid_api_key`: for a member key that is the
-    // credential, the host reads only this code as "the provider refused the
-    // key".
+    // `invalid_api_key`: the host reads it as "the provider refused the key".
     for status in [401, 403] {
         let error = refused(status);
-        assert_eq!(error.code, PluginErrorCode::AuthFailed, "{status}");
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_API_KEY),
+            "{status}"
+        );
         assert!(!error.public_message.contains(MEMBER_KEY), "{status}");
         assert!(
             !error.public_message.contains("Invalid API key"),
@@ -456,7 +478,10 @@ fn a_key_mdblist_refuses_is_an_auth_failure_and_other_trouble_is_not() {
     let limited = account_of(&limited, MEMBER_KEY).unwrap_err();
     assert_eq!(
         (limited.code, limited.retry_after_seconds),
-        (PluginErrorCode::RateLimited, Some(120))
+        (
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::QUOTA_EXCEEDED),
+            Some(120)
+        )
     );
 
     // An answer that names nobody links nobody.
@@ -595,8 +620,14 @@ fn a_watchlist_is_never_cut_short_or_read_as_gone() {
         let http = RecordedHttp::new().with(&member_url("/watchlist/items", 0), status, "{}");
         block_on(fetch(&http, &member_request(SOURCE_WATCHLIST, &[], None))).unwrap_err()
     };
-    assert_eq!(answered(401).code, PluginErrorCode::AuthFailed);
-    assert_eq!(answered(403).code, PluginErrorCode::AuthFailed);
+    assert_eq!(
+        answered(401).code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_API_KEY)
+    );
+    assert_eq!(
+        answered(403).code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_API_KEY)
+    );
     let missing = answered(404);
     assert_eq!(missing.code, PluginErrorCode::Permanent);
     assert!(

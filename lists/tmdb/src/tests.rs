@@ -474,7 +474,10 @@ fn errors_map_to_host_failure_classes() {
         assert_no_secrets(&rejected);
     }
     let missing = person(404, &[], r#"{"status_code": 34}"#);
-    assert_eq!(missing.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        missing.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(missing.public_message.contains("not found"));
     let limited = person(429, &[("Retry-After", "30")], "");
     assert_eq!(
@@ -1018,7 +1021,10 @@ fn a_rejected_member_token_is_an_expired_account() {
         401,
         r#"{"status_code": 39, "status_message": "This resource is private."}"#,
     );
-    assert_eq!(private.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        private.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(private.public_message.contains("not found"));
     let missing = own_list(404, r#"{"status_code": 34}"#);
     assert!(missing.public_message.contains("not found"));

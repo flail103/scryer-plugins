@@ -827,7 +827,11 @@ fn upstream_failures_map_to_host_classes() {
         (401, PluginErrorCode::AuthFailed, false),
         // A 403 Simkl gives no reason for is a refusal retrying cannot fix.
         (403, PluginErrorCode::Permanent, false),
-        (404, PluginErrorCode::Permanent, true),
+        (
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
         (412, PluginErrorCode::UpstreamUnavailable, false),
         (429, PluginErrorCode::RateLimited, false),
         (500, PluginErrorCode::UpstreamUnavailable, false),
@@ -1146,14 +1150,20 @@ fn a_burst_429_retries_shortly_and_ignores_retry_after() {
 #[test]
 fn a_spent_daily_allowance_waits_for_the_reset_and_names_whose_it_is() {
     let member = limited(r#"{"error":"user_limit_exceeded","code":429}"#, "5400");
-    assert_eq!(member.code, PluginErrorCode::RateLimited);
+    assert_eq!(
+        member.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::QUOTA_EXCEEDED)
+    );
     assert_eq!(member.retry_after_seconds, Some(5400));
     assert!(member.public_message.contains("this member's daily"));
     assert!(!member.public_message.contains("unavailable"));
     assert!(!member.public_message.contains(TOKEN));
 
     let app = limited(r#"{"error":"app_limit_exceeded","code":429}"#, "600");
-    assert_eq!(app.code, PluginErrorCode::RateLimited);
+    assert_eq!(
+        app.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::QUOTA_EXCEEDED)
+    );
     assert_eq!(app.retry_after_seconds, Some(600));
     assert!(app.public_message.contains("app's daily"));
 }
@@ -1388,7 +1398,10 @@ fn custom_lists_never_treat_errors_or_partial_data_as_empty_membership() {
     for (status, code) in [
         (401, PluginErrorCode::AuthFailed),
         (403, PluginErrorCode::Permanent),
-        (404, PluginErrorCode::Permanent),
+        (
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+        ),
         (429, PluginErrorCode::RateLimited),
         (503, PluginErrorCode::UpstreamUnavailable),
     ] {

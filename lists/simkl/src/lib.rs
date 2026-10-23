@@ -43,8 +43,9 @@
 use std::collections::BTreeSet;
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, invalid_config, invalid_response, permanent, plugin_error,
-    rate_limited, retry_after_seconds, unavailable, unsupported_source, with_debug,
+    Access, DEFAULT_RETRY_AFTER_SECONDS, auth_failed, check_status, invalid_config,
+    invalid_response, permanent, plugin_error, quota_exceeded, rate_limited, retry_after_seconds,
+    unavailable, unsupported_source, with_debug,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, json_body};
 use list_provider_common::ids::{
@@ -644,9 +645,10 @@ fn response_error_name(response: &PluginHttpResponse) -> Option<String> {
 /// second, so its `Retry-After` is not used. `user_limit_exceeded` is this
 /// member's daily allowance and `app_limit_exceeded` the app's; both carry
 /// `Retry-After` with the seconds until Simkl resets them at midnight US
-/// Eastern. The host's rate-limited class pauses only the list that hit the
-/// limit, which keeps a member's spent allowance from reading as Simkl being
-/// down. Anything else follows the shared mapping.
+/// Eastern. The burst limit is `RateLimited`; a spent daily allowance is the
+/// open `quota_exceeded` code with that `Retry-After`. The host pauses only
+/// the list that hit either, which keeps a member's spent allowance from
+/// reading as Simkl being down. Anything else follows the shared mapping.
 ///
 /// Public messages never carry Simkl's status or error name; both go to the
 /// host log only. A rejected token stays `auth_failed` rather than
@@ -684,18 +686,20 @@ fn check_simkl_status(response: &PluginHttpResponse, what: &str) -> Result<(), P
     Err(with_debug(error, detail))
 }
 
-/// Simkl's daily allowances are rate limits to the host, not a quota code: its
-/// rate-limited class is what pauses only the list that hit the limit until
-/// `Retry-After`.
+/// Simkl's daily allowances are a quota: the host pauses the list that hit
+/// one until `Retry-After`, the seconds until Simkl's midnight reset.
 fn simkl_rate_limited(response: &PluginHttpResponse, name: Option<&str>) -> PluginError {
     let daily = |whose: &str| {
-        let mut error = rate_limited(retry_after_seconds(response));
-        let seconds = error.retry_after_seconds.unwrap_or_default();
-        error.public_message = format!(
-            "{whose} daily Simkl request allowance is used up; Simkl resets it at midnight US \
-             Eastern, in {seconds} seconds"
-        );
-        error
+        let seconds = retry_after_seconds(response)
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(DEFAULT_RETRY_AFTER_SECONDS);
+        quota_exceeded(
+            format!(
+                "{whose} daily Simkl request allowance is used up; Simkl resets it at midnight \
+                 US Eastern, in {seconds} seconds"
+            ),
+            Some(seconds),
+        )
     };
     match name {
         Some("rate_limit") => {
