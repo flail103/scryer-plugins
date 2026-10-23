@@ -443,11 +443,14 @@ async fn drive_operation<H: EngineHost>(
         config.insert("CAPTCHA".to_string(), answer);
     }
     if wants_captcha {
-        let captcha = definition
+        // A login without a CAPTCHA asks for nothing; the host shows nothing.
+        let Some(captcha) = definition
             .login
             .as_ref()
             .and_then(|login| login.captcha.as_ref())
-            .ok_or_else(|| "definition does not declare a CAPTCHA".to_string())?;
+        else {
+            return Ok(serde_json::json!({}));
+        };
         if !captcha.captcha_type.eq_ignore_ascii_case("image") {
             return Err(format!(
                 "unsupported Cardigann CAPTCHA type `{}`",
@@ -1696,6 +1699,24 @@ pub fn resolve_network_endpoints(
     }
     let mut origins = std::collections::BTreeSet::new();
     origins.insert(base.origin().ascii_serialization());
+    // Every site link and legacy link is a root the definition names: an
+    // operator may pick any of them as the base URL, and trackers redirect
+    // between them or serve downloads from them. Each declared host also
+    // covers its own subdomains on the host side. A link that is not a plain
+    // HTTP(S) URL is skipped rather than failing the whole definition.
+    for link in definition.links.iter().chain(&definition.legacy_links) {
+        let Ok(url) = Url::parse(link.trim()) else {
+            continue;
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str().is_none()
+        {
+            continue;
+        }
+        origins.insert(url.origin().ascii_serialization());
+    }
     for endpoint in endpoints {
         if endpoint.starts_with("magnet:") {
             continue;
@@ -1716,9 +1737,6 @@ pub fn resolve_network_endpoints(
             return Err("Endpoint authorities must be HTTP(S) URLs without credentials".into());
         }
         origins.insert(url.origin().ascii_serialization());
-        if origins.len() > 64 {
-            return Err("Too many configured endpoint origins".into());
-        }
     }
     Ok(origins.into_iter().collect())
 }
@@ -4578,7 +4596,7 @@ mod tests {
     }
 
     #[test]
-    fn network_endpoints_custom_relative_and_unavailable_authorities() {
+    fn network_endpoints_declare_every_link_and_legacy_link() {
         let mut definition = parse_definition(
             &crate::baked::definition_yaml("thepiratebay")
                 .unwrap()
@@ -4587,14 +4605,71 @@ mod tests {
         .unwrap();
         definition.search.fields.clear();
         definition.search.paths[0].path = "/search/{{ .Keywords }}".into();
+        definition.links = vec![
+            "https://tracker.example/".into(),
+            "https://mirror.example:8443/".into(),
+            "magnet:?not-a-site".into(),
+        ];
+        definition.legacy_links = vec![
+            "http://old-tracker.example/".into(),
+            "https://user:secret@credentialed.example/".into(),
+        ];
+        let config = BTreeMap::from([("base_url".into(), "https://mirror.example:8443/".into())]);
+        assert_eq!(
+            resolve_network_endpoints(&definition, &config).unwrap(),
+            vec![
+                "http://old-tracker.example".to_string(),
+                "https://mirror.example:8443".to_string(),
+                "https://tracker.example".to_string(),
+            ]
+        );
+    }
+
+    /// Every bundled definition declares each of its links and legacy links.
+    #[test]
+    fn network_endpoints_for_every_bundled_definition_include_its_links() {
+        for row in crate::baked::index().unwrap() {
+            if row.id == crate::baked::CUSTOM_DEFINITION_ID {
+                continue;
+            }
+            let definition =
+                parse_definition(&crate::baked::definition_yaml(&row.id).unwrap().unwrap())
+                    .unwrap();
+            let Ok(origins) = resolve_network_endpoints(&definition, &BTreeMap::new()) else {
+                // Definitions whose authorities need operator settings are
+                // covered by the tests above.
+                continue;
+            };
+            for link in definition.links.iter().chain(&definition.legacy_links) {
+                if let Ok(url) = Url::parse(link)
+                    && matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                {
+                    assert!(
+                        origins.contains(&url.origin().ascii_serialization()),
+                        "{}: {link}",
+                        row.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn network_endpoints_custom_relative_and_unavailable_authorities() {
+        let mut definition = parse_definition(
+            &crate::baked::definition_yaml("thepiratebay")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        definition.search.fields.clear();
+        definition.links = vec!["https://tracker.example/".into()];
+        definition.legacy_links.clear();
+        definition.search.paths[0].path = "/search/{{ .Keywords }}".into();
         assert_eq!(
             resolve_network_endpoints(&definition, &BTreeMap::new()).unwrap(),
-            vec![
-                Url::parse(&definition.links[0])
-                    .unwrap()
-                    .origin()
-                    .ascii_serialization()
-            ]
+            vec!["https://tracker.example".to_string()]
         );
         definition.search.paths[0].path =
             "{{ if .Keywords }}search/{{ .Keywords }}{{ else }}recent{{ end }}".into();
@@ -5538,6 +5613,23 @@ search:
             grab["body"],
             serde_json::json!([116, 111, 114, 114, 101, 110, 116])
         );
+    }
+
+    /// A login without a CAPTCHA has nothing to show: the reply is empty and
+    /// the tracker is not contacted.
+    #[test]
+    fn captcha_action_without_a_captcha_asks_for_nothing() {
+        let definition = parse_definition(PUBLIC_DEFINITION).unwrap();
+        let mut host = MockEngineHost::default();
+        let payload = block_on(action_with_host(
+            &mut host,
+            definition,
+            EngineAction::CheckCaptcha,
+            BTreeMap::new(),
+        ))
+        .unwrap();
+        assert_eq!(payload, serde_json::json!({}));
+        assert!(host.requests.is_empty());
     }
 
     #[test]

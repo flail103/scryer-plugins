@@ -21,6 +21,7 @@ mod definition;
 mod filters;
 #[cfg(test)]
 mod gate;
+mod info_text;
 mod runtime;
 mod template;
 
@@ -214,17 +215,17 @@ fn config_fields() -> Vec<sdk::ConfigFieldDef> {
                 Some("Optional initial tracker cookie."),
             )
         },
-        sdk::ConfigFieldDef {
-            advanced: true,
-            ..field(
-                "cardigannCaptcha",
-                "CAPTCHA Answer",
-                sdk::ConfigFieldType::String,
-                false,
-                None,
-                Some("Answer returned for a Cardigann image CAPTCHA."),
-            )
-        },
+        // Shown only for a definition whose login has a CAPTCHA; Scryer then
+        // fetches the image through `checkCaptcha` and shows it beside this
+        // field.
+        field(
+            "cardigannCaptcha",
+            "CAPTCHA Answer",
+            sdk::ConfigFieldType::String,
+            false,
+            Some(sdk::ConfigFieldRole::LoginChallengeAnswer),
+            Some("Type the characters in the CAPTCHA image, then save."),
+        ),
     ]
 }
 
@@ -410,12 +411,32 @@ fn definition_config_fields(definition: &Definition) -> ConfigFieldsResponse {
     }
 }
 
-/// One definition setting as a form field. Informational settings have no
-/// value and are left out, as are setting types the engine does not bind.
+/// One definition setting as a form field. Informational settings become
+/// read-only notes that never take a value; setting types the engine does not
+/// bind are left out.
 fn setting_field(setting: &Setting) -> Option<sdk::ConfigFieldDef> {
     let key = setting.name.trim();
     if key.is_empty() || key.len() > 128 {
         return None;
+    }
+    if setting.setting_type.starts_with("info") {
+        let default_text = setting
+            .default_value
+            .as_ref()
+            .and_then(definition::scalar_to_string);
+        let (label, text) = info_text::info_note(
+            &setting.setting_type,
+            setting.label.as_deref(),
+            default_text.as_deref(),
+        )?;
+        return Some(field(
+            key,
+            &label,
+            sdk::ConfigFieldType::Info,
+            false,
+            None,
+            (!text.is_empty()).then_some(text.as_str()),
+        ));
     }
     let default = setting
         .default_value
@@ -809,8 +830,8 @@ search:
     }
 
     /// A definition's settings become fields typed the way the engine binds
-    /// them, credentials it does not use are hidden, and settings that shadow
-    /// a static field or carry no value stay out.
+    /// them, info settings become read-only notes, credentials it does not use
+    /// are hidden, and settings that shadow a static field stay out.
     #[test]
     fn config_fields_turn_definition_settings_into_fields() {
         let definition = parse_definition(&format!(
@@ -826,6 +847,7 @@ search:
         assert_eq!(
             keys,
             [
+                "info_note",
                 "apikey",
                 "passkey",
                 "freeleech",
@@ -841,6 +863,11 @@ search:
                 .find(|field| field.key == key)
                 .unwrap()
         };
+        // An info setting is a read-only note: its text is help, never a value.
+        assert_eq!(field("info_note").field_type, sdk::ConfigFieldType::Info);
+        assert_eq!(field("info_note").label, "Note");
+        assert_eq!(field("info_note").help_text.as_deref(), Some("Read me"));
+        assert_eq!(field("info_note").default_value, None);
         assert_eq!(field("apikey").field_type, sdk::ConfigFieldType::String);
         assert_eq!(field("apikey").label, "API Key");
         assert_eq!(field("passkey").field_type, sdk::ConfigFieldType::Password);
@@ -880,6 +907,7 @@ search:
     fn config_fields_for_every_bundled_definition_pass_host_rules() {
         let rows = baked::index().unwrap();
         let mut with_fields = 0;
+        let mut with_notes = 0;
         for row in &rows {
             let response = config_fields_for(Some(&row.id));
             let mut keys = HashSet::new();
@@ -914,6 +942,20 @@ search:
                 if field.field_type == sdk::ConfigFieldType::Select {
                     assert!(!field.options.is_empty(), "{}: {}", row.id, field.key);
                 }
+                // The host refuses a note that asks for a value.
+                if field.field_type == sdk::ConfigFieldType::Info {
+                    assert!(
+                        !field.required
+                            && field.required_when.is_none()
+                            && field.options.is_empty()
+                            && field.default_value.is_none()
+                            && !field.label.trim().is_empty(),
+                        "{}: {}",
+                        row.id,
+                        field.key
+                    );
+                    with_notes += 1;
+                }
             }
             for key in &response.hidden_field_keys {
                 assert!(CREDENTIAL_KEYS.contains(&key.as_str()), "{}", row.id);
@@ -921,6 +963,7 @@ search:
             with_fields += usize::from(!response.fields.is_empty());
         }
         assert!(with_fields > 0);
+        assert!(with_notes > 0, "bundled definitions carry info settings");
     }
 
     /// Config failures name the setting the operator has to fix.
@@ -1122,12 +1165,17 @@ search:
             .filter(|field| field.advanced)
             .map(|field| field.key.as_str())
             .collect();
-        assert_eq!(
-            advanced,
-            vec!["extra_field_data_json", "cookie", "cardigannCaptcha"]
-        );
-        // The things an operator needs to connect at all stay up front.
-        for key in ["definition", "base_url", "username", "password"] {
+        assert_eq!(advanced, vec!["extra_field_data_json", "cookie"]);
+        // The things an operator needs to connect at all stay up front, and
+        // so does the CAPTCHA answer: it is shown only when the login asks
+        // for one, with the image beside it.
+        for key in [
+            "definition",
+            "base_url",
+            "username",
+            "password",
+            "cardigannCaptcha",
+        ] {
             assert!(
                 fields
                     .iter()
