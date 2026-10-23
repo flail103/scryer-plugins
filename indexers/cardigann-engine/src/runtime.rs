@@ -50,7 +50,11 @@ pub enum EngineAction {
 pub trait EngineHost {
     /// One host-policy-checked HTTP attempt, with repeated response header
     /// fields preserved so the engine can own its own cookie jar.
-    async fn http(&mut self, request: PluginHttpRequest) -> Result<PluginHttpResponse, String>;
+    ///
+    /// A failed attempt is already classified, so the tracker being
+    /// unreachable or timing out keeps its code instead of turning generic.
+    async fn http(&mut self, request: PluginHttpRequest)
+    -> Result<PluginHttpResponse, EngineError>;
     async fn state_get(&mut self, key: &str) -> Result<Option<Vec<u8>>, String>;
     async fn state_set(&mut self, key: &str, value: Vec<u8>) -> Result<(), String>;
     /// UTC Unix milliseconds. Only the persisted session's expiry uses it;
@@ -110,14 +114,9 @@ pub enum Step {
     Complete {
         output: Value,
     },
-    Failed {
-        code: String,
-        message: String,
-        retryable: bool,
-    },
-    /// A failure the operator has to act on — the tracker refused the login,
-    /// or the login needs a setting that is not set — carried to the component
-    /// boundary as the SDK's typed error instead of a generic one.
+    /// A failure the tracker or the definition caused — a refused login, an
+    /// HTTP error, a page the definition cannot read — carried to the
+    /// component boundary as the SDK's typed error instead of a generic one.
     Rejected {
         error: PluginError,
     },
@@ -327,12 +326,15 @@ pub async fn action(
 struct ComponentEngineHost;
 
 impl EngineHost for ComponentEngineHost {
-    async fn http(&mut self, request: PluginHttpRequest) -> Result<PluginHttpResponse, String> {
+    async fn http(
+        &mut self,
+        request: PluginHttpRequest,
+    ) -> Result<PluginHttpResponse, EngineError> {
         // The list-shaped response keeps every `Set-Cookie` field the tracker
         // sent, which is what lets the cookie jar below live in the guest.
         let response = component::http_fields(request)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(host_http_error)?;
         let set_cookie_headers = response
             .field_values("set-cookie")
             .map(str::to_string)
@@ -392,6 +394,15 @@ impl EngineHost for ComponentEngineHost {
                 )
             })
     }
+}
+
+/// A failed host HTTP attempt as the PDK classifies it: an unreachable
+/// tracker is `UpstreamUnavailable`, a timeout `Temporary`, each with the
+/// PDK's neutral sentence and the host's text as the debug detail.
+fn host_http_error(error: component::HostError) -> EngineError {
+    EngineError::Plugin(scryer_plugin_pdk::error::plugin_error_from(
+        &scryer_plugin_pdk::Error::new(error),
+    ))
 }
 
 async fn drive_operation<H: EngineHost>(
@@ -498,8 +509,18 @@ async fn drive_operation<H: EngineHost>(
                     .get("CAPTCHA")
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| {
-                        "tracker CAPTCHA requires cardigannCaptcha (or CAPTCHA) configuration"
-                            .to_string()
+                        EngineError::Plugin(
+                            plugin_error(
+                                codes::CAPTCHA_REQUIRED,
+                                "The tracker asks for a CAPTCHA. Solve it from the indexer's \
+                                 settings, then try again.",
+                            )
+                            .debug(
+                                "tracker CAPTCHA requires cardigannCaptcha (or CAPTCHA) \
+                                 configuration",
+                            )
+                            .build(),
+                        )
                     })?
                     .clone();
                 step = resume(
@@ -514,7 +535,6 @@ async fn drive_operation<H: EngineHost>(
                 persist_session(host, &state_key, &session).await?;
                 return Ok(output);
             }
-            Step::Failed { message, .. } => return Err(EngineError::Message(message)),
             Step::Rejected { error } => return Err(EngineError::Plugin(error)),
         }
     }
@@ -591,7 +611,14 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
         }
         (Continuation::SimpleCaptcha(mut context), ResumeInput::Http(response)) => {
             merge_response_cookies(&mut context.cookies, &response);
-            require_success(&response, "simple CAPTCHA")?;
+            if let Some(step) = http_status_failure(
+                &context.definition,
+                &response,
+                "simple CAPTCHA",
+                codes::ENDPOINT_NOT_FOUND,
+            ) {
+                return Ok(step);
+            }
             let selection =
                 serde_json::from_str::<Value>(&decode_body(&context.definition, &response.body))
                     .map_err(|error| format!("invalid simple CAPTCHA response: {error}"))?
@@ -632,7 +659,14 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
         }
         (Continuation::CaptchaImage(mut context), ResumeInput::Http(response)) => {
             merge_response_cookies(&mut context.cookies, &response);
-            require_success(&response, "captcha image")?;
+            if let Some(step) = http_status_failure(
+                &context.definition,
+                &response,
+                "captcha image",
+                codes::ENDPOINT_NOT_FOUND,
+            ) {
+                return Ok(step);
+            }
             need_manual(
                 "The tracker CAPTCHA image was fetched. Enter the value shown in the challenge."
                     .to_string(),
@@ -694,10 +728,12 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
                         Html::parse_document(&decode_body(&definition, &response.body));
                     mark_contains(&mut document, &selector.needles);
                     if select_matching_element(&document.root_element(), &selector).is_none() {
-                        return Ok(failed(
-                            "login_test_failed",
+                        return Ok(rejected(
+                            login_rejection_code(&definition, &response),
+                            "The tracker did not show a logged-in page. Check the indexer's \
+                             credentials."
+                                .to_string(),
                             format!("login test selector `{selector_text}` did not match"),
-                            false,
                         ));
                     }
                 }
@@ -708,11 +744,13 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
                     }),
                 })
             } else {
-                Ok(failed(
-                    "connection_failed",
-                    format!("indexer returned HTTP {}", response.status),
-                    response.status >= 500,
-                ))
+                Ok(http_status_failure(
+                    &definition,
+                    &response,
+                    "connection test",
+                    codes::ENDPOINT_NOT_FOUND,
+                )
+                .expect("a non-2xx connection test response is a failure"))
             }
         }
         (Continuation::SearchResponse(mut context), ResumeInput::Http(response)) => {
@@ -732,21 +770,31 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            require_success(&response, "search")?;
-            check_error_blocks(
-                &definition,
-                &definition.search.error,
-                &response,
-                &context.variables,
-                "search",
-            )?;
+            if let Some(step) =
+                http_status_failure(&definition, &response, "search", codes::ENDPOINT_NOT_FOUND)
+            {
+                return Ok(step);
+            }
+            if let Some(step) = search_error_block(&definition, &context, &response)? {
+                return Ok(step);
+            }
             let path = definition
                 .search
                 .paths
                 .get(context.search_path)
                 .ok_or_else(|| "search continuation refers to a missing path".to_string())?;
             let parsed =
-                parse_search_response(&definition, path, &response, &mut context.variables)?;
+                match parse_search_response(&definition, path, &response, &mut context.variables) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        return Ok(rejected(
+                            codes::INVALID_RESPONSE.into(),
+                            "The tracker's search page could not be read with this definition."
+                                .to_string(),
+                            format!("Cardigann search response: {error}"),
+                        ));
+                    }
+                };
             context.results.extend(parsed);
             context.search_path += 1;
             next_search(&definition, context)
@@ -765,7 +813,14 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            require_success(&response, "download details")?;
+            if let Some(step) = http_status_failure(
+                &definition,
+                &response,
+                "download details",
+                codes::ITEM_NOT_FOUND,
+            ) {
+                return Ok(step);
+            }
             let before = definition
                 .download
                 .as_ref()
@@ -801,7 +856,14 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            require_success(&response, "download before request")?;
+            if let Some(step) = http_status_failure(
+                &definition,
+                &response,
+                "download before request",
+                codes::ITEM_NOT_FOUND,
+            ) {
+                return Ok(step);
+            }
             context.grab_before_body = Some(response.body);
             continue_grab_after_before(context)
         }
@@ -819,7 +881,14 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            require_success(&response, "download page")?;
+            if let Some(step) = http_status_failure(
+                &definition,
+                &response,
+                "download page",
+                codes::ITEM_NOT_FOUND,
+            ) {
+                return Ok(step);
+            }
             finish_grab(context, &response.body)
         }
         (Continuation::GrabDownload(mut context), ResumeInput::Http(response)) => {
@@ -836,7 +905,14 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            require_success(&response, "torrent download")?;
+            if let Some(step) = http_status_failure(
+                &definition,
+                &response,
+                "torrent download",
+                codes::ITEM_NOT_FOUND,
+            ) {
+                return Ok(step);
+            }
             if context.grab_selector_page_body.is_none()
                 || !definition.test_link_torrent
                 || response.body.first() == Some(&b'd')
@@ -878,7 +954,11 @@ fn begin_after_optional_login(definition: &Definition, context: Context) -> Resu
             need_http(request, Continuation::LoginLanding(context))
         }
         "post" | "get" | "oneurl" => direct_login(definition, login, context),
-        method => Err(format!("unsupported Cardigann login method `{method}`")),
+        method => Ok(rejected(
+            PluginErrorCode::Unsupported,
+            "This definition logs in a way the plugin does not support.".to_string(),
+            format!("unsupported Cardigann login method `{method}`"),
+        )),
     }
 }
 
@@ -1392,7 +1472,12 @@ fn next_grab_selector(mut context: Context) -> Result<Step, String> {
             return complete_grab(&context, &url, &download.method, Vec::new());
         }
     }
-    Err(format!("download selectors did not match `{base}`"))
+    Ok(rejected(
+        codes::INVALID_RESPONSE.into(),
+        "The tracker's download page did not show a download link this definition recognises."
+            .to_string(),
+        format!("download selectors did not match `{base}`"),
+    ))
 }
 
 fn request_block_request(
@@ -1449,13 +1534,26 @@ fn complete_grab(
             }),
         });
     }
-    let parsed =
-        Url::parse(url).map_err(|error| format!("invalid download URL `{url}`: {error}"))?;
+    let unusable_link = |debug: String| {
+        rejected(
+            codes::INVALID_RESPONSE.into(),
+            "The tracker gave a download link the plugin cannot fetch.".to_string(),
+            debug,
+        )
+    };
+    let parsed = match Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Ok(unusable_link(format!(
+                "invalid download URL `{url}`: {error}"
+            )));
+        }
+    };
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!(
+        return Ok(unusable_link(format!(
             "unsupported download URL scheme `{}`",
             parsed.scheme()
-        ));
+        )));
     }
     let request = http_request(
         &method,
@@ -1471,8 +1569,10 @@ fn complete_grab_response(context: &Context, response: PluginHttpResponse) -> Re
     // old 2 MiB ceiling rejected legitimate season packs.
     const MAX_TORRENT_BYTES: usize = 64 * 1024 * 1024;
     if response.body.len() > MAX_TORRENT_BYTES {
-        return Err(format!(
-            "torrent response exceeded the {MAX_TORRENT_BYTES}-byte runtime limit"
+        return Ok(rejected(
+            PluginErrorCode::Permanent,
+            "The tracker's torrent is larger than the plugin accepts.".to_string(),
+            format!("torrent response exceeded the {MAX_TORRENT_BYTES}-byte runtime limit"),
         ));
     }
     // An HTML-typed download is rejected outright: it is a login wall, a
@@ -1483,10 +1583,14 @@ fn complete_grab_response(context: &Context, response: PluginHttpResponse) -> Re
             && value.to_ascii_lowercase().contains("text/html")
     });
     if html_typed && response.body.first() != Some(&b'd') {
-        return Err(
+        return Ok(rejected(
+            codes::INVALID_RESPONSE.into(),
+            "The tracker sent a web page instead of the torrent. The login session has \
+             probably expired."
+                .to_string(),
             "tracker returned an HTML page instead of a torrent; the session is probably expired"
                 .to_string(),
-        );
+        ));
     }
     let request = context
         .current_request
@@ -2506,23 +2610,110 @@ fn need_manual(
     })
 }
 
-fn failed(code: &str, message: String, retryable: bool) -> Step {
-    Step::Failed {
-        code: code.to_string(),
-        message,
-        retryable,
+/// A tracker request outside the login flow that the tracker answered with
+/// an HTTP error, as the code it stands for: 401 and 403 refused the
+/// credential the definition sends (or blocked a definition that sends
+/// none), 404 is `not_found` (the page for a search, the release for a
+/// download), 429 is rate limiting with its `Retry-After`, a 5xx is the
+/// tracker being down, and anything else is a temporary failure.
+fn http_status_failure(
+    definition: &Definition,
+    response: &PluginHttpResponse,
+    phase: &str,
+    not_found: &str,
+) -> Option<Step> {
+    let status = response.status;
+    if (200..300).contains(&status) {
+        return None;
     }
+    let error = match status {
+        401 | 403 => match refused_credential(definition, response) {
+            Some(code) => plugin_error(
+                code,
+                format!(
+                    "The tracker refused the request (HTTP {status}). Check the indexer's \
+                     credentials."
+                ),
+            ),
+            None => plugin_error(
+                PluginErrorCode::Temporary,
+                format!(
+                    "The tracker blocked the request (HTTP {status}). It may sit behind a \
+                     challenge that needs a challenge solver."
+                ),
+            ),
+        },
+        404 => plugin_error(
+            not_found,
+            "The tracker has no page at that address (HTTP 404).",
+        ),
+        429 => {
+            let error = plugin_error(
+                PluginErrorCode::RateLimited,
+                "The tracker is rate limiting requests (HTTP 429).",
+            );
+            match retry_after_seconds(response) {
+                Some(seconds) => error.retry_after_seconds(seconds),
+                None => error,
+            }
+        }
+        500..=599 => plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            format!("The tracker answered with a server error (HTTP {status})."),
+        ),
+        _ => plugin_error(
+            PluginErrorCode::Temporary,
+            format!("The tracker request failed (HTTP {status})."),
+        ),
+    };
+    Some(Step::Rejected {
+        error: error
+            .debug(format!("Cardigann {phase} returned HTTP {status}"))
+            .build(),
+    })
 }
 
-fn require_success(response: &PluginHttpResponse, phase: &str) -> Result<(), String> {
-    if (200..300).contains(&response.status) {
-        Ok(())
-    } else {
-        Err(format!(
-            "Cardigann {phase} returned HTTP {}",
-            response.status
-        ))
+/// The credential a 401 or 403 refused: the login's own credential when the
+/// definition logs in, or the key or passkey setting a login-less definition
+/// sends with every request. A definition that sends no credential at all was
+/// blocked rather than refused, so there is nothing for the operator to fix
+/// in its settings.
+fn refused_credential(
+    definition: &Definition,
+    response: &PluginHttpResponse,
+) -> Option<PluginErrorCode> {
+    if definition.login.is_some() {
+        return Some(login_rejection_code(definition, response));
     }
+    let names: Vec<String> = definition
+        .settings
+        .iter()
+        .map(|setting| setting.name.to_ascii_lowercase())
+        .collect();
+    if names.iter().any(|name| name.contains("passkey")) {
+        return Some(codes::INVALID_PASSKEY.into());
+    }
+    if names
+        .iter()
+        .any(|name| name.contains("apikey") || name.contains("api_key") || name.contains("rsskey"))
+    {
+        return Some(codes::INVALID_API_KEY.into());
+    }
+    definition
+        .settings
+        .iter()
+        .any(|setting| setting.setting_type.eq_ignore_ascii_case("password"))
+        .then_some(PluginErrorCode::AuthFailed)
+}
+
+/// The response's `Retry-After` in seconds, when the tracker sent one in that
+/// form.
+fn retry_after_seconds(response: &PluginHttpResponse) -> Option<i64> {
+    response.headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("retry-after")
+            .then(|| value.trim().parse::<i64>().ok())
+            .flatten()
+    })
 }
 
 fn follow_redirect(
@@ -3054,17 +3245,29 @@ fn public_text(text: &str) -> String {
     }
 }
 
-fn check_error_blocks(
+/// The definition's `error:` block a search response matched, reported with
+/// the tracker's own explanation, credentials masked.
+fn search_error_block(
     definition: &Definition,
-    errors: &[crate::definition::ErrorBlock],
+    context: &Context,
     response: &PluginHttpResponse,
-    variables: &Variables,
-    phase: &str,
-) -> Result<(), String> {
-    match error_block_message(definition, errors, response, variables, phase)? {
-        Some(message) => Err(format!("tracker {phase} failed: {message}")),
-        None => Ok(()),
-    }
+) -> Result<Option<Step>, String> {
+    let Some(message) = error_block_message(
+        definition,
+        &definition.search.error,
+        response,
+        &context.variables,
+        "search",
+    )?
+    else {
+        return Ok(None);
+    };
+    let message = mask_credentials(context, &message);
+    Ok(Some(rejected(
+        PluginErrorCode::Temporary,
+        format!("Tracker search failed: {}", public_text(&message)),
+        format!("tracker search failed: {}", message.trim()),
+    )))
 }
 
 /// The message of the first `error:` block that matches the response.
@@ -4449,10 +4652,13 @@ mod tests {
     }
 
     impl EngineHost for MockEngineHost {
-        async fn http(&mut self, request: PluginHttpRequest) -> Result<PluginHttpResponse, String> {
+        async fn http(
+            &mut self,
+            request: PluginHttpRequest,
+        ) -> Result<PluginHttpResponse, EngineError> {
             self.requests.push(request);
             if self.responses.is_empty() {
-                return Err("unexpected HTTP request".to_string());
+                return Err(EngineError::Message("unexpected HTTP request".to_string()));
             }
             Ok(self.responses.remove(0))
         }
@@ -6515,7 +6721,10 @@ search:
 
             // The second failure is not retried again.
             assert!(
-                resume(&continuation, ResumeInput::Http(challenge)).is_err(),
+                matches!(
+                    resume(&continuation, ResumeInput::Http(challenge)),
+                    Ok(Step::Rejected { .. })
+                ),
                 "{status} must fail after one re-login"
             );
         }
@@ -6538,8 +6747,15 @@ search:
                 body: Vec::new(),
             }),
         )
-        .unwrap_err();
-        assert_eq!(error, "Cardigann search returned HTTP 404");
+        .unwrap();
+        let Step::Rejected { error } = error else {
+            panic!("a 404 search must be rejected")
+        };
+        assert_eq!(error.code.as_str(), codes::ENDPOINT_NOT_FOUND);
+        assert_eq!(
+            error.debug_message.as_deref(),
+            Some("Cardigann search returned HTTP 404")
+        );
     }
 
     #[test]
@@ -6916,12 +7132,21 @@ search:
             )
         };
 
-        let error = grab(
+        let Step::Rejected { error } = grab(
             Some("text/html; charset=utf-8"),
             b"<html>login</html>".to_vec(),
         )
-        .unwrap_err();
-        assert!(error.contains("HTML page instead of a torrent"), "{error}");
+        .unwrap() else {
+            panic!("an HTML download must be rejected")
+        };
+        assert_eq!(error.code.as_str(), codes::INVALID_RESPONSE);
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("HTML page instead of a torrent")),
+            "{error:?}"
+        );
 
         // A tracker mislabelling a real bencoded body is still believed.
         assert!(matches!(
@@ -6940,8 +7165,17 @@ search:
 
         // Past the ceiling it is still refused.
         let oversized = vec![b'd'; 64 * 1024 * 1024 + 1];
-        let error = grab(None, oversized).unwrap_err();
-        assert!(error.contains("runtime limit"), "{error}");
+        let Step::Rejected { error } = grab(None, oversized).unwrap() else {
+            panic!("an oversized torrent must be rejected")
+        };
+        assert_eq!(error.code, PluginErrorCode::Permanent);
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("runtime limit")),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -7373,5 +7607,261 @@ search:
             panic!()
         };
         assert_eq!(request.url, "https://tracker.example/health");
+    }
+
+    fn rejection(step: Result<Step, String>) -> PluginError {
+        match step {
+            Ok(Step::Rejected { error }) => error,
+            other => panic!("a typed rejection expected, got {other:?}"),
+        }
+    }
+
+    fn first_continuation(definition: &str, operation: Operation) -> Vec<u8> {
+        match begin(compiled(definition), operation, BTreeMap::new()).unwrap() {
+            Step::NeedHttp { continuation, .. } => continuation,
+            step => panic!("an HTTP request expected, got {step:?}"),
+        }
+    }
+
+    fn plain_response(status: u16, headers: &[(&str, &str)], body: &str) -> PluginHttpResponse {
+        PluginHttpResponse {
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            set_cookie_headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// A tracker HTTP error outside the login flow carries the code its status
+    /// stands for, not the component's generic failure.
+    #[test]
+    fn tracker_http_errors_carry_the_code_their_status_stands_for() {
+        let search = |response| {
+            let continuation =
+                first_continuation(PUBLIC_DEFINITION, Operation::Search(Box::default()));
+            rejection(resume(&continuation, ResumeInput::Http(response)))
+        };
+
+        let error = search(plain_response(429, &[("Retry-After", "30")], ""));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(30));
+
+        let error = search(plain_response(503, &[], ""));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+
+        // A public definition sends no credential, so a 403 is a block, not
+        // a refused login.
+        let error = search(plain_response(403, &[], ""));
+        assert_eq!(error.code, PluginErrorCode::Temporary);
+        assert!(error.public_message.contains("blocked"), "{error:?}");
+
+        // A definition that sends an API key had that key refused.
+        let Step::NeedHttp { continuation, .. } = begin(
+            compiled(&api_definition("")),
+            Operation::Search(Box::default()),
+            api_key_config(),
+        )
+        .unwrap() else {
+            panic!("search request expected")
+        };
+        let error = rejection(resume(
+            &continuation,
+            ResumeInput::Http(plain_response(401, &[], "")),
+        ));
+        assert_eq!(error.code.as_str(), codes::INVALID_API_KEY);
+
+        let error = search(plain_response(418, &[], ""));
+        assert_eq!(error.code, PluginErrorCode::Temporary);
+
+        // A download the tracker no longer has is the release, not the page.
+        let continuation = first_continuation(
+            PUBLIC_DEFINITION,
+            Operation::Grab("https://tracker.example/download/1".into()),
+        );
+        let error = rejection(resume(
+            &continuation,
+            ResumeInput::Http(plain_response(404, &[], "")),
+        ));
+        assert_eq!(error.code.as_str(), codes::ITEM_NOT_FOUND);
+        assert_eq!(
+            error.debug_message.as_deref(),
+            Some("Cardigann torrent download returned HTTP 404")
+        );
+    }
+
+    /// A search page the definition's `error:` block explains reports the
+    /// tracker's own words, with configured credentials masked.
+    #[test]
+    fn a_search_error_block_reports_the_tracker_message() {
+        let definition = api_definition("").replace(
+            "  paths:\n",
+            "  error:\n    - selector: p.error\n  paths:\n",
+        );
+        let Step::NeedHttp { continuation, .. } = begin(
+            compiled(&definition),
+            Operation::Search(Box::default()),
+            api_key_config(),
+        )
+        .unwrap() else {
+            panic!("search request expected")
+        };
+        let error = rejection(resume(
+            &continuation,
+            ResumeInput::Http(html_response(
+                200,
+                "<html><p class=error>Key synthetic-key may search again in an hour</p></html>",
+            )),
+        ));
+        assert_eq!(error.code, PluginErrorCode::Temporary);
+        assert_eq!(
+            error.public_message,
+            "Tracker search failed: Key [redacted] may search again in an hour"
+        );
+    }
+
+    /// A search page the definition cannot read is an invalid response.
+    #[test]
+    fn an_unreadable_search_page_is_an_invalid_response() {
+        let definition = PUBLIC_DEFINITION.replace(
+            "    - path: search",
+            "    - path: search\n      response: { type: xml }",
+        );
+        let continuation = first_continuation(&definition, Operation::Search(Box::default()));
+        let error = rejection(resume(
+            &continuation,
+            ResumeInput::Http(plain_response(200, &[], "<rss><unclosed></rss>")),
+        ));
+        assert_eq!(error.code.as_str(), codes::INVALID_RESPONSE);
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("invalid XML search response")),
+            "{error:?}"
+        );
+    }
+
+    /// A connection test that does not find the logged-in page names the
+    /// credential the login uses; an HTTP error names its status's code.
+    #[test]
+    fn connection_test_failures_carry_typed_codes() {
+        let definition = PUBLIC_DEFINITION.replace(
+            "search:\n",
+            "login:\n  method: cookie\n  test:\n    path: index\n    selector: a.logout\nsearch:\n",
+        );
+        let continuation = first_continuation(&definition, Operation::TestConnection);
+        let error = rejection(resume(
+            &continuation,
+            ResumeInput::Http(html_response(200, "<html><a class=login>in</a></html>")),
+        ));
+        assert_eq!(error.code.as_str(), codes::INVALID_COOKIE);
+
+        let continuation = first_continuation(&definition, Operation::TestConnection);
+        let error = rejection(resume(
+            &continuation,
+            ResumeInput::Http(plain_response(503, &[], "")),
+        ));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+    }
+
+    #[test]
+    fn an_unsupported_login_method_is_unsupported() {
+        let definition = PUBLIC_DEFINITION.replace(
+            "search:\n",
+            "login:\n  method: carrier-pigeon\n  path: login\nsearch:\n",
+        );
+        let error = rejection(begin(
+            compiled(&definition),
+            Operation::Search(Box::default()),
+            BTreeMap::new(),
+        ));
+        assert_eq!(error.code, PluginErrorCode::Unsupported);
+    }
+
+    /// A download page without a link the definition recognises, or with a
+    /// link the plugin cannot fetch, is an invalid response.
+    #[test]
+    fn unusable_download_pages_are_invalid_responses() {
+        let definition = PUBLIC_DEFINITION.replace(
+            "search:\n",
+            "download:\n  selectors:\n    - { selector: a.torrent, attribute: href }\nsearch:\n",
+        );
+        let grab = |body: &str| {
+            let continuation = first_continuation(
+                &definition,
+                Operation::Grab("https://tracker.example/details/1".into()),
+            );
+            rejection(resume(
+                &continuation,
+                ResumeInput::Http(html_response(200, body)),
+            ))
+        };
+
+        let error = grab("<html><p>no link here</p></html>");
+        assert_eq!(error.code.as_str(), codes::INVALID_RESPONSE);
+
+        let error =
+            grab("<html><a class=torrent href='ftp://tracker.example/1.torrent'>t</a></html>");
+        assert_eq!(error.code.as_str(), codes::INVALID_RESPONSE);
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("scheme `ftp`")),
+            "{error:?}"
+        );
+    }
+
+    /// A login that stops for a CAPTCHA the operator has not answered asks for
+    /// one by code.
+    #[test]
+    fn an_unanswered_captcha_is_captcha_required() {
+        let definition = parse_definition(&PUBLIC_DEFINITION.replace(
+            "search:\n",
+            "login:\n  method: form\n  path: login\n  captcha:\n    type: image\n    selector: img.captcha\n    input: captcha\nsearch:\n",
+        ))
+        .unwrap();
+        let mut host = MockEngineHost {
+            responses: vec![
+                plain_response(
+                    200,
+                    &[],
+                    "<form><img class=captcha src='/captcha.png'></form>",
+                ),
+                plain_response(200, &[("content-type", "image/png")], "png"),
+            ],
+            ..Default::default()
+        };
+        let error = block_on(search_with_host(
+            &mut host,
+            definition,
+            PluginSearchRequest::default(),
+            BTreeMap::new(),
+        ))
+        .unwrap_err();
+        let EngineError::Plugin(error) = error else {
+            panic!("a typed CAPTCHA error expected, got {error:?}")
+        };
+        assert_eq!(error.code.as_str(), codes::CAPTCHA_REQUIRED);
+    }
+
+    /// A tracker the host could not reach keeps the PDK's classification.
+    #[test]
+    fn host_http_failures_keep_their_classification() {
+        let EngineError::Plugin(error) = host_http_error(component::HostError::Transport) else {
+            panic!("a typed host error expected")
+        };
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        let EngineError::Plugin(error) = host_http_error(component::HostError::Timeout) else {
+            panic!("a typed host error expected")
+        };
+        assert_eq!(error.code, PluginErrorCode::Temporary);
+        assert_ne!(
+            error.public_message,
+            "the plugin could not complete the request"
+        );
     }
 }

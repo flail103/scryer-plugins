@@ -306,7 +306,7 @@ async fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> 
     if request.action == "resolve_network_endpoints" {
         let (definition, config) = load_definition_and_config()?;
         let origins =
-            runtime::resolve_network_endpoints(&definition, &config).map_err(Error::msg)?;
+            runtime::resolve_network_endpoints(&definition, &config).map_err(endpoint_error)?;
         return Ok(PluginActionResponse {
             payload: serde_json::json!({ "origins": origins }),
         });
@@ -525,6 +525,17 @@ fn definition_source_key(selected: Option<&str>) -> &'static str {
     }
 }
 
+/// Endpoints the configured URL or the definition name that the plugin
+/// cannot declare to the host: a setting the operator has to fix.
+fn endpoint_error(detail: impl std::fmt::Display) -> Error {
+    plugin_error(
+        sdk::PluginErrorCode::InvalidConfig,
+        "The indexer's URL or definition names an endpoint the plugin cannot use.",
+    )
+    .debug(detail)
+    .into_error()
+}
+
 /// A missing or invalid setting, named for the operator; the detail stays in
 /// the debug message.
 fn invalid_setting(key: &str, detail: impl std::fmt::Display) -> Error {
@@ -699,6 +710,15 @@ fn validate_metadata(definition: &Definition) -> Result<(), String> {
 #[cfg(test)]
 mod component_abi_tests {
     use super::*;
+
+    #[test]
+    fn an_unusable_endpoint_is_an_invalid_setting() {
+        let error = scryer_plugin_pdk::error::plugin_error_from(&endpoint_error(
+            "Endpoint authorities must be HTTP(S) URLs without credentials",
+        ));
+        assert_eq!(error.code, sdk::PluginErrorCode::InvalidConfig);
+        assert!(!error.public_message.contains("credentials"));
+    }
 
     const DEFINITION: &str = r#"
 id: example
