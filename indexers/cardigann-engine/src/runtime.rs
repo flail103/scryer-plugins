@@ -611,9 +611,12 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
         }
         (Continuation::SimpleCaptcha(mut context), ResumeInput::Http(response)) => {
             merge_response_cookies(&mut context.cookies, &response);
-            if let Some(step) =
-                http_status_failure(&response, "simple CAPTCHA", codes::ENDPOINT_NOT_FOUND)
-            {
+            if let Some(step) = http_status_failure(
+                &context.definition,
+                &response,
+                "simple CAPTCHA",
+                codes::ENDPOINT_NOT_FOUND,
+            ) {
                 return Ok(step);
             }
             let selection =
@@ -656,9 +659,12 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
         }
         (Continuation::CaptchaImage(mut context), ResumeInput::Http(response)) => {
             merge_response_cookies(&mut context.cookies, &response);
-            if let Some(step) =
-                http_status_failure(&response, "captcha image", codes::ENDPOINT_NOT_FOUND)
-            {
+            if let Some(step) = http_status_failure(
+                &context.definition,
+                &response,
+                "captcha image",
+                codes::ENDPOINT_NOT_FOUND,
+            ) {
                 return Ok(step);
             }
             need_manual(
@@ -738,10 +744,13 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
                     }),
                 })
             } else {
-                Ok(
-                    http_status_failure(&response, "connection test", codes::ENDPOINT_NOT_FOUND)
-                        .expect("a non-2xx connection test response is a failure"),
+                Ok(http_status_failure(
+                    &definition,
+                    &response,
+                    "connection test",
+                    codes::ENDPOINT_NOT_FOUND,
                 )
+                .expect("a non-2xx connection test response is a failure"))
             }
         }
         (Continuation::SearchResponse(mut context), ResumeInput::Http(response)) => {
@@ -761,7 +770,8 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            if let Some(step) = http_status_failure(&response, "search", codes::ENDPOINT_NOT_FOUND)
+            if let Some(step) =
+                http_status_failure(&definition, &response, "search", codes::ENDPOINT_NOT_FOUND)
             {
                 return Ok(step);
             }
@@ -803,9 +813,12 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            if let Some(step) =
-                http_status_failure(&response, "download details", codes::ITEM_NOT_FOUND)
-            {
+            if let Some(step) = http_status_failure(
+                &definition,
+                &response,
+                "download details",
+                codes::ITEM_NOT_FOUND,
+            ) {
                 return Ok(step);
             }
             let before = definition
@@ -843,9 +856,12 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            if let Some(step) =
-                http_status_failure(&response, "download before request", codes::ITEM_NOT_FOUND)
-            {
+            if let Some(step) = http_status_failure(
+                &definition,
+                &response,
+                "download before request",
+                codes::ITEM_NOT_FOUND,
+            ) {
                 return Ok(step);
             }
             context.grab_before_body = Some(response.body);
@@ -865,9 +881,12 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            if let Some(step) =
-                http_status_failure(&response, "download page", codes::ITEM_NOT_FOUND)
-            {
+            if let Some(step) = http_status_failure(
+                &definition,
+                &response,
+                "download page",
+                codes::ITEM_NOT_FOUND,
+            ) {
                 return Ok(step);
             }
             finish_grab(context, &response.body)
@@ -886,9 +905,12 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            if let Some(step) =
-                http_status_failure(&response, "torrent download", codes::ITEM_NOT_FOUND)
-            {
+            if let Some(step) = http_status_failure(
+                &definition,
+                &response,
+                "torrent download",
+                codes::ITEM_NOT_FOUND,
+            ) {
                 return Ok(step);
             }
             if context.grab_selector_page_body.is_none()
@@ -2590,10 +2612,12 @@ fn need_manual(
 
 /// A tracker request outside the login flow that the tracker answered with
 /// an HTTP error, as the code it stands for: 401 and 403 refused the
-/// credentials, 404 is `not_found` (the page for a search, the release for a
+/// credential the definition sends (or blocked a definition that sends
+/// none), 404 is `not_found` (the page for a search, the release for a
 /// download), 429 is rate limiting with its `Retry-After`, a 5xx is the
 /// tracker being down, and anything else is a temporary failure.
 fn http_status_failure(
+    definition: &Definition,
     response: &PluginHttpResponse,
     phase: &str,
     not_found: &str,
@@ -2603,12 +2627,22 @@ fn http_status_failure(
         return None;
     }
     let error = match status {
-        401 | 403 => plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!(
-                "The tracker refused the request (HTTP {status}). Check the indexer's credentials."
+        401 | 403 => match refused_credential(definition, response) {
+            Some(code) => plugin_error(
+                code,
+                format!(
+                    "The tracker refused the request (HTTP {status}). Check the indexer's \
+                     credentials."
+                ),
             ),
-        ),
+            None => plugin_error(
+                PluginErrorCode::Temporary,
+                format!(
+                    "The tracker blocked the request (HTTP {status}). It may sit behind a \
+                     challenge that needs a challenge solver."
+                ),
+            ),
+        },
         404 => plugin_error(
             not_found,
             "The tracker has no page at that address (HTTP 404).",
@@ -2637,6 +2671,39 @@ fn http_status_failure(
             .debug(format!("Cardigann {phase} returned HTTP {status}"))
             .build(),
     })
+}
+
+/// The credential a 401 or 403 refused: the login's own credential when the
+/// definition logs in, or the key or passkey setting a login-less definition
+/// sends with every request. A definition that sends no credential at all was
+/// blocked rather than refused, so there is nothing for the operator to fix
+/// in its settings.
+fn refused_credential(
+    definition: &Definition,
+    response: &PluginHttpResponse,
+) -> Option<PluginErrorCode> {
+    if definition.login.is_some() {
+        return Some(login_rejection_code(definition, response));
+    }
+    let names: Vec<String> = definition
+        .settings
+        .iter()
+        .map(|setting| setting.name.to_ascii_lowercase())
+        .collect();
+    if names.iter().any(|name| name.contains("passkey")) {
+        return Some(codes::INVALID_PASSKEY.into());
+    }
+    if names
+        .iter()
+        .any(|name| name.contains("apikey") || name.contains("api_key") || name.contains("rsskey"))
+    {
+        return Some(codes::INVALID_API_KEY.into());
+    }
+    definition
+        .settings
+        .iter()
+        .any(|setting| setting.setting_type.eq_ignore_ascii_case("password"))
+        .then_some(PluginErrorCode::AuthFailed)
 }
 
 /// The response's `Retry-After` in seconds, when the tracker sent one in that
@@ -7585,8 +7652,26 @@ search:
         let error = search(plain_response(503, &[], ""));
         assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
 
+        // A public definition sends no credential, so a 403 is a block, not
+        // a refused login.
         let error = search(plain_response(403, &[], ""));
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.code, PluginErrorCode::Temporary);
+        assert!(error.public_message.contains("blocked"), "{error:?}");
+
+        // A definition that sends an API key had that key refused.
+        let Step::NeedHttp { continuation, .. } = begin(
+            compiled(&api_definition("")),
+            Operation::Search(Box::default()),
+            api_key_config(),
+        )
+        .unwrap() else {
+            panic!("search request expected")
+        };
+        let error = rejection(resume(
+            &continuation,
+            ResumeInput::Http(plain_response(401, &[], "")),
+        ));
+        assert_eq!(error.code.as_str(), codes::INVALID_API_KEY);
 
         let error = search(plain_response(418, &[], ""));
         assert_eq!(error.code, PluginErrorCode::Temporary);
