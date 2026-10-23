@@ -235,12 +235,17 @@ fn api_error_code(api: DsApi, code: i64) -> PluginErrorCode {
         // Session timeout / duplicate login / missing sid. The call has already
         // been retried once with a fresh session by the time this classifies.
         (_, 106 | 107 | 119) => PluginErrorCode::Temporary,
-        // No such account or incorrect password; denied permission; an expired
-        // password that has to be changed before DSM lets the account in.
-        (DsApi::Auth, 400 | 402 | 408 | 409 | 410) => codes::INVALID_USERNAME_PASSWORD.into(),
+        // No such account or incorrect password; an expired password that has
+        // to be changed before DSM lets the account in.
+        (DsApi::Auth, 400 | 408 | 409 | 410) => codes::INVALID_USERNAME_PASSWORD.into(),
         (DsApi::Auth, 401) => codes::ACCOUNT_DISABLED.into(),
         (DsApi::Auth, 403 | 404 | 406) => codes::TWO_FACTOR_REQUIRED.into(),
-        // Blocked IP source: DSM's auto-block, which no credential code names.
+        // A login DSM blocks rather than judges: 407 is its auto-block of the
+        // address after failed logins ("Blocked IP source"); 405 is read the
+        // same way.
+        (DsApi::Auth, 405 | 407) => codes::ACCOUNT_BANNED.into(),
+        // Denied permission: the credentials were right, but the account may
+        // not sign in to this service. No shared code names that.
         (DsApi::Auth, _) => PluginErrorCode::AuthFailed,
         // File upload failed / max number of tasks reached.
         (DsApi::DownloadStationTask | DsApi::DownloadStation2Task, 400 | 401) => {
@@ -3533,9 +3538,20 @@ mod tests {
             PluginErrorCode::from(codes::TWO_FACTOR_REQUIRED)
         );
         assert_eq!(
-            api_error_code(DsApi::Auth, 407),
+            api_error_code(DsApi::Auth, 404),
+            PluginErrorCode::from(codes::TWO_FACTOR_REQUIRED)
+        );
+        assert_eq!(
+            api_error_code(DsApi::Auth, 402),
             PluginErrorCode::AuthFailed
         );
+        for blocked in [405, 407] {
+            assert_eq!(
+                api_error_code(DsApi::Auth, blocked),
+                PluginErrorCode::from(codes::ACCOUNT_BANNED),
+                "{blocked}"
+            );
+        }
         assert_eq!(
             api_error_code(DsApi::DsmInfo, 105),
             PluginErrorCode::AuthFailed

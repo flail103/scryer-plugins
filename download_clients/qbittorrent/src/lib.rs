@@ -1525,6 +1525,13 @@ fn http_failure(
         body.trim()
     );
     match status_code {
+        403 if is_ip_ban(body) => plugin_error(
+            codes::ACCOUNT_BANNED,
+            "qBittorrent has banned Scryer's address after too many failed logins; fix the \
+             credentials, then wait for the ban to lift or restart qBittorrent",
+        )
+        .debug(debug)
+        .into_error(),
         401 | 403 => auth_rejection(config).debug(debug).into_error(),
         404 => plugin_error(
             codes::ENDPOINT_NOT_FOUND,
@@ -1537,6 +1544,16 @@ fn http_failure(
             Ok(()) => Error::msg(debug),
         },
     }
+}
+
+/// qBittorrent answers a login from an address it has banned for repeated
+/// failed logins with 403 and a sentence saying so. Older releases say "Your
+/// IP is banned for too many failed login attempts", newer ones "Your IP
+/// address has been banned after too many failed authentication attempts".
+/// This is the one place that text is read.
+fn is_ip_ban(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("ip") && body.contains("banned")
 }
 
 fn retry_after(response: &HttpResponse) -> Option<&str> {
@@ -3792,6 +3809,29 @@ mod tests {
             error.code,
             PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
         );
+
+        // A login from an address qBittorrent has banned is the ban, not the
+        // credentials, in either release's wording.
+        for body in [
+            "Your IP is banned for too many failed login attempts",
+            "Your IP address has been banned after too many failed authentication attempts.",
+        ] {
+            let error = scryer_plugin_pdk::error::plugin_error_from(&http_failure(
+                &credentials,
+                "/auth/login",
+                403,
+                None,
+                body,
+            ));
+            assert_eq!(
+                error.code,
+                PluginErrorCode::from(codes::ACCOUNT_BANNED),
+                "{body}"
+            );
+            assert!(!error.public_message.contains(body), "{body}");
+        }
+        // A login qBittorrent simply refuses is still the credentials.
+        assert!(!login_response_is_success("Fails."));
 
         let mut api_key = test_config();
         api_key.api_key = "synthetic-key".to_string();
