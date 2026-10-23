@@ -1189,7 +1189,7 @@ enum Outcome {
 fn with_retry_after(error: PluginError, retry_after: Option<i64>) -> PluginError {
     let builder = scryer_plugin_pdk::plugin_error(error.code, error.public_message);
     let builder = match error.debug_message {
-        Some(debug) => builder.debug(debug),
+        Some(debug) => builder.debug(redact_secrets(&debug)),
         None => builder,
     };
     match retry_after {
@@ -1839,7 +1839,7 @@ fn plugin_error(
 ) -> PluginError {
     let error = scryer_plugin_pdk::plugin_error(code, public_message);
     match debug_message {
-        Some(debug_message) => error.debug(debug_message),
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
         None => error,
     }
     .build()

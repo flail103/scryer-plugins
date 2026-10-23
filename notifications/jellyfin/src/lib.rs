@@ -19,6 +19,8 @@
 //! unanswered request the PDK's transport reading, and a notification the
 //! plugin cannot turn into a Jellyfin call `Permanent`.
 
+mod redact;
+
 use std::collections::HashSet;
 
 use scryer_plugin_pdk::sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
@@ -315,7 +317,7 @@ fn plugin_error(
 ) -> PluginError {
     let builder = scryer_plugin_pdk::plugin_error(code, public_message);
     match debug_message {
-        Some(debug) => builder.debug(debug).build(),
+        Some(debug) => builder.debug(redact::redact_secrets(&debug)).build(),
         None => builder.build(),
     }
 }
@@ -720,7 +722,13 @@ fn execute_http(prepared: PreparedHttpRequest) -> Result<(), PluginError> {
                 ))
             }
         }
-        Err(error) => Err(scryer_plugin_pdk::error::plugin_error_from(&error)),
+        Err(error) => {
+            let mut error = scryer_plugin_pdk::error::plugin_error_from(&error);
+            error.debug_message = error
+                .debug_message
+                .map(|debug| redact::redact_secrets(&debug));
+            Err(error)
+        }
     }
 }
 
@@ -756,7 +764,7 @@ fn classify_failure(status: u16, retry_after: Option<i64>, body: &[u8]) -> Plugi
             "Jellyfin refused the library refresh",
         ),
     };
-    builder.debug(debug).build()
+    builder.debug(redact::redact_secrets(&debug)).build()
 }
 
 /// A `Retry-After` header in delta-seconds, if the response carried one.

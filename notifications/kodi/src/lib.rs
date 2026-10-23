@@ -1454,10 +1454,10 @@ fn transport_failure(
 
     let mut failure = request_failure(error);
     let detail = format!("{method} → {}: {error:#}", settings.endpoint);
-    failure.debug_message = Some(match failure.debug_message.take() {
+    failure.debug_message = Some(redact_secrets(&match failure.debug_message.take() {
         Some(debug) if !debug.is_empty() => format!("{detail} ({debug})"),
         _ => detail,
-    });
+    }));
     if strict {
         return CallOutcome::Misconfigured(failure);
     }
@@ -1594,7 +1594,7 @@ fn plugin_error(
 ) -> PluginError {
     let builder = scryer_plugin_pdk::plugin_error(code, public_message);
     match debug_message {
-        Some(debug) => builder.debug(debug).build(),
+        Some(debug) => builder.debug(redact_secrets(&debug)).build(),
         None => builder.build(),
     }
 }

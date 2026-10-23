@@ -1485,7 +1485,7 @@ fn classify_response(
             PluginErrorCode::RateLimited,
             "Slack is rate limiting this webhook",
         )
-        .debug(format!("HTTP {status}: {detail}"));
+        .debug(redact_secrets(&format!("HTTP {status}: {detail}")));
         return PluginResult::Err(
             match retry_after_seconds(headers) {
                 Some(seconds) => error.retry_after_seconds(seconds),
@@ -1613,7 +1613,7 @@ fn plugin_error(
 ) -> PluginError {
     let error = scryer_plugin_pdk::plugin_error(code, public_message);
     match debug_message {
-        Some(debug_message) => error.debug(debug_message),
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
         None => error,
     }
     .build()

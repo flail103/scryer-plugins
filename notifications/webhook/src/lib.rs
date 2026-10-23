@@ -11,6 +11,8 @@
 //! Scryer through [`scryer_plugin_pdk`] rather than the removed core-module
 //! host ABI.
 
+mod redact;
+
 use scryer_plugin_pdk::sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
 use scryer_plugin_pdk::{HttpRequest, codes, config, http};
 use scryer_plugin_sdk::current_sdk_constraint;
@@ -119,7 +121,9 @@ fn http_failure(status: u16, retry_after: Option<&str>, body: &str) -> PluginErr
             "the webhook endpoint refused the notification",
         ),
     };
-    builder.debug(format_args!("HTTP {status}: {body}")).build()
+    builder
+        .debug(redact::redact_secrets(&format!("HTTP {status}: {body}")))
+        .build()
 }
 
 /// A `Retry-After` value in delta-seconds, rounded up to at least one second.
@@ -332,7 +336,13 @@ fn send_notification(
         }
         // A request that never got an HTTP answer: the PDK reads the host's
         // transport detail (TLS, timeout, DNS/connect) into the right code.
-        Err(error) => Err(scryer_plugin_pdk::error::plugin_error_from(&error)),
+        Err(error) => {
+            let mut error = scryer_plugin_pdk::error::plugin_error_from(&error);
+            error.debug_message = error
+                .debug_message
+                .map(|debug| redact::redact_secrets(&debug));
+            Err(error)
+        }
     }
 }
 

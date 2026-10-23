@@ -1993,7 +1993,7 @@ fn publish(
         Err(error) if strict => Outcome::Misconfigured(request_failure(&error)),
         Err(error) => Outcome::Rejected {
             status: None,
-            detail: format!("request failed: {error}"),
+            detail: redact_secrets(&format!("request failed: {error}")),
             provider_status: "request_failed".to_string(),
             retry_after_seconds: None,
             error: request_failure(&error),
@@ -2207,7 +2207,7 @@ fn classify_response(
                         PluginErrorCode::RateLimited,
                         "ntfy is rate limiting requests",
                     )
-                    .debug(debug);
+                    .debug(redact_secrets(&debug));
                     match retry_after {
                         Some(seconds) => error.retry_after_seconds(seconds),
                         None => error,
@@ -2250,7 +2250,7 @@ fn plugin_error(
 ) -> PluginError {
     let error = scryer_plugin_pdk::plugin_error(code, public_message);
     match debug_message {
-        Some(debug_message) => error.debug(debug_message),
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
         None => error,
     }
     .build()

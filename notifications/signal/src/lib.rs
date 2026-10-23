@@ -1324,16 +1324,18 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
                 for recipient in batch {
                     match recipient_error_for(&recipient_errors, recipient) {
                         Some(reason) => {
+                            let reason = scrub_identifiers(reason, &settings);
+                            let target = target_label(&settings, recipient);
+                            failures.push(format!("{target}: {reason}"));
                             target_results.push(PluginNotificationTargetResult {
-                                target: recipient.value.clone(),
+                                target,
                                 success: false,
                                 status: Some(format!("http_{status}")),
-                                error: Some(reason.clone()),
+                                error: Some(reason),
                             });
-                            failures.push(format!("{}: {reason}", recipient.value));
                         }
                         None => target_results.push(PluginNotificationTargetResult {
-                            target: recipient.value.clone(),
+                            target: target_label(&settings, recipient),
                             success: true,
                             status: Some(format!("http_{status}")),
                             error: None,
@@ -1347,19 +1349,21 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
                         .iter()
                         .any(|recipient| recipient_matches(recipient, who))
                     {
-                        failures.push(format!("{who}: {reason}"));
+                        failures.push(format!(
+                            "a recipient this channel did not send to: {}",
+                            scrub_identifiers(reason, &settings)
+                        ));
                     }
                 }
             }
             Outcome::Misconfigured(error) => {
                 for recipient in batch {
                     target_results.push(PluginNotificationTargetResult {
-                        target: recipient.value.clone(),
+                        target: target_label(&settings, recipient),
                         success: false,
-                        status: error
-                            .debug_message
-                            .clone()
-                            .or_else(|| Some(format!("{:?}", error.code))),
+                        // The code, never the debug text: target results are
+                        // shown to the operator.
+                        status: Some(error.code.as_str().to_string()),
                         error: Some(error.public_message.clone()),
                     });
                 }
@@ -1386,7 +1390,7 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
                 }
                 for recipient in batch {
                     target_results.push(PluginNotificationTargetResult {
-                        target: recipient.value.clone(),
+                        target: target_label(&settings, recipient),
                         success: false,
                         status: Some(
                             status
@@ -1445,6 +1449,52 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
     PluginResult::Ok(response)
 }
 
+/// A recipient's place in `receiver_id`, which is all a target result or a
+/// message says about it: phone numbers, usernames and group ids go neither to
+/// the operator-facing text nor to the host log.
+fn target_label(settings: &Settings, recipient: &Recipient) -> String {
+    match settings
+        .recipients
+        .iter()
+        .position(|candidate| candidate == recipient)
+    {
+        Some(index) => format!("recipient {} of {}", index + 1, settings.recipients.len()),
+        None => "recipient".to_string(),
+    }
+}
+
+/// `text` with every configured recipient and the sender number replaced, for
+/// upstream text that may quote them back.
+fn scrub_identifiers(text: &str, settings: &Settings) -> String {
+    let mut identifiers: Vec<(&str, &str)> = settings
+        .recipients
+        .iter()
+        .flat_map(|recipient| {
+            [
+                Some(recipient.value.as_str()),
+                recipient.value.strip_prefix(USERNAME_PREFIX),
+                recipient.value.strip_prefix(GROUP_PREFIX),
+                recipient.value.strip_prefix('+'),
+            ]
+        })
+        .flatten()
+        .map(|value| (value, "<recipient>"))
+        .collect();
+    identifiers.push((settings.sender_number.as_str(), "<sender_number>"));
+    if let Some(bare) = settings.sender_number.strip_prefix('+') {
+        identifiers.push((bare, "<sender_number>"));
+    }
+    // Longest first, so a value is replaced before any shorter value inside it.
+    identifiers.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
+    let mut scrubbed = text.to_string();
+    for (value, placeholder) in identifiers {
+        if !value.is_empty() {
+            scrubbed = scrubbed.replace(value, placeholder);
+        }
+    }
+    scrubbed
+}
+
 /// `SendMessageError` names the failed recipient by `number`, `username` or
 /// `uuid`; only the first two can be matched against what was sent.
 fn recipient_matches(recipient: &Recipient, who: &str) -> bool {
@@ -1485,7 +1535,11 @@ fn post(url: &str, settings: &Settings, body: Vec<u8>, strict: bool) -> Outcome 
             &response.body(),
             settings,
         ),
-        Err(error) => transport_failure(&error.to_string(), request_failure(&error), strict),
+        Err(error) => transport_failure(
+            &redact_secrets(&error.to_string()),
+            request_failure(&error),
+            strict,
+        ),
     }
 }
 
@@ -1549,8 +1603,7 @@ fn probe_about(settings: &Settings) -> Vec<String> {
     let status = response.status_code();
     if !(200..300).contains(&status) {
         return vec![format!(
-            "GET {}/v1/about answered HTTP {status}: check that the server URL points at a signal-cli-rest-api server",
-            settings.base_url
+            "GET /v1/about answered HTTP {status}: check that the server URL points at a signal-cli-rest-api server"
         )];
     }
 
@@ -1613,8 +1666,6 @@ struct SignalBody {
     recipient_errors: Vec<(String, String)>,
     /// `SendMessageError.challenge_tokens` on a 429.
     challenge_tokens: Vec<String>,
-    /// `SendMessageError.account` on a 429.
-    account: Option<String>,
     /// Whether the body parsed as a JSON object at all. A `false` here is the
     /// most useful signal this channel has: signal-cli-rest-api answers JSON on
     /// every documented status, so anything else means something that is not it
@@ -1678,10 +1729,6 @@ fn parse_signal_body(body: &[u8]) -> SignalBody {
                     .collect()
             })
             .unwrap_or_default(),
-        account: map
-            .get("account")
-            .and_then(Value::as_str)
-            .map(str::to_string),
         is_json: true,
         raw,
     }
@@ -1741,7 +1788,7 @@ fn classify_response(
     settings: &Settings,
 ) -> Outcome {
     let answer = parse_signal_body(body);
-    let detail = answer.detail(status);
+    let detail = scrub_identifiers(&answer.detail(status), settings);
     let debug = format!("HTTP {status}: {detail}");
     let mut warnings = Vec::new();
 
@@ -1847,12 +1894,12 @@ fn classify_response(
         429 => {
             let mut error_debug = debug.clone();
             if !answer.challenge_tokens.is_empty() {
+                // The tokens are what the operator replays; the account number
+                // and the server address are already in their own settings and
+                // stay out of the text.
                 let challenge = format!(
-                    "Signal is rate limiting {}. Solve a captcha at https://signalcaptchas.org/challenge/generate.html and POST it with challenge token(s) {} to {}/v1/accounts/{}/rate-limit-challenge.",
-                    answer.account.as_deref().unwrap_or(&settings.sender_number),
+                    "Signal is rate limiting the sending account. Solve a captcha at https://signalcaptchas.org/challenge/generate.html and POST it with challenge token(s) {} to the server's /v1/accounts/<sender_number>/rate-limit-challenge.",
                     answer.challenge_tokens.join(", "),
-                    settings.base_url,
-                    answer.account.as_deref().unwrap_or(&settings.sender_number),
                 );
                 error_debug = format!("{debug}; {challenge}");
                 warnings.push(challenge);
@@ -1909,7 +1956,7 @@ fn plugin_error(
 ) -> PluginError {
     let error = scryer_plugin_pdk::plugin_error(code, public_message);
     match debug_message {
-        Some(debug_message) => error.debug(debug_message),
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
         None => error,
     }
     .build()
@@ -2968,5 +3015,69 @@ mod tests {
         assert_eq!(format_bytes(1024), "1 KB");
         assert_eq!(format_bytes(1_536), "1.5 KB");
         assert_eq!(format_bytes(2_147_483_648), "2 GB");
+    }
+
+    // -----------------------------------------------------------------
+    // Recipient identifiers stay out of operator text and the host log
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_target_is_labelled_by_its_position_not_its_identifier() {
+        let mut settings = settings();
+        settings.recipients.push(number("+15550003333"));
+        assert_eq!(
+            target_label(&settings, &settings.recipients[1]),
+            "recipient 2 of 2"
+        );
+        assert_eq!(
+            target_label(&settings, &number("+15550009999")),
+            "recipient"
+        );
+    }
+
+    #[test]
+    fn upstream_text_quoting_a_recipient_or_the_sender_is_scrubbed() {
+        let mut settings = settings();
+        settings.recipients.push(Recipient {
+            value: "group.ckRzaEd4VmRzNnJa".to_string(),
+            kind: RecipientKind::Group,
+        });
+        let scrubbed = scrub_identifiers(
+            "failed to send to +15550002222 and 15550002222 in ckRzaEd4VmRzNnJa from +15550001111",
+            &settings,
+        );
+        assert_eq!(
+            scrubbed,
+            "failed to send to <recipient> and <recipient> in <recipient> from <sender_number>"
+        );
+    }
+
+    #[test]
+    fn a_rejection_quoting_a_recipient_keeps_it_out_of_every_message() {
+        let Outcome::Rejected { detail, error, .. } =
+            classify(503, r#"{"error":"could not deliver to +15550002222"}"#)
+        else {
+            panic!("a 5xx is the provider saying not now");
+        };
+        assert!(!detail.contains("+15550002222"), "{detail}");
+        let debug = error.debug_message.unwrap_or_default();
+        assert!(!debug.contains("15550002222"), "{debug}");
+        assert!(debug.contains("<recipient>"), "{debug}");
+    }
+
+    #[test]
+    fn a_rate_limit_challenge_names_neither_the_account_nor_the_server() {
+        let Outcome::Rejected { warnings, error, .. } = classify_response(
+            429,
+            &headers(&[]),
+            br#"{"error":"Rate limit exceeded","challenge_tokens":["abc123"],"account":"+15550001111"}"#,
+            &settings(),
+        ) else {
+            panic!("a rate limit is the provider saying not now");
+        };
+        for text in warnings.iter().chain(error.debug_message.iter()) {
+            assert!(!text.contains("15550001111"), "{text}");
+            assert!(!text.contains("signal.test"), "{text}");
+        }
     }
 }

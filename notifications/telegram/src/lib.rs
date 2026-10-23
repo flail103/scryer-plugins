@@ -1281,8 +1281,10 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
 fn without_token(error: PluginError, token: &str) -> PluginError {
     let builder = scryer_plugin_pdk::plugin_error(error.code, error.public_message);
     let builder = match error.debug_message {
-        Some(debug) if !token.is_empty() => builder.debug(debug.replace(token, "<bot_token>")),
-        Some(debug) => builder.debug(debug),
+        Some(debug) if !token.is_empty() => {
+            builder.debug(redact_secrets(&debug.replace(token, "<bot_token>")))
+        }
+        Some(debug) => builder.debug(redact_secrets(&debug)),
         None => builder,
     };
     match error.retry_after_seconds {
@@ -1389,7 +1391,7 @@ fn classify_response(
                 PluginErrorCode::RateLimited,
                 "Telegram is rate limiting this bot",
             )
-            .debug(format!("HTTP 429: {detail}"));
+            .debug(redact_secrets(&format!("HTTP 429: {detail}")));
             PluginResult::Err(
                 match retry_after {
                     Some(seconds) => error.retry_after_seconds(seconds),
@@ -1499,7 +1501,7 @@ fn plugin_error(
 ) -> PluginError {
     let error = scryer_plugin_pdk::plugin_error(code, public_message);
     match debug_message {
-        Some(debug_message) => error.debug(debug_message),
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
         None => error,
     }
     .build()
@@ -2507,7 +2509,12 @@ mod tests {
         assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
         let debug = error.debug_message.expect("the detail is kept");
         assert!(!debug.contains("SYNTHETICTOKEN"), "{debug}");
-        assert!(debug.contains("<bot_token>"), "{debug}");
+        // The shared URL redaction or the token scrub, whichever runs first,
+        // leaves a placeholder where the token was.
+        assert!(
+            debug.contains("<bot_token>") || debug.contains("<redacted>"),
+            "{debug}"
+        );
     }
 
     #[test]

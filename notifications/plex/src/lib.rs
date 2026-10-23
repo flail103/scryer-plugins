@@ -359,7 +359,7 @@ fn plex_auth_token(pin_id: i64) -> Result<String, Error> {
                 codes::ITEM_NOT_FOUND,
                 "the Plex sign-in request has expired; start the sign-in again",
             )
-            .debug(debug)
+            .debug(redact_secrets(&debug))
             .build()
         } else {
             http_failure(

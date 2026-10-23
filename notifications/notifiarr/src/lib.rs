@@ -2218,7 +2218,7 @@ fn classify_response(
             PluginErrorCode::UpstreamUnavailable,
             "something in front of Notifiarr (usually Cloudflare) answered instead of the API",
         )
-        .debug(debug);
+        .debug(redact_secrets(&debug));
         return PluginResult::Err(match retry_after {
             Some(seconds) => builder.retry_after_seconds(seconds).build(),
             None => builder.build(),
@@ -2322,7 +2322,7 @@ fn plugin_error(
 ) -> PluginError {
     let builder = scryer_plugin_pdk::plugin_error(code, public_message);
     match debug_message {
-        Some(debug) => builder.debug(debug).build(),
+        Some(debug) => builder.debug(redact_secrets(&debug)).build(),
         None => builder.build(),
     }
 }

@@ -282,7 +282,7 @@ fn plugin_error(
 ) -> PluginError {
     let builder = scryer_plugin_pdk::plugin_error(code, public_message);
     match debug_message {
-        Some(debug) => builder.debug(debug).build(),
+        Some(debug) => builder.debug(redact_secrets(&debug)).build(),
         None => builder.build(),
     }
 }
