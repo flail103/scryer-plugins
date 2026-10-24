@@ -19,6 +19,8 @@ pub const PAGE_CEILING: u32 = 2;
 
 pub struct HttpReply {
     pub status: u16,
+    /// The `Retry-After` header, if the reply sent one.
+    pub retry_after: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -116,7 +118,7 @@ pub async fn run_page<F: Fetch>(
         size,
     };
     let reply = fetch.post(&call).await?;
-    let result = api::parse_reply(reply.status, &reply.body)?;
+    let result = api::parse_reply(reply.status, reply.retry_after.as_deref(), &reply.body)?;
 
     let read = result.results.len();
     let results = result

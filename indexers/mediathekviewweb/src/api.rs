@@ -264,8 +264,12 @@ fn lenient_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, 
 pub enum MvwError {
     InvalidConfig(String),
     InvalidCursor,
-    /// HTTP 429.
-    RateLimited,
+    /// HTTP 429, with the `Retry-After` delay in seconds when one was sent.
+    RateLimited {
+        retry_after_seconds: Option<i64>,
+    },
+    /// An HTML challenge page (CAPTCHA, Cloudflare) where JSON belongs.
+    Challenge,
     /// HTTP 5xx, with the API's own message when it sent one.
     Upstream {
         status: u16,
@@ -281,6 +285,7 @@ pub enum MvwError {
     /// The body was not the documented JSON.
     Malformed(String),
     Transport(String),
+    TimedOut(String),
     Cancelled,
 }
 
@@ -298,7 +303,13 @@ impl fmt::Display for MvwError {
                 formatter,
                 "the page cursor was not written by this indexer or no longer fits its configuration"
             ),
-            Self::RateLimited => write!(formatter, "MediathekViewWeb is rate limiting requests"),
+            Self::RateLimited { .. } => {
+                write!(formatter, "MediathekViewWeb is rate limiting requests")
+            }
+            Self::Challenge => write!(
+                formatter,
+                "MediathekViewWeb answered with an HTML challenge page"
+            ),
             Self::Upstream { status, message } => write!(
                 formatter,
                 "MediathekViewWeb is unavailable (HTTP {status}){}",
@@ -322,6 +333,12 @@ impl fmt::Display for MvwError {
                 write!(
                     formatter,
                     "MediathekViewWeb could not be reached: {message}"
+                )
+            }
+            Self::TimedOut(message) => {
+                write!(
+                    formatter,
+                    "the request to MediathekViewWeb timed out: {message}"
                 )
             }
             Self::Cancelled => write!(formatter, "the search was cancelled"),
@@ -370,11 +387,42 @@ fn body_message(body: &[u8]) -> Option<String> {
         .and_then(|err| error_text(&err))
 }
 
-/// Read one reply: status first, then the body.
-pub fn parse_reply(status: u16, body: &[u8]) -> Result<QueryResult, MvwError> {
+/// A `Retry-After` value in delta seconds. An HTTP-date or a negative
+/// number is ignored: the guest has no wall clock to subtract from.
+pub fn retry_after_seconds(value: &str) -> Option<i64> {
+    value
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|seconds| *seconds >= 0)
+}
+
+/// An HTML page carrying a CAPTCHA or Cloudflare challenge.
+fn is_challenge_page(body: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&body[..body.len().min(4096)]).to_ascii_lowercase();
+    let head = head.trim_start();
+    (head.starts_with("<!doctype html") || head.starts_with("<html"))
+        && (head.contains("captcha")
+            || head.contains("cf-challenge")
+            || head.contains("challenge-platform"))
+}
+
+/// Read one reply: a challenge page first, then the status, then the body.
+pub fn parse_reply(
+    status: u16,
+    retry_after: Option<&str>,
+    body: &[u8],
+) -> Result<QueryResult, MvwError> {
+    if is_challenge_page(body) {
+        return Err(MvwError::Challenge);
+    }
     match status {
         200..=299 => {}
-        429 => return Err(MvwError::RateLimited),
+        429 => {
+            return Err(MvwError::RateLimited {
+                retry_after_seconds: retry_after.and_then(retry_after_seconds),
+            });
+        }
         500..=599 => {
             return Err(MvwError::Upstream {
                 status,

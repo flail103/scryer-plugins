@@ -199,6 +199,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mediathekviewweb-indexer"
+version = "0.1.0"
+dependencies = [
+ "scryer-plugin-pdk",
+ "scryer-plugin-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -313,7 +323,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scryer-plugin-pdk"
-version = "0.7.0"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd05e4ac0d93f86458afce9cb834791f0f27e2a4a8b16d900cd637e42769a48f"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -326,7 +338,9 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-sdk"
-version = "3.17.0"
+version = "3.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dacf2fc749d78471b28a923da4a4a8c32fd9bb32449cbc0fabf56aa75567a1ae"
 dependencies = [
  "base64",
  "schemars",
@@ -589,16 +603,6 @@ dependencies = [
  "serde_json",
  "unicode-ident",
  "wasmparser",
-]
-
-[[package]]
-name = "mediathekviewweb-indexer"
-version = "0.1.0"
-dependencies = [
- "scryer-plugin-pdk",
- "scryer-plugin-sdk",
- "serde",
- "serde_json",
 ]
 
 [[package]]

@@ -22,6 +22,7 @@ use crate::engine::{self, Fetch, HttpReply, PAGE_CEILING, PageOutcome};
 use crate::release::{
     Variant, infer_height, media_geo, release_title, rfc3339_from_unix, subtitle_format, variant,
 };
+use scryer_plugin_pdk::error::codes;
 
 /// A real three-result answer for "Die Sendung mit der Maus".
 const QUERY_SAMPLE: &str = include_str!("../tests/fixtures/query_sample.json");
@@ -74,6 +75,7 @@ impl FixtureFetch {
 fn reply(status: u16, body: &str) -> HttpReply {
     HttpReply {
         status,
+        retry_after: None,
         body: body.as_bytes().to_vec(),
     }
 }
@@ -1061,41 +1063,68 @@ fn unix_timestamps_render_as_rfc3339() {
 #[test]
 fn replies_classify_by_status_then_body() {
     assert_eq!(
-        parse_reply(500, ERROR_SERVER.as_bytes()).unwrap_err(),
+        parse_reply(500, None, ERROR_SERVER.as_bytes()).unwrap_err(),
         MvwError::Upstream {
             status: 500,
             message: Some("Cannot read properties of undefined (reading 'slice')".into()),
         }
     );
     assert_eq!(
-        parse_reply(503, ERROR_NOT_JSON.as_bytes()).unwrap_err(),
+        parse_reply(503, None, ERROR_NOT_JSON.as_bytes()).unwrap_err(),
         MvwError::Upstream {
             status: 503,
             message: None
         }
     );
-    assert_eq!(parse_reply(429, b"").unwrap_err(), MvwError::RateLimited);
     assert_eq!(
-        parse_reply(404, ERROR_NOT_JSON.as_bytes()).unwrap_err(),
+        parse_reply(429, None, b"").unwrap_err(),
+        MvwError::RateLimited {
+            retry_after_seconds: None
+        }
+    );
+    assert_eq!(
+        parse_reply(429, Some(" 30 "), b"").unwrap_err(),
+        MvwError::RateLimited {
+            retry_after_seconds: Some(30)
+        }
+    );
+    for ignored in ["-5", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+        assert_eq!(
+            parse_reply(429, Some(ignored), b"").unwrap_err(),
+            MvwError::RateLimited {
+                retry_after_seconds: None
+            },
+            "{ignored}"
+        );
+    }
+    for status in [200, 403, 503] {
+        assert_eq!(
+            parse_reply(status, None, CHALLENGE_PAGE.as_bytes()).unwrap_err(),
+            MvwError::Challenge,
+            "{status}"
+        );
+    }
+    assert_eq!(
+        parse_reply(404, None, ERROR_NOT_JSON.as_bytes()).unwrap_err(),
         MvwError::BadStatus {
             status: 404,
             message: None
         }
     );
     assert_eq!(
-        parse_reply(200, ERROR_REJECTED.as_bytes()).unwrap_err(),
+        parse_reply(200, None, ERROR_REJECTED.as_bytes()).unwrap_err(),
         MvwError::Rejected("Synthetic query failure".into())
     );
     assert!(matches!(
-        parse_reply(200, ERROR_NOT_JSON.as_bytes()).unwrap_err(),
+        parse_reply(200, None, ERROR_NOT_JSON.as_bytes()).unwrap_err(),
         MvwError::Malformed(_)
     ));
     assert!(matches!(
-        parse_reply(200, br#"{"result":null,"err":null}"#).unwrap_err(),
+        parse_reply(200, None, br#"{"result":null,"err":null}"#).unwrap_err(),
         MvwError::Malformed(_)
     ));
     assert_eq!(
-        parse_reply(200, QUERY_SAMPLE.as_bytes())
+        parse_reply(200, None, QUERY_SAMPLE.as_bytes())
             .unwrap()
             .results
             .len(),
@@ -1115,6 +1144,9 @@ fn engine_failures_surface_without_results() {
         assert_eq!(fetch.calls().len(), 1);
     }
 }
+
+const CHALLENGE_PAGE: &str = "<!DOCTYPE html><html><head><title>Just a moment</title></head>\
+<body><div id=\"challenge-platform\">Synthetic CAPTCHA check</div></body></html>";
 
 #[test]
 fn plugin_error_codes() {
@@ -1137,7 +1169,22 @@ fn plugin_error_codes() {
     );
     assert_eq!(
         code(MvwError::Malformed("x".into())),
-        PluginErrorCode::Permanent
+        PluginErrorCode::from(codes::INVALID_RESPONSE)
+    );
+    assert_eq!(
+        code(MvwError::Challenge),
+        PluginErrorCode::from(codes::CAPTCHA_REQUIRED)
+    );
+    assert_eq!(
+        code(MvwError::BadStatus {
+            status: 404,
+            message: None
+        }),
+        PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+    );
+    assert_eq!(
+        code(MvwError::TimedOut("timeout".into())),
+        PluginErrorCode::Temporary
     );
     assert_eq!(
         code(MvwError::BadStatus {
@@ -1152,19 +1199,41 @@ fn plugin_error_codes() {
         PluginErrorCode::InvalidConfig
     );
 
-    let limited = crate::plugin_error(&MvwError::RateLimited);
+    let limited = crate::plugin_error(&MvwError::RateLimited {
+        retry_after_seconds: Some(30),
+    });
     assert_eq!(limited.code, PluginErrorCode::RateLimited);
+    assert_eq!(limited.retry_after_seconds, Some(30));
     assert!(matches!(
         limited.details,
         Some(PluginErrorDetails::IndexerSearch(
             IndexerSearchPluginError::Deferred {
                 reason: IndexerSearchIncompleteReason::RateLimited,
-                ..
+                retry_after_seconds: Some(30),
             }
         ))
     ));
-    let rejected = crate::plugin_error(&MvwError::Rejected("Synthetic query failure".into()));
-    assert!(rejected.public_message.contains("Synthetic query failure"));
+
+    // The API's own text and host details reach the debug message only.
+    for error in [
+        MvwError::Rejected("Synthetic query failure".into()),
+        MvwError::Upstream {
+            status: 500,
+            message: Some("Synthetic query failure".into()),
+        },
+        MvwError::Malformed("Synthetic query failure".into()),
+        MvwError::Transport("Synthetic query failure".into()),
+    ] {
+        let built = crate::plugin_error(&error);
+        assert!(!built.public_message.contains("Synthetic"), "{built:?}");
+        assert!(
+            built
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("Synthetic query failure")),
+            "{built:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,7 +1280,11 @@ impl Fetch for CurlFetch {
             .and_then(|status| status.trim().parse::<u16>().ok())
             .ok_or_else(|| MvwError::Transport("unreadable status".into()))?;
         body.truncate(split);
-        Ok(HttpReply { status, body })
+        Ok(HttpReply {
+            status,
+            retry_after: None,
+            body,
+        })
     }
 }
 

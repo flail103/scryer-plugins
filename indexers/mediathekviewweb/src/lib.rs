@@ -17,6 +17,7 @@ mod tests;
 use std::collections::{BTreeMap, HashMap};
 
 use scryer_plugin_pdk::component::{self, HostError, structured_plugin_error};
+use scryer_plugin_pdk::error::{codes, plugin_error as build_plugin_error};
 use scryer_plugin_pdk::log::{LogLevel, log};
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::{
@@ -181,10 +182,17 @@ impl Fetch for HostFetch {
         .await
         .map_err(|error| match error {
             HostError::Cancelled => MvwError::Cancelled,
+            HostError::Timeout => MvwError::TimedOut(error.to_string()),
             other => MvwError::Transport(other.to_string()),
         })?;
+        let retry_after = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.clone());
         Ok(HttpReply {
             status: response.status,
+            retry_after,
             body: response.body,
         })
     }
@@ -228,36 +236,68 @@ pub(crate) fn ceiling_error(response: SearchResponse) -> PluginError {
     }
 }
 
-/// The SDK error for a failure.
+/// The SDK error for a failure. The public sentence never carries the API's
+/// own text or a host detail; the whole failure goes to the debug message.
 pub(crate) fn plugin_error(error: &MvwError) -> PluginError {
-    let message = error.to_string();
-    let (code, details) = match error {
-        MvwError::InvalidConfig(_) => (PluginErrorCode::InvalidConfig, None),
-        MvwError::RateLimited => (
+    let detail = error.to_string();
+    let (code, public_message): (PluginErrorCode, String) = match error {
+        // The configuration and cursor sentences are this plugin's own.
+        MvwError::InvalidConfig(_) => (PluginErrorCode::InvalidConfig, detail.clone()),
+        MvwError::InvalidCursor => (PluginErrorCode::Permanent, detail.clone()),
+        MvwError::RateLimited { .. } => (
             PluginErrorCode::RateLimited,
-            Some(PluginErrorDetails::IndexerSearch(
-                IndexerSearchPluginError::Deferred {
-                    reason: IndexerSearchIncompleteReason::RateLimited,
-                    retry_after_seconds: None,
-                },
-            )),
+            "MediathekViewWeb is rate limiting requests".into(),
         ),
-        MvwError::Upstream { .. } | MvwError::Transport(_) => {
-            (PluginErrorCode::UpstreamUnavailable, None)
-        }
-        MvwError::Cancelled => (PluginErrorCode::Temporary, None),
-        MvwError::InvalidCursor
-        | MvwError::BadStatus { .. }
-        | MvwError::Rejected(_)
-        | MvwError::Malformed(_) => (PluginErrorCode::Permanent, None),
+        MvwError::Challenge => (
+            codes::CAPTCHA_REQUIRED.into(),
+            "MediathekViewWeb answered with a CAPTCHA challenge".into(),
+        ),
+        MvwError::Upstream { .. } => (
+            PluginErrorCode::UpstreamUnavailable,
+            "MediathekViewWeb answered with a server error".into(),
+        ),
+        MvwError::BadStatus { status: 404, .. } => (
+            codes::ENDPOINT_NOT_FOUND.into(),
+            "the MediathekViewWeb query address was not found".into(),
+        ),
+        MvwError::BadStatus { .. } => (
+            PluginErrorCode::Permanent,
+            "MediathekViewWeb refused the query".into(),
+        ),
+        MvwError::Rejected(_) => (
+            PluginErrorCode::Permanent,
+            "MediathekViewWeb rejected the query".into(),
+        ),
+        MvwError::Malformed(_) => (
+            codes::INVALID_RESPONSE.into(),
+            "MediathekViewWeb returned a response that could not be read".into(),
+        ),
+        MvwError::Transport(_) => (
+            PluginErrorCode::UpstreamUnavailable,
+            "MediathekViewWeb could not be reached".into(),
+        ),
+        MvwError::TimedOut(_) => (
+            PluginErrorCode::Temporary,
+            "the request to MediathekViewWeb timed out".into(),
+        ),
+        MvwError::Cancelled => (PluginErrorCode::Temporary, detail.clone()),
     };
-    PluginError {
-        code,
-        public_message: message.clone(),
-        debug_message: Some(message),
-        retry_after_seconds: None,
-        details,
+    let mut builder = build_plugin_error(code, public_message).debug(detail);
+    if let MvwError::RateLimited {
+        retry_after_seconds,
+    } = error
+    {
+        if let Some(seconds) = retry_after_seconds {
+            builder = builder.retry_after_seconds(*seconds);
+        }
+        builder = builder.details(PluginErrorDetails::IndexerSearch(
+            IndexerSearchPluginError::Deferred {
+                reason: IndexerSearchIncompleteReason::RateLimited,
+                retry_after_seconds: *retry_after_seconds,
+            },
+        ));
     }
+    builder.build()
 }
 
 scryer_indexer_component_main!(descriptor = build_descriptor, search = search,);

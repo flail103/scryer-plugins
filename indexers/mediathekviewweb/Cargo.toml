@@ -11,9 +11,7 @@ official = true
 plugin_id = "mediathekviewweb"
 status = "beta"
 catalog_versions = ["v3"]
-# The `http` protocol family (`IndexerProtocol::Http`, `PluginHttpRelease` and
-# the `http` capability block) first ships in Scryer 0.21.19 on SDK 3.17.0.
-min_scryer_version = "0.21.19"
+min_scryer_version = "0.21.21"
 docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/indexers/mediathekviewweb"
 source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/indexers/mediathekviewweb"
 
@@ -22,8 +20,8 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-scryer-plugin-pdk = { path = "../../pdk/scryer-plugin-pdk", version = "0.7.0" }
-scryer-plugin-sdk = "3.17.0"
+scryer-plugin-pdk = "0.8.0"
+scryer-plugin-sdk = "3.18.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
