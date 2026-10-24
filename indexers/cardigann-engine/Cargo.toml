@@ -49,9 +49,3 @@ opt-level = 3
 lto = "fat"
 strip = true
 panic = "abort"
-
-# SDK 3.19.0 (the read-only `info` field type) is not on crates.io yet. This
-# patch points at the Scryer checkout that carries it and must be removed once
-# 3.19.0 is published.
-[patch.crates-io]
-scryer-plugin-sdk = { path = "../../../../../scryer/.worktrees/cardigann-host-gaps/crates/scryer-plugin-sdk" }
