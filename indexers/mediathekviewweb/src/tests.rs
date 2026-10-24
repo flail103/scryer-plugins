@@ -171,7 +171,7 @@ fn descriptor_declares_an_interactive_http_indexer() {
     let descriptor = crate::build_descriptor();
     assert_eq!(descriptor.id, "mediathekviewweb");
     assert_eq!(descriptor.name, "MediathekViewWeb");
-    assert_eq!(descriptor.version, "0.1.0");
+    assert_eq!(descriptor.version, "0.1.1");
     let ProviderDescriptor::Indexer(indexer) = descriptor.provider else {
         panic!("not an indexer");
     };
@@ -344,6 +344,54 @@ fn season_and_episode_are_not_added_to_the_query() {
     let body = fetch.only_body();
     assert_eq!(body["queries"][0]["query"], "Die Sendung mit der Maus");
     assert_eq!(body["size"], 50, "no limit asks for a full page");
+}
+
+#[test]
+fn numbering_words_in_the_query_are_dropped() {
+    for (query, sent) in [
+        (
+            "Die Sendung mit der Maus S2026E29",
+            "Die Sendung mit der Maus",
+        ),
+        ("Die Sendung mit der Maus S2026", "Die Sendung mit der Maus"),
+        (
+            "die sendung mit der maus s01e02",
+            "die sendung mit der maus",
+        ),
+        // Words that only look like numbering stay.
+        ("Tatort S Bahn", "Tatort S Bahn"),
+        ("Folge S2026E", "Folge S2026E"),
+        ("Serie S1x02 Spezial", "Serie S1x02 Spezial"),
+        ("SOKO Wismar S2E", "SOKO Wismar S2E"),
+        ("Sport S1E2E3", "Sport S1E2E3"),
+    ] {
+        assert_eq!(engine::build_query(&request(query)), sent, "{query}");
+    }
+}
+
+#[test]
+fn an_episode_query_sends_only_the_show_name() {
+    let fetch = FixtureFetch::ok(QUERY_SAMPLE);
+    let request = SearchRequest {
+        query: "Die Sendung mit der Maus S2026E41".to_string(),
+        season: Some(2026),
+        episode: Some(41),
+        ..SearchRequest::default()
+    };
+    let outcome = run(&config_with(&[]), &request, &fetch).unwrap();
+    assert_eq!(
+        fetch.only_body()["queries"][0]["query"],
+        "Die Sendung mit der Maus"
+    );
+    assert!(!outcome.response.results.is_empty());
+}
+
+#[test]
+fn a_query_of_only_numbering_makes_no_call() {
+    let fetch = FixtureFetch::new(vec![]);
+    let outcome = run(&config_with(&[]), &request("S2026E29"), &fetch).unwrap();
+    assert!(outcome.response.results.is_empty());
+    assert!(fetch.calls().is_empty());
 }
 
 #[test]

@@ -38,13 +38,30 @@ pub struct PageOutcome {
 
 /// The text sent to MediathekViewWeb: the request's query with its
 /// whitespace collapsed. Season and episode numbers mean nothing to the
-/// film list, so they are not added.
+/// film list, which titles programmes by broadcast date and needs every
+/// query word to match. So they are not added, and the `S2026E41` or `S2026`
+/// words the host puts in an episode query are dropped; the host matches
+/// the returned air dates to its episodes.
 pub fn build_query(request: &SearchRequest) -> String {
     request
         .query
         .split_whitespace()
+        .filter(|word| !is_numbering_word(word))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `S<digits>`, optionally followed by `E<digits>`, in either case.
+fn is_numbering_word(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix(['S', 's']) else {
+        return false;
+    };
+    let (season, episode) = match rest.find(['E', 'e']) {
+        Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+        None => (rest, None),
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    digits(season) && episode.is_none_or(digits)
 }
 
 pub fn page_size(request: &SearchRequest) -> usize {
