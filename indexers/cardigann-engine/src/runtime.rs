@@ -615,7 +615,7 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
         (Continuation::SimpleCaptcha(mut context), ResumeInput::Http(response)) => {
             merge_response_cookies(&mut context.cookies, &response);
             if let Some(step) = http_status_failure(
-                &context.definition,
+                &context,
                 &response,
                 "simple CAPTCHA",
                 codes::ENDPOINT_NOT_FOUND,
@@ -663,7 +663,7 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
         (Continuation::CaptchaImage(mut context), ResumeInput::Http(response)) => {
             merge_response_cookies(&mut context.cookies, &response);
             if let Some(step) = http_status_failure(
-                &context.definition,
+                &context,
                 &response,
                 "captcha image",
                 codes::ENDPOINT_NOT_FOUND,
@@ -732,7 +732,7 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
                     mark_contains(&mut document, &selector.needles);
                     if select_matching_element(&document.root_element(), &selector).is_none() {
                         return Ok(rejected(
-                            login_rejection_code(&definition, &response),
+                            login_refusal(&context).code,
                             "The tracker did not show a logged-in page. Check the indexer's \
                              credentials."
                                 .to_string(),
@@ -748,7 +748,7 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
                 })
             } else {
                 Ok(http_status_failure(
-                    &definition,
+                    &context,
                     &response,
                     "connection test",
                     codes::ENDPOINT_NOT_FOUND,
@@ -774,7 +774,7 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
                 return Ok(step);
             }
             if let Some(step) =
-                http_status_failure(&definition, &response, "search", codes::ENDPOINT_NOT_FOUND)
+                http_status_failure(&context, &response, "search", codes::ENDPOINT_NOT_FOUND)
             {
                 return Ok(step);
             }
@@ -817,7 +817,7 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
                 return Ok(step);
             }
             if let Some(step) = http_status_failure(
-                &definition,
+                &context,
                 &response,
                 "download details",
                 codes::ITEM_NOT_FOUND,
@@ -860,7 +860,7 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
                 return Ok(step);
             }
             if let Some(step) = http_status_failure(
-                &definition,
+                &context,
                 &response,
                 "download before request",
                 codes::ITEM_NOT_FOUND,
@@ -884,12 +884,9 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
             if let Some(step) = retry_login_if_needed(&definition, context.clone(), &response)? {
                 return Ok(step);
             }
-            if let Some(step) = http_status_failure(
-                &definition,
-                &response,
-                "download page",
-                codes::ITEM_NOT_FOUND,
-            ) {
+            if let Some(step) =
+                http_status_failure(&context, &response, "download page", codes::ITEM_NOT_FOUND)
+            {
                 return Ok(step);
             }
             finish_grab(context, &response.body)
@@ -909,7 +906,7 @@ pub fn resume(continuation: &[u8], input: ResumeInput) -> Result<Step, String> {
                 return Ok(step);
             }
             if let Some(step) = http_status_failure(
-                &definition,
+                &context,
                 &response,
                 "torrent download",
                 codes::ITEM_NOT_FOUND,
@@ -2635,7 +2632,7 @@ fn need_manual(
 /// download), 429 is rate limiting with its `Retry-After`, a 5xx is the
 /// tracker being down, and anything else is a temporary failure.
 fn http_status_failure(
-    definition: &Definition,
+    context: &Context,
     response: &PluginHttpResponse,
     phase: &str,
     not_found: &str,
@@ -2645,7 +2642,7 @@ fn http_status_failure(
         return None;
     }
     let error = match status {
-        401 | 403 => match refused_credential(definition, response) {
+        401 | 403 => match refused_credential(context) {
             Some(code) => plugin_error(
                 code,
                 format!(
@@ -2696,12 +2693,10 @@ fn http_status_failure(
 /// sends with every request. A definition that sends no credential at all was
 /// blocked rather than refused, so there is nothing for the operator to fix
 /// in its settings.
-fn refused_credential(
-    definition: &Definition,
-    response: &PluginHttpResponse,
-) -> Option<PluginErrorCode> {
+fn refused_credential(context: &Context) -> Option<PluginErrorCode> {
+    let definition = &context.definition;
     if definition.login.is_some() {
-        return Some(login_rejection_code(definition, response));
+        return Some(login_refusal(context).code);
     }
     let names: Vec<String> = definition
         .settings
@@ -3116,9 +3111,14 @@ fn parse_selector(selector: &str) -> Result<CardigannSelector, String> {
 /// The definition's error check for a login response.
 ///
 /// A non-2xx response still reaches the definition's `error:` blocks. They run first
-/// here for every status, which keeps the definition's own explanation of a
-/// rejected login whatever status the tracker answered it with. A non-2xx
-/// response no block explains is reported as the HTTP failure it is.
+/// here for every status, which keeps a rejected login reported as refused
+/// whatever status the tracker answered it with. A non-2xx response no block
+/// matches is reported as the HTTP failure it is.
+///
+/// A matching block only says the login was refused. Which credential was
+/// refused comes from the definition and the configuration, never from the
+/// response, and the operator sentence is fixed for that code. The tracker's
+/// own text goes to the debug message only.
 fn login_failure(
     definition: &Definition,
     context: &Context,
@@ -3133,14 +3133,14 @@ fn login_failure(
             "login",
         )?
     {
-        let message = mask_credentials(context, &message);
+        let refusal = login_refusal(context);
         return Ok(Some(rejected(
-            login_rejection_code(definition, response),
-            format!("Tracker login failed: {}", public_text(&message)),
+            refusal.code,
+            refusal.public_message.to_string(),
             format!(
                 "Cardigann login returned HTTP {} and matched the definition's error block: {}",
                 response.status,
-                message.trim()
+                tracker_text(&mask_credentials(context, &message))
             ),
         )));
     }
@@ -3148,32 +3148,52 @@ fn login_failure(
         return Ok(Some(login_http_failure(
             response.status,
             "login",
-            login_rejection_code(definition, response),
+            login_refusal(context).code,
         )));
     }
     Ok(None)
 }
 
-/// The code a rejected login carries, from how the definition logs in: a
-/// login page that shows the definition's captcha again wants a captcha
-/// answer, a cookie login was refused its cookie, and a definition with
-/// username and password settings was refused that pair. Anything else, such
-/// as an API-key login, stays the generic auth failure.
-fn login_rejection_code(definition: &Definition, response: &PluginHttpResponse) -> PluginErrorCode {
-    let Some(login) = definition.login.as_ref() else {
-        return PluginErrorCode::AuthFailed;
+/// A refused login: the code it carries and the fixed operator sentence for
+/// that code.
+struct LoginRefusal {
+    code: PluginErrorCode,
+    public_message: &'static str,
+}
+
+/// What a refused login refused, from how the definition logs in and what the
+/// configuration supplies, all known before the request is sent: a cookie
+/// login was refused its cookie, a login that declares a CAPTCHA with no
+/// answer configured wants one, and a definition with username and password
+/// settings was refused that pair. Anything else, such as an API-key login,
+/// stays the generic auth failure. Nothing in the tracker's response decides
+/// it.
+fn login_refusal(context: &Context) -> LoginRefusal {
+    let definition = &context.definition;
+    let refused_sign_in = LoginRefusal {
+        code: PluginErrorCode::AuthFailed,
+        public_message: "The tracker refused the sign-in.",
     };
-    if let Some(captcha) = login.captcha.as_ref()
-        && let Ok(selector) = parse_selector(&captcha.selector)
-    {
-        let mut document = Html::parse_document(&decode_body(definition, &response.body));
-        mark_contains(&mut document, &selector.needles);
-        if select_matching_element(&document.root_element(), &selector).is_some() {
-            return codes::CAPTCHA_REQUIRED.into();
-        }
-    }
+    let Some(login) = definition.login.as_ref() else {
+        return refused_sign_in;
+    };
     if login.method.eq_ignore_ascii_case("cookie") {
-        return codes::INVALID_COOKIE.into();
+        return LoginRefusal {
+            code: codes::INVALID_COOKIE.into(),
+            public_message: "The tracker refused the cookie.",
+        };
+    }
+    let has_captcha_answer = ["cardigannCaptcha", "CAPTCHA"].iter().any(|key| {
+        context
+            .config
+            .get(*key)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    if login.captcha.is_some() && !has_captcha_answer {
+        return LoginRefusal {
+            code: codes::CAPTCHA_REQUIRED.into(),
+            public_message: "The tracker asks for a CAPTCHA answer.",
+        };
     }
     let has_setting = |name: &str| {
         definition
@@ -3182,9 +3202,12 @@ fn login_rejection_code(definition: &Definition, response: &PluginHttpResponse) 
             .any(|setting| setting.name == name)
     };
     if has_setting("username") && has_setting("password") {
-        return codes::INVALID_USERNAME_PASSWORD.into();
+        return LoginRefusal {
+            code: codes::INVALID_USERNAME_PASSWORD.into(),
+            public_message: "The tracker refused the username and password.",
+        };
     }
-    PluginErrorCode::AuthFailed
+    refused_sign_in
 }
 
 /// A login request the tracker answered with an HTTP error and nothing the
@@ -3220,10 +3243,10 @@ fn rejected(code: PluginErrorCode, public_message: String, debug_message: String
     }
 }
 
-/// Upper bound on tracker-supplied text in an operator-facing message. An
-/// error block without a `message:` reports the matched element's text, which
-/// for a `:root:contains(…)` selector is the whole page.
-const PUBLIC_TEXT_LIMIT: usize = 200;
+/// Upper bound on tracker-supplied text in a debug message. An error block
+/// without a `message:` reports the matched element's text, which for a
+/// `:root:contains(…)` selector is the whole page.
+const TRACKER_TEXT_LIMIT: usize = 200;
 
 /// Tracker or definition text with every credential-bearing setting value the
 /// operator configured masked, in case a definition's message template or the
@@ -3252,19 +3275,37 @@ fn mask_credentials(context: &Context, text: &str) -> String {
     text
 }
 
-/// Masked text made fit for a `public_message`: whitespace collapsed and
-/// length bounded.
-fn public_text(text: &str) -> String {
+/// Masked tracker text made fit for a `debug_message`: whitespace collapsed
+/// and length bounded. Tracker text never goes into a `public_message`.
+fn tracker_text(text: &str) -> String {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.chars().count() > PUBLIC_TEXT_LIMIT {
-        text.chars().take(PUBLIC_TEXT_LIMIT).collect::<String>() + "…"
+    if text.chars().count() > TRACKER_TEXT_LIMIT {
+        text.chars().take(TRACKER_TEXT_LIMIT).collect::<String>() + "…"
     } else {
         text
     }
 }
 
-/// The definition's `error:` block a search response matched, reported with
-/// the tracker's own explanation, credentials masked.
+/// The text an element shows a reader: its text nodes, without the contents
+/// of `<style>` and `<script>` elements inside it.
+fn visible_text(element: &ElementRef<'_>) -> String {
+    let mut text = String::new();
+    let mut pending = vec![**element];
+    while let Some(node) = pending.pop() {
+        match node.value() {
+            Node::Text(fragment) => text.push_str(fragment),
+            Node::Element(child)
+                if child.name().eq_ignore_ascii_case("style")
+                    || child.name().eq_ignore_ascii_case("script") => {}
+            _ => pending.extend(node.children().rev()),
+        }
+    }
+    text
+}
+
+/// The definition's `error:` block a search response matched. The operator
+/// sentence is fixed; the tracker's own explanation, credentials masked, goes
+/// to the debug message.
 fn search_error_block(
     definition: &Definition,
     context: &Context,
@@ -3280,15 +3321,19 @@ fn search_error_block(
     else {
         return Ok(None);
     };
-    let message = mask_credentials(context, &message);
     Ok(Some(rejected(
         PluginErrorCode::Temporary,
-        format!("Tracker search failed: {}", public_text(&message)),
-        format!("tracker search failed: {}", message.trim()),
+        "The tracker reported an error for the search.".to_string(),
+        format!(
+            "tracker search failed: {}",
+            tracker_text(&mask_credentials(context, &message))
+        ),
     )))
 }
 
-/// The message of the first `error:` block that matches the response.
+/// The message of the first `error:` block that matches the response: the
+/// block's `message:` value when it declares one, otherwise the matched
+/// element's visible text.
 fn error_block_message(
     definition: &Definition,
     errors: &[crate::definition::ErrorBlock],
@@ -3313,7 +3358,7 @@ fn error_block_message(
                 .and_then(|field| {
                     select_element_value(definition, &element, field, variables, false).ok()
                 })
-                .unwrap_or_else(|| element.text().collect::<String>().trim().to_string());
+                .unwrap_or_else(|| visible_text(&element).trim().to_string());
             return Ok(Some(message));
         }
     }
@@ -6518,10 +6563,19 @@ search:
     /// Answer the definition's login request with `response` and return the
     /// typed error the flow ends with.
     fn login_rejection(definition: &str, response: PluginHttpResponse) -> PluginError {
+        login_rejection_with(definition, api_key_config(), response)
+    }
+
+    /// [`login_rejection`] with the given configuration.
+    fn login_rejection_with(
+        definition: &str,
+        config: BTreeMap<String, String>,
+        response: PluginHttpResponse,
+    ) -> PluginError {
         let Step::NeedHttp { continuation, .. } = begin(
             compiled(definition),
             Operation::Search(Box::default()),
-            api_key_config(),
+            config,
         )
         .unwrap() else {
             panic!("login request expected")
@@ -6541,9 +6595,14 @@ search:
         }
     }
 
+    fn debug(error: &PluginError) -> &str {
+        error.debug_message.as_deref().unwrap_or_default()
+    }
+
     /// Login `error:` messages render with the definition's variables, so a
     /// `{{ .Config.sitelink }}` names the configured site instead of rendering
-    /// empty, and the message reaches the operator as a typed auth failure.
+    /// empty. That text is the debug message; the operator sees the fixed
+    /// sentence for the code.
     #[test]
     fn login_error_block_message_renders_config_variables() {
         let error = login_rejection(
@@ -6551,15 +6610,12 @@ search:
             html_response(200, "<html><a href='/login'>Sign in</a></html>"),
         );
         assert_eq!(error.code, PluginErrorCode::AuthFailed);
-        assert_eq!(
-            error.public_message,
-            "Tracker login failed: The API key was not accepted by https://tracker.example/."
-        );
+        assert_eq!(error.public_message, "The tracker refused the sign-in.");
+        assert!(debug(&error).contains("HTTP 200"), "{}", debug(&error));
         assert!(
-            error
-                .debug_message
-                .as_deref()
-                .is_some_and(|debug| debug.contains("HTTP 200"))
+            debug(&error).contains("The API key was not accepted by https://tracker.example/."),
+            "{}",
+            debug(&error)
         );
     }
 
@@ -6573,12 +6629,11 @@ search:
             html_response(403, "<html><a href='/login'>Sign in</a></html>"),
         );
         assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.public_message, "The tracker refused the sign-in.");
         assert!(
-            error
-                .public_message
-                .starts_with("Tracker login failed: The API key was not accepted"),
+            debug(&error).contains("The API key was not accepted"),
             "{}",
-            error.public_message
+            debug(&error)
         );
 
         for (status, code) in [
@@ -6606,9 +6661,11 @@ search:
             html_response(200, "<html><p>Account is Banned</p></html>"),
         );
         assert_eq!(error.code, PluginErrorCode::AuthFailed);
-        assert_eq!(
-            error.public_message,
-            "Tracker login failed: Account is Banned"
+        assert_eq!(error.public_message, "The tracker refused the sign-in.");
+        assert!(
+            debug(&error).ends_with("Account is Banned"),
+            "{}",
+            debug(&error)
         );
     }
 
@@ -6623,7 +6680,8 @@ search:
     }
 
     /// A rejected username/password login says which credential failed, and
-    /// a login page that shows the captcha again asks for the captcha instead.
+    /// a login that declares a captcha with no answer configured asks for the
+    /// captcha instead. The response body decides neither.
     #[test]
     fn login_rejections_carry_the_credential_code() {
         let definition = password_login_definition("");
@@ -6635,6 +6693,11 @@ search:
             error.code,
             PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
         );
+        assert_eq!(
+            error.public_message,
+            "The tracker refused the username and password."
+        );
+        assert!(debug(&error).ends_with(": Wrong"), "{}", debug(&error));
         let error = login_rejection(&definition, html_response(401, "<html></html>"));
         assert_eq!(
             error.code,
@@ -6655,14 +6718,103 @@ search:
             ),
         );
         assert_eq!(error.code, PluginErrorCode::from(codes::CAPTCHA_REQUIRED));
+        assert_eq!(
+            error.public_message,
+            "The tracker asks for a CAPTCHA answer."
+        );
+        // Without the captcha image in the response the declared captcha
+        // still has no answer, so the code is the same.
         let error = login_rejection(
             &definition,
             html_response(200, "<html><div class=login-error>Wrong</div></html>"),
+        );
+        assert_eq!(error.code, PluginErrorCode::from(codes::CAPTCHA_REQUIRED));
+    }
+
+    /// With the captcha answered, a refused login refused the username and
+    /// password, even when the tracker shows its captcha again.
+    #[test]
+    fn an_answered_captcha_login_rejection_is_invalid_username_password() {
+        let definition = password_login_definition(
+            "  captcha:\n    type: image\n    selector: img.captcha\n    input: captcha\n",
+        );
+        for key in ["cardigannCaptcha", "CAPTCHA"] {
+            let error = login_rejection_with(
+                &definition,
+                BTreeMap::from([
+                    ("username".to_string(), "synthetic-user".to_string()),
+                    ("password".to_string(), "synthetic-pass".to_string()),
+                    (key.to_string(), "answer".to_string()),
+                ]),
+                html_response(
+                    200,
+                    "<html><div class=login-error>Wrong</div><img class=captcha src='/c.png'></html>",
+                ),
+            );
+            assert_eq!(
+                error.code,
+                PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD),
+                "{key}"
+            );
+            assert_eq!(
+                error.public_message,
+                "The tracker refused the username and password."
+            );
+        }
+    }
+
+    /// A matched login error element that carries an inline stylesheet and a
+    /// script reports the fixed sentence, and its debug text holds only what
+    /// a reader sees, credentials masked.
+    #[test]
+    fn a_login_error_element_with_style_and_script_reports_only_visible_text() {
+        let definition = password_login_definition("");
+        let error = login_rejection_with(
+            &definition,
+            BTreeMap::from([
+                ("username".to_string(), "synthetic-user".to_string()),
+                ("password".to_string(), "synthetic-pass".to_string()),
+            ]),
+            html_response(
+                200,
+                "<html><div class=login-error><style>.msg-wrap { width: 80%; margin: 0 auto; }</style>\
+                 <script>var shown = true;</script><p>Wrong   password for\n synthetic-user</p></div></html>",
+            ),
         );
         assert_eq!(
             error.code,
             PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
         );
+        assert_eq!(
+            error.public_message,
+            "The tracker refused the username and password."
+        );
+        let debug = debug(&error);
+        assert!(
+            debug.ends_with(": Wrong password for [redacted]"),
+            "{debug}"
+        );
+        for leaked in ["width", "margin", "{", "var shown", "synthetic-user"] {
+            assert!(!debug.contains(leaked), "{leaked} in {debug}");
+        }
+    }
+
+    /// A login with no username and password settings, no cookie and no
+    /// captcha is refused as a plain sign-in failure.
+    #[test]
+    fn a_login_without_credential_settings_is_auth_failed() {
+        let definition = PUBLIC_DEFINITION.replace(
+            "search:\n  paths:\n",
+            "login:\n  path: takelogin.php\n  method: post\n  error:\n    - selector: div.login-error\nsearch:\n  paths:\n",
+        );
+        let error = login_rejection_with(
+            &definition,
+            BTreeMap::new(),
+            html_response(200, "<html><div class=login-error>Refused</div></html>"),
+        );
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.public_message, "The tracker refused the sign-in.");
+        assert!(debug(&error).ends_with(": Refused"), "{}", debug(&error));
     }
 
     /// A cookie login whose reissued request still lands on a logged-out page
@@ -6692,8 +6844,34 @@ search:
         assert_eq!(host.requests.len(), 2);
     }
 
-    /// The public message never carries a configured credential back out, and
-    /// a block without a `message:` cannot dump a whole page into it.
+    /// A cookie login the tracker still answers with 401 after the reissued
+    /// request refused the cookie, whatever the page shows.
+    #[test]
+    fn a_refused_cookie_login_status_is_invalid_cookie() {
+        let definition = parse_definition(
+            &PUBLIC_DEFINITION.replace("search:\n", "login:\n  method: cookie\nsearch:\n"),
+        )
+        .unwrap();
+        let refused = || html_response(401, "<html><img class=captcha src='/c.png'></html>");
+        let mut host = MockEngineHost {
+            responses: vec![refused(), refused()],
+            ..Default::default()
+        };
+        let Err(EngineError::Plugin(error)) = block_on(search_with_host(
+            &mut host,
+            definition,
+            PluginSearchRequest::default(),
+            BTreeMap::from([("cookie".to_string(), "uid=1; pass=synthetic".to_string())]),
+        )) else {
+            panic!("cookie rejection expected")
+        };
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_COOKIE));
+        assert!(!error.public_message.contains("synthetic"));
+    }
+
+    /// Neither message carries a configured credential back out, the public
+    /// message carries no tracker text, and a block without a `message:`
+    /// cannot dump a whole page into the debug message.
     #[test]
     fn login_error_public_message_masks_credentials_and_stays_short() {
         let definition = api_definition(
@@ -6703,25 +6881,23 @@ search:
             &definition,
             html_response(200, "<html><p class=denied>no</p></html>"),
         );
-        assert_eq!(
-            error.public_message,
-            "Tracker login failed: Key [redacted] refused"
-        );
+        assert_eq!(error.public_message, "The tracker refused the sign-in.");
         assert!(
-            !error
-                .debug_message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("synthetic-key")
+            debug(&error).ends_with(": Key [redacted] refused"),
+            "{}",
+            debug(&error)
         );
+        assert!(!debug(&error).contains("synthetic-key"));
 
         let page = format!(
             "<html><p>Account is Banned</p>{}</html>",
             "filler ".repeat(200)
         );
         let error = login_rejection(&definition, html_response(200, &page));
-        assert!(error.public_message.chars().count() <= 230);
-        assert!(error.public_message.ends_with('…'));
+        assert_eq!(error.public_message, "The tracker refused the sign-in.");
+        let tracker_part = debug(&error).split_once("error block: ").unwrap().1;
+        assert!(tracker_part.chars().count() <= TRACKER_TEXT_LIMIT + 1);
+        assert!(tracker_part.ends_with('…'));
     }
 
     /// Login is redone on any unfollowed redirect and any HTTP error, not
@@ -7810,7 +7986,45 @@ search:
         assert_eq!(error.code, PluginErrorCode::Temporary);
         assert_eq!(
             error.public_message,
-            "Tracker search failed: Key [redacted] may search again in an hour"
+            "The tracker reported an error for the search."
+        );
+        assert_eq!(
+            error.debug_message.as_deref(),
+            Some("tracker search failed: Key [redacted] may search again in an hour")
+        );
+    }
+
+    /// A search error element's stylesheet and script stay out of the debug
+    /// message.
+    #[test]
+    fn a_search_error_block_debug_text_skips_style_and_script() {
+        let definition = api_definition("").replace(
+            "  paths:\n",
+            "  error:\n    - selector: div.error\n  paths:\n",
+        );
+        let Step::NeedHttp { continuation, .. } = begin(
+            compiled(&definition),
+            Operation::Search(Box::default()),
+            api_key_config(),
+        )
+        .unwrap() else {
+            panic!("search request expected")
+        };
+        let error = rejection(resume(
+            &continuation,
+            ResumeInput::Http(html_response(
+                200,
+                "<html><div class=error><style>.box { color: red; }</style><script>track();</script>Slow down</div></html>",
+            )),
+        ));
+        assert_eq!(error.code, PluginErrorCode::Temporary);
+        assert_eq!(
+            error.public_message,
+            "The tracker reported an error for the search."
+        );
+        assert_eq!(
+            error.debug_message.as_deref(),
+            Some("tracker search failed: Slow down")
         );
     }
 
