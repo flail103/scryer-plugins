@@ -22,8 +22,8 @@ use scryer_plugin_sdk::{
     DownloadItemState, DownloadTorrentCapabilities, PluginCompletedDownload, PluginDescriptor,
     PluginDownloadClientAddRequest, PluginDownloadClientAddResponse,
     PluginDownloadClientControlRequest, PluginDownloadClientMarkImportedRequest,
-    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadOutputKind, PluginError,
-    PluginErrorCode, PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
+    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadOutputKind, PluginErrorCode,
+    PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -129,7 +129,7 @@ fn validate_config(config: &TriblerConfig) -> Result<(), PluginError> {
     // combination cannot misroute a grab, and refusing adds for a
     // configuration that worked before would fail grabs on upgrade.
     if !config.category.is_empty() && !config.directory.is_empty() {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::InvalidConfig,
             "Cannot use Category and Directory: clear one of them.",
         ));
@@ -140,7 +140,7 @@ fn validate_config(config: &TriblerConfig) -> Result<(), PluginError> {
 /// The rules an add must satisfy before it commits anything.
 fn validate_add_config(config: &TriblerConfig) -> Result<(), PluginError> {
     if config.api_key.is_empty() {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::InvalidConfig,
             "API Key is required: Tribler's REST API key is the `[api] key` value from triblerd.conf.",
         ));
@@ -175,7 +175,7 @@ fn validate_add_config(config: &TriblerConfig) -> Result<(), PluginError> {
             ));
         }
         Some(level) if level > 0 && !config.safe_seeding => {
-            return Err(plugin_error(
+            return Err(typed_error(
                 PluginErrorCode::InvalidConfig,
                 "Tribler refuses an anonymous download with safe seeding off: enable Safe Seeding or set Anonymity Level to 0.",
             ));
@@ -237,11 +237,9 @@ struct TriblerDownload {
     /// 7.x name for `all_time_ratio`.
     #[serde(default)]
     ratio: Option<f64>,
-    /// Parsed but deliberately unused. Sonarr's only use of it is the seeding
-    /// time goal (`TriblerDownloadClient.cs:205-210`), where it is the wrong
-    /// clock — see `derive_can_remove` — and Scryer's queue item has no
-    /// "added at" of its own to carry it in.
-    #[allow(dead_code)]
+    /// The unix second the torrent was added; reported as the queue item's
+    /// `added_at`. Not used for the seeding time goal, where it is the wrong
+    /// clock (see `derive_can_remove`).
     #[serde(default)]
     time_added: Option<i64>,
     /// `tdef.atp.completed_time` — the unix second at which the payload
@@ -407,25 +405,18 @@ struct UpdateDownloadRequest {
 // Errors
 // ---------------------------------------------------------------------------
 
-fn plugin_error(code: PluginErrorCode, public_message: impl Into<String>) -> PluginError {
-    PluginError {
-        code,
-        public_message: public_message.into(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+fn typed_error(code: impl Into<PluginErrorCode>, public_message: impl Into<String>) -> PluginError {
+    plugin_error(code, public_message).build()
 }
 
 fn detailed_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: impl Into<String>,
     debug_message: impl Into<String>,
 ) -> PluginError {
-    PluginError {
-        debug_message: Some(debug_message.into()),
-        ..plugin_error(code, public_message)
-    }
+    plugin_error(code, public_message)
+        .debug(debug_message.into())
+        .build()
 }
 
 fn respond<T: Serialize>(result: Result<T, PluginError>) -> FnResult<String> {
@@ -493,23 +484,22 @@ fn classify_http_status(response: &TriblerHttpResponse) -> Option<PluginError> {
     match status {
         200..=299 => None,
         300..=399 => Some(detailed_error(
-            PluginErrorCode::InvalidConfig,
+            codes::ENDPOINT_NOT_FOUND,
+            "Tribler's REST API redirected the request; check host, port and URL base.",
             match response.location.as_deref().map(str::trim) {
-                Some(location) if !location.is_empty() => format!(
-                    "Tribler's REST API redirected to {location}; check host, port and URL base."
-                ),
-                _ => "Tribler's REST API redirected the request; check host, port and URL base."
-                    .to_string(),
+                Some(location) if !location.is_empty() => {
+                    format!("redirected to {location}: {}", error_detail(body))
+                }
+                _ => error_detail(body),
             },
-            error_detail(body),
         )),
         401 | 403 => Some(detailed_error(
-            PluginErrorCode::AuthFailed,
+            codes::INVALID_API_KEY,
             "Tribler rejected the API key.",
             error_detail(body),
         )),
         404 => Some(detailed_error(
-            PluginErrorCode::InvalidConfig,
+            codes::ENDPOINT_NOT_FOUND,
             "No Tribler REST API was found at this address; check host, port and URL base.",
             error_detail(body),
         )),
@@ -518,8 +508,23 @@ fn classify_http_status(response: &TriblerHttpResponse) -> Option<PluginError> {
             "Tribler rejected the request as invalid.",
             error_detail(body),
         )),
+        429 => {
+            let mut error = plugin_error(
+                PluginErrorCode::RateLimited,
+                "Tribler is rate limiting requests.",
+            )
+            .debug(error_detail(body));
+            if let Some(seconds) = response
+                .retry_after
+                .as_deref()
+                .and_then(|value| value.trim().parse::<i64>().ok())
+            {
+                error = error.retry_after_seconds(seconds);
+            }
+            Some(error.build())
+        }
         500..=599 => Some(detailed_error(
-            PluginErrorCode::Temporary,
+            PluginErrorCode::UpstreamUnavailable,
             format!("Tribler returned HTTP {status}."),
             error_detail(body),
         )),
@@ -531,34 +536,31 @@ fn classify_http_status(response: &TriblerHttpResponse) -> Option<PluginError> {
     }
 }
 
+/// An add Tribler refused: its 400 here is a torrent or URI it would not take.
+fn classify_add_status(response: &TriblerHttpResponse) -> Option<PluginError> {
+    if response.status == 400 {
+        return Some(detailed_error(
+            codes::DOWNLOAD_REJECTED,
+            "Tribler refused to add the torrent.",
+            error_detail(&response.body),
+        ));
+    }
+    classify_http_status(response)
+}
+
 /// The host hands transport failures back as a string, so classification is by
 /// substring. This is the closest this surface gets to the exception Sonarr
 /// turns into its `Host` "Unable to connect" validation failure.
-fn classify_transport_error(detail: &str) -> PluginError {
-    let lowered = detail.to_ascii_lowercase();
-    if lowered.contains("timeout") || lowered.contains("timed out") {
-        detailed_error(
-            PluginErrorCode::Temporary,
-            "Tribler did not answer in time.",
-            detail,
-        )
-    } else if lowered.contains("certificate")
-        || lowered.contains("tls")
-        || lowered.contains("ssl")
-        || lowered.contains("trust")
-    {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to connect to Tribler: certificate validation failed.",
-            detail,
-        )
+fn classify_transport_error(error: &Error) -> PluginError {
+    let mut classified = scryer_plugin_pdk::error::plugin_error_from(error);
+    classified.public_message = if classified.code == PluginErrorCode::from(codes::TLS_ERROR) {
+        "Unable to connect to Tribler: certificate validation failed.".to_string()
+    } else if classified.code == PluginErrorCode::UpstreamUnavailable {
+        "Unable to connect to Tribler, please check your settings.".to_string()
     } else {
-        detailed_error(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to connect to Tribler, please check your settings.",
-            detail,
-        )
-    }
+        "Tribler did not answer in time.".to_string()
+    };
+    classified
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +575,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "tribler".to_string(),
             provider_aliases: vec![],
@@ -593,6 +596,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             ],
             isolation_modes: vec![DownloadIsolationMode::Directory],
             capabilities: DownloadClientCapabilities {
+                // Tribler only downloads torrents.
+                http: None,
                 // `PATCH /downloads/{infohash}` with `{"state": "stop"}` /
                 // `{"state": "resume"}` — present in every Tribler this plugin
                 // supports (`downloads_endpoint.py::update_download`, `v7.14.0`
@@ -756,7 +761,7 @@ fn add(input: &str) -> Result<PluginDownloadClientAddResponse, PluginError> {
     // (`downloads_endpoint.py::create_dconfig_from_params`). Refuse before the
     // round trip so the message names the cause.
     if anon_hops > 0 && !safe_seeding {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::InvalidConfig,
             "Tribler refuses an anonymous download with safe seeding off: enable Safe Seeding or set Anonymity Level to 0.",
         ));
@@ -787,7 +792,7 @@ fn add(input: &str) -> Result<PluginDownloadClientAddResponse, PluginError> {
     {
         add_uri(&config, uri, destination, safe_seeding, anon_hops)?
     } else {
-        return Err(plugin_error(
+        return Err(typed_error(
             PluginErrorCode::Permanent,
             "Tribler needs a magnet link, a torrent URL or torrent file contents to start a download.",
         ));
@@ -823,7 +828,18 @@ fn add_uri(
         anon_hops,
     })
     .map_err(encoding_error)?;
-    request_json(config, "PUT", "/downloads", Some(body))
+    let payload = serde_json::to_vec(&body).map_err(encoding_error)?;
+    let response = send(
+        config,
+        "PUT",
+        "/downloads",
+        Some(payload),
+        "application/json",
+    )?;
+    if let Some(error) = classify_add_status(&response) {
+        return Err(error);
+    }
+    parse_json(&response.body)
 }
 
 /// `PUT /downloads` with the raw torrent as the body.
@@ -856,7 +872,7 @@ fn add_torrent_bytes(
         Some(bytes),
         "applications/x-bittorrent",
     )?;
-    if let Some(error) = classify_http_status(&response) {
+    if let Some(error) = classify_add_status(&response) {
         return Err(error);
     }
     parse_json(&response.body)
@@ -933,7 +949,7 @@ fn control(input: &str) -> Result<(), PluginError> {
             request_ignoring_missing(&config, "PATCH", &format!("/downloads/{hash}"), Some(body))?;
         }
         DownloadControlAction::ForceStart => {
-            return Err(plugin_error(
+            return Err(typed_error(
                 PluginErrorCode::Unsupported,
                 "Tribler has no force-start control.",
             ));
@@ -1180,6 +1196,8 @@ fn torrent_to_item(
         removed: Some(false),
         raw_state: download.status,
         completed_at,
+        added_at: download.time_added.and_then(unix_to_rfc3339),
+        http: None,
     })
 }
 
@@ -1213,6 +1231,7 @@ fn torrent_to_completed(
         completed_at,
         parameters: Vec::new(),
         release_name: None,
+        subtitle_paths: Vec::new(),
     })
 }
 
@@ -1378,6 +1397,7 @@ struct TriblerHttpResponse {
     status: u16,
     body: String,
     location: Option<String>,
+    retry_after: Option<String>,
 }
 
 fn user_agent() -> String {
@@ -1406,11 +1426,12 @@ fn send(
     .with_header("X-Api-Key", &config.api_key)
     .with_header("User-Agent", user_agent());
     let response = http::request::<Vec<u8>>(&request, body)
-        .map_err(|error| classify_transport_error(&error.to_string()))?;
+        .map_err(|error| classify_transport_error(&error))?;
     Ok(TriblerHttpResponse {
         status: response.status_code(),
         body: String::from_utf8_lossy(&response.body()).to_string(),
         location: response.header("Location").map(str::to_string),
+        retry_after: response.header("Retry-After").map(str::to_string),
     })
 }
 
@@ -1464,8 +1485,15 @@ fn request_ignoring_missing(
 
 fn parse_json<T: DeserializeOwned>(body: &str) -> Result<T, PluginError> {
     serde_json::from_str(body).map_err(|error| {
+        // An HTML page where the REST API should answer is a proxy or web UI
+        // at this address, not Tribler's API.
+        let code = if body.trim_start().starts_with('<') {
+            codes::ENDPOINT_NOT_FOUND
+        } else {
+            codes::INVALID_RESPONSE
+        };
         detailed_error(
-            PluginErrorCode::Temporary,
+            code,
             "Tribler returned a response Scryer could not read.",
             format!("{error}: {}", truncate(body)),
         )
@@ -2356,6 +2384,7 @@ mod tests {
             status,
             body: body.to_string(),
             location: None,
+            retry_after: None,
         }
     }
 
@@ -2371,7 +2400,10 @@ mod tests {
             r#"{"error":{"handled":true,"message":"Unauthorized access"}}"#,
         ))
         .expect("401 is an error");
-        assert_eq!(unauthorized.code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            unauthorized.code,
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
         assert_eq!(
             unauthorized.debug_message.as_deref(),
             Some("Unauthorized access")
@@ -2379,7 +2411,7 @@ mod tests {
 
         assert_eq!(
             classify_http_status(&response(404, "{}")).unwrap().code,
-            PluginErrorCode::InvalidConfig
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
         );
         assert_eq!(
             classify_http_status(&response(
@@ -2392,33 +2424,80 @@ mod tests {
         );
         assert_eq!(
             classify_http_status(&response(503, "busy")).unwrap().code,
-            PluginErrorCode::Temporary
+            PluginErrorCode::UpstreamUnavailable
         );
 
         let redirected = TriblerHttpResponse {
             status: 302,
             body: String::new(),
             location: Some("/login".to_string()),
+            retry_after: None,
         };
         let error = classify_http_status(&redirected).expect("302 is an error");
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
-        assert!(error.public_message.contains("/login"));
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
+        assert!(!error.public_message.contains("/login"));
+        assert!(error.debug_message.as_deref().unwrap().contains("/login"));
+
+        let limited = classify_http_status(&TriblerHttpResponse {
+            status: 429,
+            body: String::new(),
+            location: None,
+            retry_after: Some("45".to_string()),
+        })
+        .expect("429 is an error");
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(45));
+
+        assert_eq!(
+            classify_add_status(&response(
+                400,
+                r#"{"error":{"handled":true,"message":"invalid torrent"}}"#
+            ))
+            .unwrap()
+            .code,
+            PluginErrorCode::from(codes::DOWNLOAD_REJECTED)
+        );
+    }
+
+    #[test]
+    fn unreadable_bodies_are_invalid_responses_and_html_is_the_wrong_endpoint() {
+        assert_eq!(
+            parse_json::<serde_json::Value>("{not json")
+                .unwrap_err()
+                .code,
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
+        assert_eq!(
+            parse_json::<serde_json::Value>("<!doctype html><html></html>")
+                .unwrap_err()
+                .code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
     }
 
     #[test]
     fn transport_failures_are_classified_by_kind() {
         assert_eq!(
-            classify_transport_error("operation timed out").code,
+            classify_transport_error(&host_failure("request timeout")).code,
             PluginErrorCode::Temporary
         );
         assert_eq!(
-            classify_transport_error("invalid peer certificate").code,
-            PluginErrorCode::UpstreamUnavailable
+            classify_transport_error(&host_failure("tls: invalid peer certificate")).code,
+            PluginErrorCode::from(codes::TLS_ERROR)
         );
         assert_eq!(
-            classify_transport_error("connection refused").code,
+            classify_transport_error(&host_failure("dns error: connection refused")).code,
             PluginErrorCode::UpstreamUnavailable
         );
+    }
+
+    fn host_failure(detail: &str) -> Error {
+        scryer_plugin_pdk::host::HostCallError::Service(
+            plugin_error(PluginErrorCode::Temporary, "request failed")
+                .debug(detail)
+                .build(),
+        )
+        .into()
     }
 
     #[test]

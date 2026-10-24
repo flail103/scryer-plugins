@@ -306,6 +306,7 @@ mod tests {
             sdk_version: scryer_plugin_sdk::SDK_VERSION.to_string(),
             sdk_constraint: scryer_plugin_sdk::current_sdk_constraint(),
             socket_permissions: vec![],
+            settings: vec![],
             provider: scryer_plugin_sdk::ProviderDescriptor::Notification(
                 scryer_plugin_sdk::NotificationDescriptor {
                     provider_type: "test".to_string(),

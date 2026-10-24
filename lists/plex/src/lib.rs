@@ -24,8 +24,8 @@
 //! undocumented GraphQL service that returns titles without ids.
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, missing_param, permanent, plugin_error, unavailable,
-    unsupported_source,
+    Access, auth_failed, check_status, invalid_config, invalid_response, missing_param, permanent,
+    plugin_error, unavailable, unsupported_source, with_debug,
 };
 use list_provider_common::feed::parse_feed;
 use list_provider_common::http::{
@@ -35,6 +35,7 @@ use list_provider_common::ids::{
     Ids, build_item, dedupe_and_rank, json_text, json_year, year_from_date,
 };
 use list_provider_common::page::single_page;
+use scryer_plugin_pdk::error::codes;
 use scryer_plugin_pdk::runtime;
 use scryer_plugin_sdk::command::{PluginListCommand, PluginListCommandResult};
 use scryer_plugin_sdk::host::{PluginHttpRequest, PluginHttpResponse};
@@ -98,6 +99,7 @@ pub fn descriptor() -> PluginDescriptor {
         sdk_version: scryer_plugin_sdk::SDK_VERSION.to_string(),
         sdk_constraint: scryer_plugin_sdk::current_sdk_constraint(),
         socket_permissions: Vec::new(),
+        settings: Vec::new(),
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: Vec::new(),
@@ -125,6 +127,7 @@ pub fn descriptor() -> PluginDescriptor {
                 byo_app: false,
                 scopes: Vec::new(),
             },
+            member_key: None,
             groups: vec![
                 ListProviderGroup {
                     label: "Watchlist".to_string(),
@@ -237,10 +240,9 @@ fn feed_url(request: &ListPluginFetchRequest) -> Result<String, PluginError> {
         .ok_or_else(|| missing_param(PARAM_URL))?;
     let path = url.strip_prefix(FEED_PREFIX).unwrap_or_default();
     if path.is_empty() || path.contains(['?', '#', '@']) {
-        return Err(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            "the Plex watchlist feed must be an https://rss.plex.tv/ address",
-        ));
+        return Err(invalid_config(format!(
+            "list parameter {PARAM_URL} must be an https://rss.plex.tv/ address"
+        )));
     }
     Ok(url.to_string())
 }
@@ -327,18 +329,21 @@ fn member_get(url: String, token: &str) -> PluginHttpRequest {
 /// Plex answers a token it no longer accepts with 401 (or 403), which marks
 /// the linked account expired. A 404 means the service moved, not that the
 /// member's watchlist is gone, so it stays a plain failure.
+///
+/// A refused token stays `auth_failed` rather than `invalid_api_key`: the host
+/// expires the linked account and asks for a reconnect only on that
+/// well-known code.
 fn check_member_status(response: &PluginHttpResponse, what: &str) -> Result<(), PluginError> {
-    match response.status {
-        401 | 403 => Err(auth_failed(format!(
-            "Plex no longer accepts the linked account (HTTP {})",
-            response.status
-        ))),
-        404 | 410 => Err(permanent(format!(
-            "Plex no longer serves the {what} at this address (HTTP {})",
-            response.status
-        ))),
-        _ => check_status(response, Access::ServerKey, what),
-    }
+    let status = response.status;
+    let error = match status {
+        401 | 403 => auth_failed("Plex no longer accepts the linked account"),
+        404 | 410 => plugin_error(
+            codes::ENDPOINT_NOT_FOUND,
+            format!("Plex no longer serves the {what} at this address"),
+        ),
+        _ => return check_status(response, Access::ServerKey, what),
+    };
+    Err(with_debug(error, format_args!("{what}: HTTP {status}")))
 }
 
 /// The member watchlist's cursor: the request number, then the container
@@ -375,7 +380,7 @@ async fn fetch_watchlist<H: ListHttp>(
     let body = json_body(&response)?;
     let container = body
         .get("MediaContainer")
-        .ok_or_else(|| permanent("the Plex watchlist response has no MediaContainer"))?;
+        .ok_or_else(|| invalid_response("the Plex watchlist response has no MediaContainer"))?;
     let entries = container
         .get("Metadata")
         .and_then(Value::as_array)
@@ -540,10 +545,10 @@ pub async fn account<H: ListHttp>(
     let user = body
         .get("user")
         .filter(|user| user.is_object())
-        .ok_or_else(|| permanent("the Plex account response has no user"))?;
+        .ok_or_else(|| invalid_response("the Plex account response has no user"))?;
     let external_user_id = json_text(user.get("id"))
         .or_else(|| json_text(user.get("uuid")))
-        .ok_or_else(|| permanent("the Plex account response has no user id"))?;
+        .ok_or_else(|| invalid_response("the Plex account response has no user id"))?;
     let display_name = json_text(user.get("title"));
     let username = json_text(user.get("username"))
         .or_else(|| display_name.clone())

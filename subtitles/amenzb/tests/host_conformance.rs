@@ -122,6 +122,35 @@ fn amenzb_search_ladder_moves_from_tvdb_to_anidb_on_an_empty_rung() {
     assert_eq!(pair(&anidb, "q"), None);
 }
 
+/// A rejected API key reaches Scryer as `invalid_api_key`, classified by the
+/// shared newznab engine from the indexer's own error document, with the
+/// indexer's wording kept out of the operator-facing sentence.
+#[test]
+fn a_rejected_api_key_is_reported_as_invalid_api_key() {
+    let suite = suite();
+    let rejection = r#"<?xml version="1.0" encoding="UTF-8"?><error code="100" description="Incorrect user credentials"/>"#;
+    let script = suite.script_with_routes(vec![HttpRoute::contains(
+        API_ENDPOINT,
+        HttpReply::new(200, rejection.as_bytes().to_vec()),
+    )]);
+    let (mut store, plugin) = instantiate(&suite.wasm_path(), script);
+
+    let result = call_subtitle(
+        &mut store,
+        &plugin,
+        PluginSubtitleCommand::Search(search_request()),
+    );
+    let PluginSubtitleCommandResult::Search(PluginResult::Err(error)) = result else {
+        panic!("a rejected key must be a typed search error: {result:?}");
+    };
+    assert_eq!(error.code, PluginErrorCode::from("invalid_api_key"));
+    assert!(
+        !error.public_message.contains("Incorrect user credentials"),
+        "{error:?}"
+    );
+    assert!(!error.public_message.contains(TEST_API_KEY), "{error:?}");
+}
+
 fn query_pairs(url: &str) -> Vec<(String, String)> {
     url::Url::parse(url)
         .expect("search url parses")

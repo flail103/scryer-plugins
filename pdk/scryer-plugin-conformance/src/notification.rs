@@ -521,13 +521,20 @@ impl NotificationConformance {
         script.clone()
     }
 
-    /// An upstream rejection is not a plugin failure: the channel reports an
-    /// unsuccessful delivery with the provider's own status, and the operator
-    /// sees what the provider said. That behaviour predates the migration and
-    /// must survive it.
+    /// An upstream 5xx is reported, never swallowed and never a trap. Two
+    /// answers are accepted:
+    ///
+    /// * the older in-band shape: an unsuccessful delivery carrying the
+    ///   provider's own status, which is what a channel with several targets
+    ///   still sends so one failing target does not hide the others;
+    /// * a typed `PluginError` with code `UpstreamUnavailable`, which is what
+    ///   `HttpResponse::error_for_status` and the PDK fallback map a 5xx to.
+    ///   Its public sentence must not repeat the provider's body: that text
+    ///   belongs in the debug message.
     pub fn assert_an_upstream_failure_is_a_reported_delivery_failure(&self) {
+        const UPSTREAM_BODY: &str = "upstream exploded";
         let script = Script {
-            http: HttpScript::status(500, b"upstream exploded".to_vec()),
+            http: HttpScript::status(500, UPSTREAM_BODY.as_bytes().to_vec()),
             ..self.script()
         };
         let (mut store, plugin) = instantiate(&self.wasm_path(), script);
@@ -536,10 +543,7 @@ impl NotificationConformance {
             &plugin,
             PluginNotificationCommand::Send(test_request(self.event_type)),
         );
-        let PluginNotificationCommandResult::Send(PluginResult::Ok(response)) = result else {
-            panic!("an upstream failure must stay in-band: {result:?}");
-        };
-        assert!(!response.success, "a 500 cannot be a successful delivery");
+        assert_upstream_failure_reported(&result, UPSTREAM_BODY);
     }
 
     /// Capability availability is in-band. A Scryer whose HTTP egress refuses
@@ -638,5 +642,110 @@ impl NotificationConformance {
             outcome.is_err(),
             "a download-client command must not produce a notification response"
         );
+    }
+}
+
+/// The acceptance rule behind
+/// [`NotificationConformance::assert_an_upstream_failure_is_a_reported_delivery_failure`],
+/// on its own so it can be tested without building a plugin.
+pub fn assert_upstream_failure_reported(
+    result: &PluginNotificationCommandResult,
+    upstream_body: &str,
+) {
+    match result {
+        PluginNotificationCommandResult::Send(PluginResult::Ok(response)) => {
+            assert!(
+                !response.success,
+                "a 500 cannot be a successful delivery: {response:?}"
+            );
+        }
+        PluginNotificationCommandResult::Send(PluginResult::Err(error)) => {
+            assert_eq!(
+                error.code,
+                PluginErrorCode::UpstreamUnavailable,
+                "a typed answer to a 5xx must be UpstreamUnavailable: {error:?}"
+            );
+            assert!(
+                !error.public_message.contains(upstream_body),
+                "the provider's text belongs in the debug message, not the public one: {error:?}"
+            );
+        }
+        other => panic!("send answered another operation: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use scryer_plugin_sdk::{PluginError, PluginNotificationResponse};
+
+    use super::*;
+
+    fn failed_delivery() -> PluginNotificationCommandResult {
+        PluginNotificationCommandResult::Send(PluginResult::Ok(PluginNotificationResponse {
+            success: false,
+            error: Some("HTTP 500: upstream exploded".to_string()),
+            delivery_id: None,
+            provider_status: Some("http_500".to_string()),
+            retry_after_seconds: None,
+            warnings: Vec::new(),
+            target_results: Vec::new(),
+        }))
+    }
+
+    fn typed(code: PluginErrorCode, public_message: &str) -> PluginNotificationCommandResult {
+        PluginNotificationCommandResult::Send(PluginResult::Err(PluginError {
+            code,
+            public_message: public_message.to_string(),
+            debug_message: Some("HTTP 500: upstream exploded".to_string()),
+            retry_after_seconds: None,
+            details: None,
+        }))
+    }
+
+    #[test]
+    fn an_in_band_failed_delivery_is_accepted() {
+        assert_upstream_failure_reported(&failed_delivery(), "upstream exploded");
+    }
+
+    #[test]
+    fn a_typed_upstream_unavailable_error_is_accepted() {
+        assert_upstream_failure_reported(
+            &typed(
+                PluginErrorCode::UpstreamUnavailable,
+                "the service answered with a server error",
+            ),
+            "upstream exploded",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "UpstreamUnavailable")]
+    fn a_typed_error_with_another_code_is_refused() {
+        assert_upstream_failure_reported(
+            &typed(PluginErrorCode::Temporary, "the request failed"),
+            "upstream exploded",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "debug message")]
+    fn a_typed_error_repeating_the_upstream_body_is_refused() {
+        assert_upstream_failure_reported(
+            &typed(
+                PluginErrorCode::UpstreamUnavailable,
+                "HTTP 500: upstream exploded",
+            ),
+            "upstream exploded",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "successful delivery")]
+    fn a_successful_delivery_is_refused() {
+        let mut result = failed_delivery();
+        if let PluginNotificationCommandResult::Send(PluginResult::Ok(response)) = &mut result {
+            response.success = true;
+        }
+        assert_upstream_failure_reported(&result, "upstream exploded");
     }
 }

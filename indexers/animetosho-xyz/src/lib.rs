@@ -35,9 +35,12 @@ impl DownloadMode {
         {
             "nzb" | "usenet" => Ok(Self::Nzb),
             "torrent" | "torznab" => Ok(Self::Torrent),
-            other => Err(Error::msg(format!(
-                "invalid download_mode '{other}', expected 'nzb' or 'torrent'"
-            ))),
+            other => plugin_error(
+                PluginErrorCode::InvalidConfig,
+                "the download_mode setting must be nzb or torrent",
+            )
+            .debug(format!("download_mode was '{other}'"))
+            .err(),
         }
     }
 
@@ -90,6 +93,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Generic,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 supported_ids: HashMap::from([("anime".to_string(), vec!["anidb_id".to_string()])]),
                 deduplicates_aliases: false,
                 season_param: Some("season".into()),
@@ -315,9 +321,21 @@ async fn execute_anidb_search(
 
     for page in 1..=MAX_PAGES {
         let url = native_search_url(config, anidb_id, query.as_deref(), page);
-        let (_, body) = polite_http_get(&url, "application/json", &config.http_behavior).await?;
-        let items = serde_json::from_str::<Vec<serde_json::Value>>(&body)
-            .map_err(|error| Error::msg(format!("invalid AnimeTosho JSON response: {error}")))?;
+        let (status, body) =
+            polite_http_get(&url, "application/json", &config.http_behavior).await?;
+        if status == 404 {
+            return plugin_error(
+                codes::ENDPOINT_NOT_FOUND,
+                "the AnimeTosho search endpoint was not found",
+            )
+            .debug(format!("HTTP {status}"))
+            .err();
+        }
+        check_http_status(status, None)?;
+        let items = serde_json::from_str::<Vec<serde_json::Value>>(&body).or_plugin_error(
+            codes::INVALID_RESPONSE,
+            "AnimeTosho returned a response that could not be read",
+        )?;
         let page_len = items.len();
 
         for item in &items {
@@ -349,12 +367,24 @@ async fn execute_anidb_search(
 fn anidb_id(req: &SearchRequest) -> Result<u64, Error> {
     req.ids
         .get("anidb_id")
-        .ok_or_else(|| Error::msg("anidb_id is required for AniDB search"))?
+        .ok_or_else(|| {
+            plugin_error(
+                PluginErrorCode::Permanent,
+                "an AniDB search needs an anidb_id",
+            )
+            .into_error()
+        })?
         .trim()
         .parse::<u64>()
         .ok()
         .filter(|value| *value > 0)
-        .ok_or_else(|| Error::msg("anidb_id must be a positive integer"))
+        .ok_or_else(|| {
+            plugin_error(
+                PluginErrorCode::Permanent,
+                "the anidb_id must be a positive integer",
+            )
+            .into_error()
+        })
 }
 
 fn native_episode_query(req: &SearchRequest) -> Option<String> {
@@ -574,7 +604,14 @@ fn annotate_response(response: &mut SearchResponse, mode: DownloadMode) {
 
 fn config_string(key: &str) -> Result<Option<String>, Error> {
     Ok(config::get(key)
-        .map_err(|error| Error::msg(format!("failed to read config {key}: {error}")))?
+        .map_err(|error| {
+            plugin_error(
+                PluginErrorCode::InvalidConfig,
+                format!("the {key} setting could not be read"),
+            )
+            .debug(error)
+            .into_error()
+        })?
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty()))
 }
@@ -924,7 +961,7 @@ mod tests {
             ..SearchRequest::default()
         };
         let error = anidb_id(&request).expect_err("invalid AniDB IDs must not become searches");
-        assert_eq!(error.to_string(), "anidb_id must be a positive integer");
+        assert_eq!(error.to_string(), "the anidb_id must be a positive integer");
     }
 
     #[test]
@@ -1078,5 +1115,193 @@ mod legacy_result_tests {
             assert_eq!(config.base_url, "http://feed.animetosho.net:8080/proxy");
             assert_eq!(config.api_path, mode.api_path());
         }
+    }
+
+    /// A host that answers every HTTP request on this thread with one canned
+    /// response, so a handler runs end to end without a network.
+    mod canned_host {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        use scryer_plugin_pdk::runtime::{
+            HostError, HostRuntime, PluginHttpFieldsResponse, PluginHttpRequest,
+            install_host_runtime,
+        };
+
+        #[derive(Default)]
+        struct Canned {
+            active: bool,
+            config: HashMap<String, String>,
+            status: u16,
+            body: String,
+            /// Monotonic time; a sleep advances it by exactly its duration.
+            now_ms: u64,
+        }
+
+        thread_local! {
+            static CANNED: RefCell<Canned> = RefCell::new(Canned::default());
+        }
+
+        struct CannedHost;
+
+        static HOST: CannedHost = CannedHost;
+
+        impl HostRuntime for CannedHost {
+            fn http_fields(
+                &self,
+                _request: PluginHttpRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<PluginHttpFieldsResponse, HostError>> + '_>>
+            {
+                Box::pin(async move {
+                    CANNED.with(|canned| {
+                        let canned = canned.borrow();
+                        if !canned.active {
+                            return Err(HostError::Transport);
+                        }
+                        Ok(PluginHttpFieldsResponse {
+                            status: canned.status,
+                            headers: Vec::new(),
+                            body: canned.body.clone().into_bytes(),
+                        })
+                    })
+                })
+            }
+
+            fn sleep(&self, duration_ms: u64) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+                CANNED.with(|canned| {
+                    let mut canned = canned.borrow_mut();
+                    canned.now_ms = canned.now_ms.saturating_add(duration_ms);
+                });
+                Box::pin(async {})
+            }
+
+            fn monotonic_now_ms(&self) -> u64 {
+                CANNED.with(|canned| canned.borrow().now_ms)
+            }
+
+            fn operation_deadline_monotonic_ms(&self) -> u64 {
+                u64::MAX
+            }
+
+            fn wall_now_ms(&self) -> u64 {
+                0
+            }
+
+            fn config_get(&self, key: &str) -> Option<String> {
+                CANNED.with(|canned| canned.borrow().config.get(key).cloned())
+            }
+
+            fn provider_profile_bytes(&self) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_get(&self, _key: &str) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_cas(
+                &self,
+                _key: &str,
+                _expected: Option<&[u8]>,
+                _replacement: Option<&[u8]>,
+            ) -> bool {
+                true
+            }
+
+            fn log(&self, _level: scryer_plugin_pdk::log::LogLevel, _message: &str) {}
+        }
+
+        /// Answer every request on this thread with `status` and `body`, and
+        /// serve `config` as the instance settings.
+        pub fn answer(config: &[(&str, &str)], status: u16, body: &str) {
+            install_host_runtime(&HOST);
+            CANNED.with(|canned| {
+                *canned.borrow_mut() = Canned {
+                    active: true,
+                    config: config
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                    status,
+                    body: body.to_string(),
+                    now_ms: 1_000_000,
+                }
+            });
+        }
+
+        /// Drive `future` to completion; the canned host never suspends.
+        pub fn run<T>(future: impl Future<Output = T>) -> T {
+            let mut future = std::pin::pin!(future);
+            match future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                Poll::Ready(output) => output,
+                Poll::Pending => panic!("the canned host never suspends"),
+            }
+        }
+    }
+
+    fn synthetic_config(mode: DownloadMode) -> NewznabConfig {
+        animetosho_config_from(mode, |key| {
+            Ok(match key {
+                "base_url" => Some("https://feed.example.invalid".to_string()),
+                "api_key" => Some("synthetic-key".to_string()),
+                _ => None,
+            })
+        })
+        .expect("synthetic config")
+    }
+
+    #[test]
+    fn a_rejected_api_key_reaches_the_host_as_invalid_api_key() {
+        canned_host::answer(
+            &[],
+            200,
+            r#"<?xml version="1.0" encoding="UTF-8"?><error code="100" description="Invalid API Key"/>"#,
+        );
+        let mode = DownloadMode::Nzb;
+        let config = synthetic_config(mode);
+        let request = SearchRequest {
+            query: "Synthetic Title".to_string(),
+            ..SearchRequest::default()
+        };
+
+        let error = canned_host::run(execute_full_search(&config, &request, mode.extractor()))
+            .expect_err("the key is rejected");
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+        assert!(!error.public_message.contains("Invalid API Key"));
+    }
+
+    #[test]
+    fn an_unreadable_anidb_answer_is_invalid_response() {
+        canned_host::answer(&[], 200, "<html>not json</html>");
+        let mode = DownloadMode::Nzb;
+        let config = synthetic_config(mode);
+        let mut request = SearchRequest::default();
+        request.ids.insert("anidb_id".to_string(), "42".to_string());
+
+        let error = canned_host::run(execute_anidb_search(&config, &request, mode))
+            .expect_err("the body is not JSON");
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
+    }
+
+    #[test]
+    fn a_missing_anidb_endpoint_is_endpoint_not_found() {
+        canned_host::answer(&[], 404, "");
+        let mode = DownloadMode::Torrent;
+        let config = synthetic_config(mode);
+        let mut request = SearchRequest::default();
+        request.ids.insert("anidb_id".to_string(), "42".to_string());
+
+        let error = canned_host::run(execute_anidb_search(&config, &request, mode))
+            .expect_err("the endpoint is missing");
+        let error = scryer_plugin_pdk::error::plugin_error_from(&error);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
     }
 }

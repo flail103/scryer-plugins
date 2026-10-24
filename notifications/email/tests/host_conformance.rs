@@ -425,13 +425,10 @@ impl HostResponder for SmtpResponder {
 /// `Unsupported`, and carrying the socket layer's own message.
 fn permission_denied() -> PluginError {
     let message = format!("socket to {SMTP_HOST}:{SMTP_PORT} is not permitted by this plugin");
-    PluginError {
-        code: PluginErrorCode::Permanent,
-        public_message: message.clone(),
-        debug_message: Some(message),
-        retry_after_seconds: Some(0),
-        details: None,
-    }
+    scryer_plugin_pdk::plugin_error(PluginErrorCode::Permanent, message.clone())
+        .debug(message)
+        .retry_after_seconds(0)
+        .build()
 }
 
 // ---------------------------------------------------------------------------

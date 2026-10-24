@@ -43,9 +43,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use scryer_plugin_pdk::sdk::command::{PluginSubtitleCommand, PluginSubtitleCommandResult};
 use scryer_plugin_pdk::{
-    HttpRequest, PluginArchiveExtractRequest, config,
+    HttpRequest, PluginArchiveExtractRequest, codes, config,
     host::{HostCallError, archive_extract},
-    http, var,
+    http, plugin_error, var,
 };
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
@@ -117,36 +117,28 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         // `SubtitleCapabilities::mode` and never routes a generate here, so
         // this arm answers in-band rather than trapping.
         PluginSubtitleCommand::Generate(_) => {
-            PluginSubtitleCommandResult::Generate(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "Tsukihime is a catalog subtitle provider and cannot generate \
-                                 subtitles"
-                    .to_string(),
-                debug_message: Some(
-                    "SubtitleProviderMode::Catalog advertises no generate capability".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
+            PluginSubtitleCommandResult::Generate(PluginResult::Err(
+                plugin_error(
+                    PluginErrorCode::Unsupported,
+                    "Tsukihime is a catalog subtitle provider and cannot generate subtitles",
+                )
+                .debug("SubtitleProviderMode::Catalog advertises no generate capability")
+                .build(),
+            ))
         }
         // Alignment moved into this envelope when the subtitle-sync plugin
         // migrated off the Preview 1 transport, so every subtitle provider now
         // sees the operation whether or not it can serve one. Tsukihime cannot:
         // it has no audio decoder and advertises no `sync` capability. Same
         // in-band refusal as `Generate`, for the same reason.
-        PluginSubtitleCommand::Sync(_) => {
-            PluginSubtitleCommandResult::Sync(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "Tsukihime is a catalog subtitle provider and cannot align \
-                                 subtitles"
-                    .to_string(),
-                debug_message: Some(
-                    "SubtitleCapabilities::sync is None for this provider".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
-        }
+        PluginSubtitleCommand::Sync(_) => PluginSubtitleCommandResult::Sync(PluginResult::Err(
+            plugin_error(
+                PluginErrorCode::Unsupported,
+                "Tsukihime is a catalog subtitle provider and cannot align subtitles",
+            )
+            .debug("SubtitleCapabilities::sync is None for this provider")
+            .build(),
+        )),
     }
 }
 
@@ -177,7 +169,7 @@ fn search(request: &SubtitlePluginSearchRequest) -> PluginResult<SubtitlePluginS
         Err(TsukihimeError::RateLimited(_)) => {
             PluginResult::Ok(SubtitlePluginSearchResponse::default())
         }
-        Err(error) => PluginResult::Err(plugin_error(error)),
+        Err(error) => PluginResult::Err(to_plugin_error(error)),
     }
 }
 
@@ -187,14 +179,14 @@ fn download(
     let reference: TsukihimeDownloadRef = match serde_json::from_str(&request.provider_file_id) {
         Ok(reference) => reference,
         Err(error) => {
-            return PluginResult::Err(plugin_error(TsukihimeError::Message(format!(
+            return PluginResult::Err(to_plugin_error(TsukihimeError::Message(format!(
                 "Tsukihime subtitle reference is not valid: {error}"
             ))));
         }
     };
     match subtitle_download_impl(&reference) {
         Ok(response) => PluginResult::Ok(response),
-        Err(error) => PluginResult::Err(plugin_error(error)),
+        Err(error) => PluginResult::Err(to_plugin_error(error)),
     }
 }
 
@@ -206,6 +198,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Subtitle(SubtitleDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec!["tsukihime.org".to_string()],
@@ -419,8 +412,19 @@ fn fetch_typed<T: for<'de> Deserialize<'de>>(
     fetch: &mut Fetch<'_>,
     path: &str,
 ) -> Result<T, TsukihimeError> {
-    serde_json::from_value(fetch(path)?)
-        .map_err(|error| TsukihimeError::Message(format!("Tsukihime JSON parse error: {error}")))
+    serde_json::from_value(fetch(path)?).map_err(|error| invalid_response(&error))
+}
+
+/// A body Tsukihime sent that is not the JSON this plugin reads.
+fn invalid_response(error: &serde_json::Error) -> TsukihimeError {
+    TsukihimeError::Plugin(
+        plugin_error(
+            codes::INVALID_RESPONSE,
+            "Tsukihime returned a response Scryer could not read.",
+        )
+        .debug(format!("Tsukihime JSON parse error: {error}"))
+        .build(),
+    )
 }
 
 /// Keep the torrents that can hold the requested episode, likeliest first.
@@ -1190,15 +1194,26 @@ fn get_json<T: for<'de> Deserialize<'de>>(
     let response = http_get(&url, "application/json")?;
     let _ = sync_rate_limit_from_headers(path, &response.headers);
     match response.status {
-        200..=299 => serde_json::from_slice(&response.body).map_err(|error| {
-            TsukihimeError::Message(format!("Tsukihime JSON parse error: {error}"))
-        }),
+        200..=299 => {
+            serde_json::from_slice(&response.body).map_err(|error| invalid_response(&error))
+        }
         404 => Err(TsukihimeError::NotFound),
         429 => {
             let retry_after = retry_after_seconds(&response.headers);
             let _ = remember_api_rate_limit(path, retry_after);
             Err(TsukihimeError::RateLimited(retry_after))
         }
+        status @ 500..=599 => Err(TsukihimeError::Plugin(
+            plugin_error(
+                PluginErrorCode::UpstreamUnavailable,
+                "Tsukihime answered with a server error.",
+            )
+            .debug(format!(
+                "Tsukihime API returned HTTP {status}: {}",
+                compact_error_body(&response.body)
+            ))
+            .build(),
+        )),
         status => Err(TsukihimeError::Message(format!(
             "Tsukihime API returned HTTP {status}: {}",
             compact_error_body(&response.body)
@@ -1211,13 +1226,35 @@ fn http_get(url: &str, accept: &str) -> Result<TsukihimeHttpResponse, TsukihimeE
         .with_method("GET")
         .with_header("Accept", accept)
         .with_header("User-Agent", DEFAULT_USER_AGENT);
-    let response = http::request::<Vec<u8>>(&request, None)
-        .map_err(|error| TsukihimeError::Message(format!("Tsukihime request failed: {error}")))?;
+    let response =
+        http::request::<Vec<u8>>(&request, None).map_err(|error| transport_error(&error))?;
     Ok(TsukihimeHttpResponse {
         status: response.status_code(),
         headers: response.headers().clone(),
         body: response.body(),
     })
+}
+
+/// A request that never got an answer. The host's own detail goes to the
+/// debug text; TLS failures keep their own code.
+fn transport_error(error: &scryer_plugin_pdk::Error) -> TsukihimeError {
+    let classified = scryer_plugin_pdk::error::plugin_error_from(error);
+    let (code, public_message) = if classified.code == PluginErrorCode::from(codes::TLS_ERROR) {
+        (
+            classified.code,
+            "A secure connection to Tsukihime could not be established.",
+        )
+    } else {
+        (
+            PluginErrorCode::UpstreamUnavailable,
+            "Tsukihime could not be reached.",
+        )
+    };
+    TsukihimeError::Plugin(
+        plugin_error(code, public_message)
+            .debug(format!("Tsukihime request failed: {error}"))
+            .build(),
+    )
 }
 
 fn validation_error_response(error: TsukihimeError) -> SubtitlePluginValidateConfigResponse {
@@ -1228,31 +1265,51 @@ fn validation_error_response(error: TsukihimeError) -> SubtitlePluginValidateCon
             SubtitleValidateConfigStatus::Unreachable
         }
         TsukihimeError::Message(_) => SubtitleValidateConfigStatus::Unsupported,
+        TsukihimeError::Plugin(ref error)
+            if error.code == PluginErrorCode::UpstreamUnavailable
+                || error.code == PluginErrorCode::from(codes::TLS_ERROR) =>
+        {
+            SubtitleValidateConfigStatus::Unreachable
+        }
         TsukihimeError::Plugin(_) => SubtitleValidateConfigStatus::Unsupported,
+    };
+    let retry_after_seconds = match error {
+        TsukihimeError::RateLimited(seconds) => seconds,
+        _ => None,
     };
     SubtitlePluginValidateConfigResponse {
         status,
-        message: Some(error.to_string()),
-        retry_after_seconds: match error {
-            TsukihimeError::RateLimited(seconds) => seconds,
-            _ => None,
-        },
+        message: Some(to_plugin_error(error).public_message),
+        retry_after_seconds,
     }
 }
 
-fn plugin_error(error: TsukihimeError) -> PluginError {
-    let (code, retry_after_seconds) = match error {
-        TsukihimeError::RateLimited(seconds) => (PluginErrorCode::RateLimited, seconds),
-        TsukihimeError::NotFound => (PluginErrorCode::UpstreamUnavailable, None),
-        TsukihimeError::Message(_) => (PluginErrorCode::Temporary, None),
-        TsukihimeError::Plugin(error) => return error,
-    };
-    PluginError {
-        code,
-        public_message: error.to_string(),
-        debug_message: None,
-        retry_after_seconds,
-        details: None,
+/// The typed error for a failure. `Message` text can carry Tsukihime's own
+/// response body, so it goes to the debug detail behind a fixed sentence.
+fn to_plugin_error(error: TsukihimeError) -> PluginError {
+    match error {
+        TsukihimeError::RateLimited(seconds) => {
+            let mut builder = plugin_error(
+                PluginErrorCode::RateLimited,
+                "Tsukihime is rate limiting requests.",
+            );
+            if let Some(seconds) = seconds {
+                builder = builder.retry_after_seconds(seconds);
+            }
+            builder.build()
+        }
+        TsukihimeError::NotFound => plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "Tsukihime resource was not found",
+        )
+        .build(),
+        TsukihimeError::Message(message) => plugin_error(
+            PluginErrorCode::Temporary,
+            "The Tsukihime request could not be completed.",
+        )
+        .debug(message)
+        .build(),
+        TsukihimeError::Plugin(error) => error,
     }
 }
 
@@ -1710,6 +1767,34 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failures_carry_their_codes_without_upstream_text() {
+        let unreadable = serde_json::from_str::<serde_json::Value>("{not json").unwrap_err();
+        let error = to_plugin_error(invalid_response(&unreadable));
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
+
+        let upstream = to_plugin_error(TsukihimeError::Message(
+            "Tsukihime API returned HTTP 418: fixture upstream text".to_string(),
+        ));
+        assert_eq!(upstream.code, PluginErrorCode::Temporary);
+        assert!(!upstream.public_message.contains("fixture upstream text"));
+        assert!(
+            upstream
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("fixture upstream text")
+        );
+
+        let limited = to_plugin_error(TsukihimeError::RateLimited(Some(20)));
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(20));
+
+        let validation = validation_error_response(TsukihimeError::RateLimited(Some(20)));
+        assert_eq!(validation.status, SubtitleValidateConfigStatus::RateLimited);
+        assert_eq!(validation.retry_after_seconds, Some(20));
+    }
 
     fn fixture_detail() -> TorrentDetail {
         serde_json::from_str(

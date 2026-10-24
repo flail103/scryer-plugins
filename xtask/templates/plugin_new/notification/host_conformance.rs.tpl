@@ -24,8 +24,9 @@
 //!   `.config("base_url", "https://{{plugin_id}}.invalid")` for whatever
 //!   settings Scryer would have resolved, and `.expects_url_prefix(...)` to pin
 //!   the endpoint it builds from them.
-//! * `UpstreamFailureIsReported` once a non-2xx answer becomes an unsuccessful
-//!   delivery rather than a plugin error.
+//! * `UpstreamFailureIsReported` once a 5xx answer becomes either an
+//!   unsuccessful delivery or a typed `UpstreamUnavailable` error (what
+//!   `error_for_status` gives you).
 //! * `RefusedHttpStaysInBand` once a host that refuses egress does too.
 //!
 //! Add `.required_setting("api_key")` when a setting is mandatory: a missing

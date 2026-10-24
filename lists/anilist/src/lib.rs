@@ -24,8 +24,8 @@
 use std::collections::BTreeSet;
 
 use list_provider_common::error::{
-    auth_failed, invalid_config, missing_param, not_found, permanent, plugin_error, rate_limited,
-    retry_after_seconds, unavailable, unsupported_source,
+    auth_failed, invalid_config, invalid_response, missing_param, not_found, permanent,
+    plugin_error, rate_limited, retry_after_seconds, unavailable, unsupported_source, with_debug,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get};
 use list_provider_common::ids::{dedupe_and_rank, json_id, json_text, json_year};
@@ -173,6 +173,7 @@ pub fn descriptor() -> PluginDescriptor {
         sdk_version: scryer_plugin_sdk::SDK_VERSION.to_string(),
         sdk_constraint: scryer_plugin_sdk::current_sdk_constraint(),
         socket_permissions: Vec::new(),
+        settings: Vec::new(),
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: Vec::new(),
@@ -199,6 +200,7 @@ pub fn descriptor() -> PluginDescriptor {
                 // AniList has no scopes: a token can do whatever its member can.
                 scopes: Vec::new(),
             },
+            member_key: None,
             groups: vec![ListProviderGroup {
                 label: "Your lists".to_string(),
                 auth_badge: ListAuthBadge::MemberAccount,
@@ -432,8 +434,23 @@ async fn graphql<H: ListHttp>(
 /// Map an AniList answer onto the host's failure classes. AniList reports
 /// most failures in the GraphQL `errors` array, sometimes alongside HTTP 200,
 /// so the array is read whatever the status. AniList's own messages are never
-/// passed on, because they can quote the request.
+/// passed on to the operator, because they can quote the request; they reach
+/// the host log only.
+///
+/// A rejected token stays `auth_failed` rather than `invalid_api_key`: the
+/// host expires the linked account and asks for a reconnect only on that
+/// well-known code.
 fn check_response(response: &PluginHttpResponse, what: &str) -> Result<Value, PluginError> {
+    classify_response(response, what).map_err(|error| {
+        if error.debug_message.is_some() {
+            error
+        } else {
+            with_debug(error, format_args!("{what}: HTTP {}", response.status))
+        }
+    })
+}
+
+fn classify_response(response: &PluginHttpResponse, what: &str) -> Result<Value, PluginError> {
     let status = response.status;
     match status {
         401 => return Err(rejected_token()),
@@ -441,17 +458,16 @@ fn check_response(response: &PluginHttpResponse, what: &str) -> Result<Value, Pl
         // AniList answers 403 while its API is switched off for maintenance.
         403 => {
             return Err(unavailable(
-                "AniList refused the request (HTTP 403); its API may be switched off",
+                "AniList refused the request; its API may be switched off",
             ));
         }
         408 | 500..=599 => {
-            return Err(unavailable(format!(
-                "AniList is unavailable (HTTP {status})"
-            )));
+            return Err(unavailable("AniList is unavailable"));
         }
         _ => {}
     }
-    let body = serde_json::from_slice::<Value>(&response.body).ok();
+    let parsed = serde_json::from_slice::<Value>(&response.body);
+    let body = parsed.as_ref().ok().cloned();
     if let Some(errors) = body
         .as_ref()
         .and_then(|body| body.get("errors"))
@@ -461,17 +477,51 @@ fn check_response(response: &PluginHttpResponse, what: &str) -> Result<Value, Pl
         return Err(graphql_error(errors, response, what));
     }
     match status {
-        200..=299 => body.ok_or_else(|| permanent("the AniList response is not valid JSON")),
-        404 | 410 => Err(not_found(format!("{what} (HTTP {status})"))),
-        _ => Err(permanent(format!(
-            "AniList answered with unexpected HTTP {status}"
-        ))),
+        200..=299 => parsed.map_err(|error| {
+            invalid_response(format_args!(
+                "{what}: HTTP {status} body is not valid JSON: {error}"
+            ))
+        }),
+        404 | 410 => Err(with_debug(
+            not_found(what),
+            format_args!("{what}: HTTP {status}"),
+        )),
+        _ => Err(permanent("AniList answered with an unexpected HTTP status")),
     }
 }
 
 /// Classify a GraphQL `errors` array by its most telling entry: a rejected
 /// token, then a rate limit, then a missing member or list, then an outage.
 fn graphql_error(errors: &[Value], response: &PluginHttpResponse, what: &str) -> PluginError {
+    let error = classify_graphql_error(errors, response, what);
+    let detail = errors
+        .iter()
+        .map(|error| {
+            format!(
+                "{} {}",
+                error
+                    .get("status")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    with_debug(
+        error,
+        format_args!("{what}: HTTP {} GraphQL errors: {detail}", response.status),
+    )
+}
+
+fn classify_graphql_error(
+    errors: &[Value],
+    response: &PluginHttpResponse,
+    what: &str,
+) -> PluginError {
     let reported: Vec<(i64, String)> = errors
         .iter()
         .map(|error| {
@@ -509,10 +559,8 @@ fn graphql_error(errors: &[Value], response: &PluginHttpResponse, what: &str) ->
     if any(&|status, _| status == 403 || status == 408 || status >= 500) {
         return unavailable("AniList could not answer the request right now");
     }
-    match reported.iter().map(|(status, _)| *status).find(|s| *s > 0) {
-        Some(status) => permanent(format!("AniList rejected the request (status {status})")),
-        None => permanent("AniList rejected the request"),
-    }
+    // The reported statuses reach the host log through the caller's debug.
+    permanent("AniList rejected the request")
 }
 
 pub async fn fetch<H: ListHttp>(
@@ -538,7 +586,7 @@ pub async fn fetch<H: ListHttp>(
     let collection = body
         .pointer("/data/MediaListCollection")
         .filter(|collection| collection.is_object())
-        .ok_or_else(|| permanent("AniList returned no list collection"))?;
+        .ok_or_else(|| invalid_response("AniList returned no list collection"))?;
     let user = collection.get("user");
     let custom_lists = custom_list_names(user);
     let groups = collection
@@ -825,9 +873,9 @@ pub async fn account<H: ListHttp>(
         .filter(|viewer| viewer.is_object())
         .ok_or_else(rejected_token)?;
     let external_user_id = json_id(viewer.get("id"))
-        .ok_or_else(|| permanent("AniList returned an account without an id"))?;
+        .ok_or_else(|| invalid_response("AniList returned an account without an id"))?;
     let username = json_text(viewer.get("name"))
-        .ok_or_else(|| permanent("AniList returned an account without a name"))?;
+        .ok_or_else(|| invalid_response("AniList returned an account without a name"))?;
     let avatar_url = viewer.get("avatar").and_then(|avatar| {
         json_text(avatar.get("large"))
             .or_else(|| json_text(avatar.get("medium")))

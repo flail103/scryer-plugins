@@ -18,11 +18,11 @@
 //! This module rebuilds the channel on Scryer's notification contract and on
 //! Pushcut's current OpenAPI document:
 //!
-//! * a rejected key is `AuthFailed` naming `api_key`, an undefined notification
-//!   is `InvalidConfig` naming `notification_name`, a payload Pushcut refuses is
-//!   `Permanent`, and a quota or server fault is a *delivery* failure carrying
-//!   `provider_status`/`retry_after_seconds` — the two lanes the notification
-//!   adapter distinguishes;
+//! * a rejected key is `invalid_api_key` naming `api_key`, an undefined
+//!   notification is `InvalidConfig` naming `notification_name`, a payload
+//!   Pushcut refuses is `Permanent`, a rate limit is `RateLimited` carrying the
+//!   provider's delay, and a server fault or a request that got no answer is
+//!   `UpstreamUnavailable`; the provider's own text goes to the debug detail;
 //! * a `Test` resolves the configured notification (and device) names against
 //!   the account through `GET /v1/notifications` and `GET /v1/devices` before it
 //!   sends, so the operator is told "there is no notification called X; the
@@ -206,6 +206,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(NotificationDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec![],
@@ -674,6 +675,7 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<(&'static str, String)> 
         | NotificationEventType::ListTitleLeft
         | NotificationEventType::ListSyncFailed
         | NotificationEventType::ListUnfollowed
+        | NotificationEventType::FileRestored
         | NotificationEventType::Test => {}
     }
     lines
@@ -1400,25 +1402,10 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
             &notification_name,
             warnings,
         ),
-        // The host answers a refused or failed egress in-band. `api.pushcut.io`
-        // is not operator-configurable, so this is the service (or Scryer's
-        // egress) being unreachable rather than a setting to fix. On a
-        // connection test that is worth a typed `UpstreamUnavailable`; on a live
-        // send it stays on the delivery lane, like every sibling channel, so a
-        // network blink is never reported as a broken channel.
-        Err(error) => {
-            let detail = format!("could not reach the Pushcut API at {API_HOST}: {error}");
-            if req.is_test {
-                return PluginResult::Err(plugin_error(
-                    PluginErrorCode::UpstreamUnavailable,
-                    detail,
-                    Some(error.to_string()),
-                ));
-            }
-            let mut failure = error_response(detail, Some("request_failed".to_string()));
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        // The send is one request, so a request that got no answer at all is
+        // the send's failure, typed from the host's transport detail
+        // (unreachable, timeout, TLS) on Test and live sends alike.
+        Err(error) => PluginResult::Err(request_failure(&error)),
     }
 }
 
@@ -1697,9 +1684,8 @@ fn classify_response(
     {
         return PluginResult::Err(plugin_error(
             PluginErrorCode::AuthFailed,
-            format!(
-                "the Pushcut account has to sign in again in the Pushcut app before it can accept notifications: {detail}"
-            ),
+            "the Pushcut account has to sign in again in the Pushcut app before it can accept notifications"
+                .to_string(),
             Some(format!("HTTP {status}: {detail}")),
         ));
     }
@@ -1710,10 +1696,12 @@ fn classify_response(
         // (`PushcutProxy.cs:88`), so its Test blames the wrong field today; both
         // statuses are handled here.
         401 | 403 => PluginResult::Err(rejected_key(&detail)),
+        // The API host is fixed, so a 404 on the send names the one path
+        // segment the operator configures: the notification.
         404 => PluginResult::Err(plugin_error(
             PluginErrorCode::InvalidConfig,
             format!(
-                "notification_name: Pushcut has no notification called {notification_name:?} ({detail}). Check the name in the Pushcut app."
+                "notification_name: Pushcut has no notification called {notification_name:?}. Check the name in the Pushcut app."
             ),
             Some(format!("HTTP 404: {detail}")),
         )),
@@ -1721,27 +1709,25 @@ fn classify_response(
         // No rate limit is published, only that one exists and that it varies by
         // subscription, so the delay comes from the response rather than from a
         // constant this plugin invented.
-        429 => {
-            let mut failure = error_response(
-                format!("Pushcut is rate limiting this account: {detail}"),
-                Some("http_429".to_string()),
-            );
-            failure.retry_after_seconds = retry_after_seconds(headers);
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
-        500..=599 => {
-            let mut failure = error_response(
-                format!("HTTP {status}: {detail}"),
-                Some(format!("http_{status}")),
-            );
-            failure.retry_after_seconds = retry_after_seconds(headers);
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        429 => PluginResult::Err(with_retry_after(
+            plugin_error(
+                PluginErrorCode::RateLimited,
+                "Pushcut is rate limiting this account".to_string(),
+                Some(format!("HTTP {status}: {detail}")),
+            ),
+            retry_after_header(headers),
+        )),
+        500..=599 => PluginResult::Err(with_retry_after(
+            plugin_error(
+                PluginErrorCode::UpstreamUnavailable,
+                "Pushcut answered with a server error".to_string(),
+                Some(format!("HTTP {status}: {detail}")),
+            ),
+            retry_after_header(headers),
+        )),
         _ => PluginResult::Err(plugin_error(
             PluginErrorCode::Permanent,
-            format!("Pushcut rejected the request (HTTP {status}): {detail}"),
+            "Pushcut refused the notification".to_string(),
             Some(format!("HTTP {status}: {detail}")),
         )),
     }
@@ -1749,10 +1735,9 @@ fn classify_response(
 
 fn rejected_key(detail: &str) -> PluginError {
     plugin_error(
-        PluginErrorCode::AuthFailed,
-        format!(
-            "api_key was rejected by Pushcut: {detail}. Check the key in the Pushcut app under Account -> API Keys."
-        ),
+        codes::INVALID_API_KEY,
+        "api_key was rejected by Pushcut. Check the key in the Pushcut app under Account -> API Keys."
+            .to_string(),
         Some(detail.to_string()),
     )
 }
@@ -1772,38 +1757,43 @@ fn bad_request(status: u16, answer: &PushcutBody, detail: &str) -> PluginError {
         if answer.mentions(needle) {
             return plugin_error(
                 PluginErrorCode::InvalidConfig,
-                format!("{setting} was rejected by Pushcut: {detail}"),
+                format!("{setting} was rejected by Pushcut"),
                 Some(debug),
             );
         }
     }
     plugin_error(
         PluginErrorCode::Permanent,
-        format!("Pushcut rejected the notification this plugin built: {detail}"),
+        "Pushcut rejected the notification this plugin built".to_string(),
         Some(debug),
     )
 }
 
-fn retry_after_seconds(headers: &BTreeMap<String, String>) -> Option<i64> {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
-        .and_then(|(_, value)| value.trim().parse::<i64>().ok())
-        .map(|seconds| seconds.max(1))
+/// The same typed error carrying the service's requested delay, if any.
+fn with_retry_after(error: PluginError, seconds: Option<i64>) -> PluginError {
+    let builder = scryer_plugin_pdk::plugin_error(error.code, error.public_message);
+    let builder = match error.debug_message {
+        Some(debug) => builder.debug(redact_secrets(&debug)),
+        None => builder,
+    };
+    match seconds {
+        Some(seconds) => builder.retry_after_seconds(seconds),
+        None => builder,
+    }
+    .build()
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let error = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
+        None => error,
     }
+    .build()
 }
 
 /// The world's single `process` entry, dispatching the SDK's notification
@@ -2592,7 +2582,7 @@ mod tests {
     /// with `{"error":"Invalid API-Key provided."}`. Sonarr only tests for 403
     /// (`PushcutProxy.cs:88`), so its Test misattributes this today.
     #[test]
-    fn a_rejected_key_is_authfailed_on_401_and_on_403() {
+    fn a_rejected_key_is_invalid_api_key_on_401_and_on_403() {
         for status in [401u16, 403] {
             let error = err_of(classify_response(
                 status,
@@ -2601,12 +2591,25 @@ mod tests {
                 "Scryer",
                 Vec::new(),
             ));
-            assert_eq!(error.code, PluginErrorCode::AuthFailed, "status {status}");
+            assert_eq!(
+                error.code.as_str(),
+                codes::INVALID_API_KEY,
+                "status {status}"
+            );
             assert!(
                 error.public_message.contains("api_key"),
                 "the operator has to be told which setting: {error:?}"
             );
-            assert!(error.public_message.contains("Invalid API-Key provided."));
+            assert!(
+                !error.public_message.contains("Invalid API-Key provided."),
+                "the provider's own text stays out of the public message: {error:?}"
+            );
+            assert!(
+                error
+                    .debug_message
+                    .as_deref()
+                    .is_some_and(|debug| debug.contains("Invalid API-Key provided."))
+            );
         }
     }
 
@@ -2670,45 +2673,41 @@ mod tests {
     }
 
     #[test]
-    fn a_rate_limit_is_a_delivery_failure_carrying_the_providers_own_delay() {
-        let response = ok_of(classify_response(
+    fn a_rate_limit_is_a_typed_error_carrying_the_providers_own_delay() {
+        let error = err_of(classify_response(
             429,
             &headers(&[("Retry-After", "90")]),
             br#"{"error":"Too many requests"}"#,
             "Scryer",
             Vec::new(),
         ));
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_429"));
-        assert_eq!(response.retry_after_seconds, Some(90));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(90));
+        assert!(!error.public_message.contains("Too many requests"));
         assert!(
-            response
-                .error
+            error
+                .debug_message
                 .expect("the provider's own text")
                 .contains("Too many requests")
         );
     }
 
     #[test]
-    fn a_server_fault_is_a_delivery_failure_not_a_configuration_error() {
-        let response = ok_of(classify_response(
+    fn a_server_fault_is_upstream_unavailable_not_a_configuration_error() {
+        let error = err_of(classify_response(
             503,
             &BTreeMap::new(),
             b"upstream exploded",
             "Scryer",
-            vec!["carried".to_string()],
+            Vec::new(),
         ));
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_503"));
-        assert_eq!(
-            response.warnings,
-            vec!["carried".to_string()],
-            "warnings raised while building the payload survive a failure"
-        );
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert!(!error.public_message.contains("upstream exploded"));
+        assert!(!error.public_message.contains("503"));
         assert!(
-            response
-                .error
-                .expect("a non-JSON body still yields a message")
+            error
+                .debug_message
+                .expect("a non-JSON body still yields a detail")
                 .contains("upstream exploded")
         );
     }
@@ -2735,22 +2734,22 @@ mod tests {
     #[test]
     fn retry_after_is_read_case_insensitively_and_floored() {
         assert_eq!(
-            retry_after_seconds(&headers(&[("retry-after", " 30 ")])),
+            retry_after_header(&headers(&[("retry-after", " 30 ")])),
             Some(30)
         );
         assert_eq!(
-            retry_after_seconds(&headers(&[("Retry-After", "0")])),
+            retry_after_header(&headers(&[("Retry-After", "0")])),
             Some(1)
         );
         assert_eq!(
-            retry_after_seconds(&headers(&[(
+            retry_after_header(&headers(&[(
                 "Retry-After",
                 "Wed, 02 Sep 2026 08:00:00 GMT"
             )])),
             None,
             "an HTTP-date delay is not seconds and is not guessed at"
         );
-        assert_eq!(retry_after_seconds(&BTreeMap::new()), None);
+        assert_eq!(retry_after_header(&BTreeMap::new()), None);
     }
 
     #[test]

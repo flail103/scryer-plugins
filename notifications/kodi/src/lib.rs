@@ -86,8 +86,9 @@
 //! The shared helper collapses every non-2xx into `error_response("HTTP N:
 //! body", "http_N")` and treats every 2xx as a delivery. Neither holds here: a
 //! JSON-RPC error arrives inside a **200**, a 401 is the web server's
-//! credentials, a 404 is `url_base`, and an HTML body means the web *interface*
-//! answered instead of the JSON-RPC endpoint.
+//! credentials (`invalid_username_password`), a 404 is `url_base`, and an HTML
+//! body means the web *interface* answered instead of the JSON-RPC endpoint
+//! (both `endpoint_not_found`).
 
 use notify_common::*;
 use scryer_plugin_sdk::{
@@ -214,6 +215,7 @@ fn build_descriptor() -> PluginDescriptor {
             },
             config_fields: config_fields(),
         }),
+        settings: Vec::new(),
     }
 }
 
@@ -783,7 +785,8 @@ fn library_plan(req: &Request) -> LibraryPlan {
             clean: !deleted_paths(req).is_empty(),
         },
         // Not in `supported_events`, so the host never routes them here.
-        NotificationEventType::ListTitleAdded
+        NotificationEventType::FileRestored
+        | NotificationEventType::ListTitleAdded
         | NotificationEventType::ListRequestSubmitted
         | NotificationEventType::ListItemHeld
         | NotificationEventType::ListTitleLeft
@@ -898,6 +901,7 @@ fn header_suffix(event_type: NotificationEventType) -> &'static str {
         NotificationEventType::TitleAdded => "Added",
         NotificationEventType::TitleDeleted => "Deleted",
         NotificationEventType::TitleMoved => "Moved",
+        NotificationEventType::FileRestored => "Restored",
         NotificationEventType::ListTitleAdded
         | NotificationEventType::ListRequestSubmitted
         | NotificationEventType::ListItemHeld
@@ -1342,11 +1346,11 @@ enum CallOutcome {
     /// which *every* call says the same thing can be reported on the typed lane
     /// naming the field.
     Misconfigured(PluginError),
-    /// Kodi said no, for now.
+    /// Kodi said no, for now. Carries the typed error so a send in which every
+    /// call was refused the same way is reported on the typed lane too.
     Rejected {
-        detail: String,
+        error: PluginError,
         provider_status: String,
-        retry_after_seconds: Option<i64>,
     },
 }
 
@@ -1361,15 +1365,23 @@ impl CallOutcome {
     fn failure(&self) -> Option<String> {
         match self {
             Self::Ok(_) => None,
-            Self::Misconfigured(error) => Some(error.public_message.clone()),
-            Self::Rejected { detail, .. } => Some(detail.clone()),
+            Self::Misconfigured(error) | Self::Rejected { error, .. } => {
+                Some(error.public_message.clone())
+            }
+        }
+    }
+
+    fn error(&self) -> Option<&PluginError> {
+        match self {
+            Self::Ok(_) => None,
+            Self::Misconfigured(error) | Self::Rejected { error, .. } => Some(error),
         }
     }
 
     fn provider_status(&self) -> Option<String> {
         match self {
             Self::Ok(_) => Some("ok".to_string()),
-            Self::Misconfigured(error) => Some(format!("{:?}", error.code).to_ascii_lowercase()),
+            Self::Misconfigured(error) => Some(error.code.as_str().to_string()),
             Self::Rejected {
                 provider_status, ..
             } => Some(provider_status.clone()),
@@ -1412,7 +1424,7 @@ fn json_rpc(settings: &Settings, method: &str, params: Value, strict: bool) -> C
             method,
             settings,
         ),
-        Err(error) => transport_failure(&error.to_string(), method, settings, strict),
+        Err(error) => transport_failure(&error, method, settings, strict),
     }
 }
 
@@ -1420,46 +1432,38 @@ fn json_rpc(settings: &Settings, method: &str, params: Value, strict: bool) -> C
 /// (`Xbmc.cs:143-149`), so an unreachable Kodi is invisible. Scryer's host
 /// answers a refused or failed egress in-band, so there are two cases: the host
 /// would not let this plugin out at all — a configuration problem with a precise
-/// fix, typed on every send — and Kodi not answering. The latter is typed
-/// `UpstreamUnavailable` on a connection test, where Sonarr would blame `Host`
-/// (`XbmcService.cs:136`), and stays on the delivery lane on a live send: a
-/// network blink must not be reported to the operator as a broken setting.
-fn transport_failure(error: &str, method: &str, settings: &Settings, strict: bool) -> CallOutcome {
-    let lower = error.to_ascii_lowercase();
+/// fix — and Kodi not answering, which the PDK classifies from the host's own
+/// error (`UpstreamUnavailable`, `tls_error`, or a timeout). On a connection
+/// test that is reported as the typed error; on a live send it is a refused
+/// call, so a toast that did go through is still reported beside it.
+fn transport_failure(
+    error: &Error,
+    method: &str,
+    settings: &Settings,
+    strict: bool,
+) -> CallOutcome {
+    let text = error.to_string();
+    let lower = text.to_ascii_lowercase();
     if lower.contains("is not allowed") || lower.contains("not permitted") {
         return CallOutcome::Misconfigured(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "Scryer refused a request to {}: set server_url to that address so it is added to this channel's allowlist. Scryer derives the allowlist from configuration values that are URLs, and the legacy host setting is not one.",
-                settings.endpoint
-            ),
-            Some(format!("{method}: {error}")),
+            "Scryer refused the request to Kodi's address: set server_url to that address so it is added to this channel's allowlist".to_string(),
+            Some(format!("{method} → {}: {text}", settings.endpoint)),
         ));
     }
 
-    let detail = format!(
-        "could not reach Kodi at {}: {}",
-        settings.endpoint,
-        ellipsize(error, MAX_QUOTED_ERROR)
-    );
+    let mut failure = request_failure(error);
+    let detail = format!("{method} → {}: {error:#}", settings.endpoint);
+    failure.debug_message = Some(redact_secrets(&match failure.debug_message.take() {
+        Some(debug) if !debug.is_empty() => format!("{detail} ({debug})"),
+        _ => detail,
+    }));
     if strict {
-        return CallOutcome::Misconfigured(plugin_error(
-            PluginErrorCode::UpstreamUnavailable,
-            format!(
-                "{detail}. Check server_url{}, and that Kodi has 'Allow remote control via HTTP' enabled.",
-                if settings.legacy_connection {
-                    " (or the legacy host, port and use_ssl settings)"
-                } else {
-                    ""
-                }
-            ),
-            Some(format!("{method}: {error}")),
-        ));
+        return CallOutcome::Misconfigured(failure);
     }
     CallOutcome::Rejected {
-        detail,
+        error: failure,
         provider_status: "request_failed".to_string(),
-        retry_after_seconds: None,
     }
 }
 
@@ -1484,30 +1488,32 @@ fn classify_response(
     // Kodi's web server answers these as HTML, so they are decided before the
     // "did not answer JSON" branch that would otherwise swallow them.
     match status {
+        // Kodi's web-server credentials from Settings → Services → Control, not
+        // a Kodi profile.
         401 | 403 => {
-            return CallOutcome::Misconfigured(plugin_error(
-                PluginErrorCode::AuthFailed,
-                format!(
-                    "Kodi rejected the credentials (HTTP {status}): check username and password. These are Kodi's web-server credentials from Settings → Services → Control, not a Kodi profile."
-                ),
-                Some(debug),
+            return CallOutcome::Misconfigured(rejected_credential(
+                Credential::UsernamePassword,
+                debug,
             ));
         }
+        // Kodi serves JSON-RPC at `DEFAULT_URL_BASE`; a 404 is `url_base` or a
+        // path in `server_url`.
         404 => {
             return CallOutcome::Misconfigured(plugin_error(
-                PluginErrorCode::InvalidConfig,
-                format!(
-                    "{} does not exist (HTTP 404): Kodi serves JSON-RPC at {DEFAULT_URL_BASE}. Check url_base, and any path in server_url.",
-                    settings.endpoint
-                ),
-                Some(debug),
+                codes::ENDPOINT_NOT_FOUND,
+                "Kodi has no JSON-RPC endpoint at the configured address; check url_base and any path in server_url".to_string(),
+                Some(format!("{} → {debug}", settings.endpoint)),
             ));
         }
         429 | 500..=599 => {
             return CallOutcome::Rejected {
-                detail: format!("Kodi answered HTTP {status} for {method}: {quoted}"),
+                error: http_failure(
+                    status,
+                    retry_after_seconds,
+                    Credential::UsernamePassword,
+                    debug,
+                ),
                 provider_status: format!("http_{status}"),
-                retry_after_seconds,
             };
         }
         _ => {}
@@ -1518,17 +1524,15 @@ fn classify_response(
     // proxy's login page — which is a `url_base` problem with a precise fix.
     let Some(parsed) = parsed else {
         return CallOutcome::Misconfigured(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "{} did not answer with JSON-RPC (HTTP {status}): {quoted}. That is usually Kodi's web interface rather than its JSON-RPC endpoint — check url_base, and any path in server_url.",
-                settings.endpoint
-            ),
-            Some(debug),
+            codes::ENDPOINT_NOT_FOUND,
+            "the configured address did not answer with Kodi's JSON-RPC, usually because it is Kodi's web interface; check url_base and any path in server_url".to_string(),
+            Some(format!("{} → {debug}", settings.endpoint)),
         ));
     };
 
     // A JSON-RPC error arrives inside a 200. Sonarr's wording, with the method
-    // added because this channel makes up to four calls per event.
+    // added because this channel makes up to four calls per event, goes to the
+    // host log.
     if let Some(error) = parsed.get("error") {
         let code = error
             .get("code")
@@ -1540,15 +1544,17 @@ fn classify_response(
             .unwrap_or("no message");
         return CallOutcome::Misconfigured(plugin_error(
             PluginErrorCode::Permanent,
-            format!("Kodi JSON error. Code = {code}, Message: {message} (method {method})"),
-            Some(format!("{debug} :: {error}")),
+            format!("Kodi refused the {method} call"),
+            Some(format!(
+                "Kodi JSON error. Code = {code}, Message: {message} (method {method}) :: {debug} :: {error}"
+            )),
         ));
     }
 
     if !(200..300).contains(&status) {
         return CallOutcome::Misconfigured(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!("Kodi rejected {method} with HTTP {status}: {quoted}"),
+            format!("Kodi rejected the {method} call"),
             Some(debug),
         ));
     }
@@ -1582,16 +1588,14 @@ fn retry_after(headers: &std::collections::BTreeMap<String, String>) -> Option<i
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let builder = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug) => builder.debug(redact_secrets(&debug)).build(),
+        None => builder.build(),
     }
 }
 
@@ -1828,27 +1832,29 @@ fn resolve_library_directory(
     }
 }
 
-/// Every call refused the channel's own configuration, and for the same reason:
-/// that is a setting the operator must fix, not a delivery that failed, so it
-/// goes on the typed lane naming the field. A partial failure — a toast that
-/// worked and a clean that did not — stays on the delivery lane so the part that
-/// worked is still reported.
+/// Every call failed, and for the same reason: that is one failure of the
+/// channel — a setting the operator must fix, rejected credentials, or Kodi not
+/// answering — so it goes on the typed lane with its code. A partial failure — a
+/// toast that worked and a clean that did not — stays on the delivery lane so
+/// the part that worked is still reported.
 fn finish(calls: Vec<Call>, warnings: Vec<String>) -> PluginResult<PluginNotificationResponse> {
-    let misconfigurations: Vec<&PluginError> = calls
+    let errors: Vec<&PluginError> = calls
         .iter()
-        .filter_map(|call| match &call.outcome {
-            CallOutcome::Misconfigured(error) => Some(error),
-            _ => None,
-        })
+        .filter_map(|call| call.outcome.error())
         .collect();
 
-    if misconfigurations.len() == calls.len()
-        && let Some(first) = misconfigurations.first()
-        && misconfigurations
+    if errors.len() == calls.len()
+        && let Some(first) = errors.first()
+        && errors
             .iter()
             .all(|error| error.code == first.code && error.public_message == first.public_message)
     {
-        return PluginResult::Err((*first).clone());
+        let mut error = (*first).clone();
+        error.retry_after_seconds = errors
+            .iter()
+            .filter_map(|error| error.retry_after_seconds)
+            .max();
+        return PluginResult::Err(error);
     }
 
     let mut retry_after_seconds: Option<i64> = None;
@@ -1856,11 +1862,8 @@ fn finish(calls: Vec<Call>, warnings: Vec<String>) -> PluginResult<PluginNotific
     let mut target_results: Vec<PluginNotificationTargetResult> = Vec::new();
 
     for call in &calls {
-        if let CallOutcome::Rejected {
-            retry_after_seconds: retry_after,
-            ..
-        } = &call.outcome
-            && let Some(retry_after) = retry_after
+        if let CallOutcome::Rejected { error, .. } = &call.outcome
+            && let Some(retry_after) = &error.retry_after_seconds
         {
             retry_after_seconds =
                 Some(retry_after_seconds.map_or(*retry_after, |seen: i64| seen.max(*retry_after)));
@@ -2899,8 +2902,8 @@ mod tests {
         match outcome {
             CallOutcome::Misconfigured(error) => error,
             CallOutcome::Ok(_) => panic!("expected a typed error, got a success"),
-            CallOutcome::Rejected { detail, .. } => {
-                panic!("expected a typed error, got a rejection: {detail}")
+            CallOutcome::Rejected { error, .. } => {
+                panic!("expected a misconfiguration, got a rejection: {error:?}")
             }
         }
     }
@@ -2913,32 +2916,36 @@ mod tests {
     }
 
     #[test]
-    fn a_401_names_the_credentials() {
+    fn a_401_is_an_invalid_username_or_password() {
         let error = expect_error(classify(401, "<html>Unauthorized</html>"));
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
-        assert!(error.public_message.contains("username"));
-        assert!(error.public_message.contains("password"));
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        assert!(error.public_message.contains("username or password"));
+        assert!(error.debug_message.unwrap().contains("Unauthorized"));
     }
 
     #[test]
-    fn a_403_is_also_an_auth_failure() {
+    fn a_403_is_also_an_invalid_username_or_password() {
         assert_eq!(
             expect_error(classify(403, "nope")).code,
-            PluginErrorCode::AuthFailed
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
         );
     }
 
     #[test]
-    fn a_404_names_url_base() {
+    fn a_404_is_an_endpoint_not_found_naming_url_base() {
         let error = expect_error(classify(404, "<html>Not Found</html>"));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
         assert!(error.public_message.contains("url_base"));
+        assert!(!error.public_message.contains("http"));
     }
 
     #[test]
     fn an_html_page_on_a_200_names_url_base_rather_than_the_credentials() {
         let error = expect_error(classify(200, "<!DOCTYPE html><title>Kodi</title>"));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
         assert!(error.public_message.contains("url_base"));
     }
 
@@ -2947,11 +2954,11 @@ mod tests {
         // `"Invalid response from XBMC, the response is not valid JSON"`
         // (`XbmcJsonApiProxy.cs:102`).
         let error = expect_error(classify(200, ""));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
     }
 
     #[test]
-    fn a_json_rpc_error_keeps_sonarrs_wording_and_names_the_method() {
+    fn a_json_rpc_error_keeps_sonarrs_wording_in_debug_and_names_the_method() {
         let error = expect_error(classify(
             200,
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found."}}"#,
@@ -2959,8 +2966,11 @@ mod tests {
         assert_eq!(error.code, PluginErrorCode::Permanent);
         assert_eq!(
             error.public_message,
-            "Kodi JSON error. Code = -32601, Message: Method not found. (method GUI.ShowNotification)"
+            "Kodi refused the GUI.ShowNotification call"
         );
+        assert!(error.debug_message.unwrap().contains(
+            "Kodi JSON error. Code = -32601, Message: Method not found. (method GUI.ShowNotification)"
+        ));
     }
 
     #[test]
@@ -2972,11 +2982,11 @@ mod tests {
             r#"{"error":{"code":-32602,"message":"Invalid params.","data":{"method":"GUI.ShowNotification","stack":{"message":"Invalid type"}}}}"#,
         ));
         assert_eq!(error.code, PluginErrorCode::Permanent);
-        assert!(error.public_message.contains("Code = -32602"));
+        assert!(error.debug_message.unwrap().contains("Code = -32602"));
     }
 
     #[test]
-    fn a_500_is_a_delivery_failure_carrying_retry_after() {
+    fn a_503_is_a_refused_call_carrying_upstream_unavailable_and_retry_after() {
         let outcome = classify_response(
             503,
             Some(30),
@@ -2986,20 +2996,28 @@ mod tests {
         );
         let CallOutcome::Rejected {
             provider_status,
-            retry_after_seconds,
-            ..
+            error,
         } = outcome
         else {
-            panic!("a 503 must stay on the delivery lane");
+            panic!("a 503 must be a refused call");
         };
         assert_eq!(provider_status, "http_503");
-        assert_eq!(retry_after_seconds, Some(30));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert_eq!(error.retry_after_seconds, None);
+
+        let CallOutcome::Rejected { error, .. } =
+            classify_response(429, Some(30), b"", "VideoLibrary.Scan", &settings())
+        else {
+            panic!("a 429 must be a refused call");
+        };
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(30));
     }
 
     #[test]
     fn a_refused_egress_names_server_url() {
         let outcome = transport_failure(
-            "HTTP request to http://kodi.local:8080/jsonrpc is not allowed",
+            &Error::msg("HTTP request to http://kodi.local:8080/jsonrpc is not allowed"),
             "GUI.ShowNotification",
             &settings(),
             false,
@@ -3008,18 +3026,22 @@ mod tests {
         assert_eq!(error.code, PluginErrorCode::InvalidConfig);
         assert!(error.public_message.contains("server_url"));
         assert!(error.public_message.contains("allowlist"));
+        assert!(!error.public_message.contains("kodi.local"));
     }
 
     #[test]
-    fn an_unreachable_kodi_is_typed_only_on_a_connection_test() {
-        let strict = transport_failure("connection refused", "JSONRPC.Version", &settings(), true);
-        assert_eq!(
-            expect_error(strict).code,
-            PluginErrorCode::UpstreamUnavailable
+    fn an_unreachable_kodi_is_a_misconfiguration_only_on_a_connection_test() {
+        let strict = transport_failure(
+            &Error::msg("connection refused"),
+            "JSONRPC.Version",
+            &settings(),
+            true,
         );
+        let error = expect_error(strict);
+        assert!(error.debug_message.unwrap().contains("connection refused"));
 
         let lenient = transport_failure(
-            "connection refused",
+            &Error::msg("connection refused"),
             "GUI.ShowNotification",
             &settings(),
             false,
@@ -3028,9 +3050,10 @@ mod tests {
     }
 
     #[test]
-    fn a_long_html_body_is_bounded_before_it_reaches_the_operator() {
+    fn a_long_html_body_never_reaches_the_operator() {
         let error = expect_error(classify(400, &"<p>boom</p>".repeat(200)));
-        assert!(error.public_message.chars().count() < 600);
+        assert!(!error.public_message.contains("boom"));
+        assert!(error.debug_message.unwrap().chars().count() < 600);
     }
 
     #[test]
@@ -3077,6 +3100,37 @@ mod tests {
     }
 
     #[test]
+    fn a_send_whose_only_call_kodi_rejected_is_a_typed_error_with_its_code() {
+        let calls = vec![Call {
+            method: "GUI.ShowNotification",
+            outcome: classify_response(
+                401,
+                None,
+                b"<html>Unauthorized</html>",
+                "GUI.ShowNotification",
+                &settings(),
+            ),
+        }];
+        let PluginResult::Err(error) = finish(calls, Vec::new()) else {
+            panic!("expected a typed error");
+        };
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+
+        let calls = vec![Call {
+            method: "GUI.ShowNotification",
+            outcome: classify_response(429, Some(20), b"", "GUI.ShowNotification", &settings()),
+        }];
+        let PluginResult::Err(error) = finish(calls, Vec::new()) else {
+            panic!("expected a typed error");
+        };
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(20));
+    }
+
+    #[test]
     fn a_partial_failure_stays_on_the_delivery_lane_and_reports_each_method() {
         let calls = vec![
             Call {
@@ -3086,9 +3140,13 @@ mod tests {
             Call {
                 method: "VideoLibrary.Clean",
                 outcome: CallOutcome::Rejected {
-                    detail: "Kodi answered HTTP 503".to_string(),
+                    error: scryer_plugin_pdk::plugin_error(
+                        PluginErrorCode::UpstreamUnavailable,
+                        "the service answered with a server error",
+                    )
+                    .retry_after_seconds(5)
+                    .build(),
                     provider_status: "http_503".to_string(),
-                    retry_after_seconds: Some(5),
                 },
             },
         ];

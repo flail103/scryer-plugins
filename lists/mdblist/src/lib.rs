@@ -17,8 +17,9 @@
 //! The public source never reads a member's key.
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, invalid_config, missing_param, permanent, plugin_error,
-    unsupported_source,
+    Access, auth_failed, check_status, invalid_api_key, invalid_config, invalid_response,
+    missing_param, not_found, permanent, plugin_error, quota_exceeded, retry_after_seconds,
+    unsupported_source, with_debug,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, header, json_body};
 use list_provider_common::ids::{Ids, build_item, dedupe_and_rank, json_id, json_text, json_year};
@@ -227,11 +228,17 @@ fn member_key(credential: Option<&ListCredential>) -> Result<&str, PluginError> 
 
 /// MDBList answers a key it does not accept with 401 or 403. On a member's
 /// own read that is the key, never the thing being read.
+///
+/// The refusal is the open `invalid_api_key` code: the host reads it as "the
+/// provider refused the key" when linking, and as "reconnect" on a fetch.
 fn check_member_key(
     response: &scryer_plugin_sdk::host::PluginHttpResponse,
 ) -> Result<(), PluginError> {
     match response.status {
-        401 | 403 => Err(auth_failed("MDBList did not accept the API key")),
+        401 | 403 => Err(with_debug(
+            invalid_api_key("MDBList did not accept the API key"),
+            format_args!("MDBList answered HTTP {}", response.status),
+        )),
         _ => Ok(()),
     }
 }
@@ -244,16 +251,48 @@ fn check_member_status(
 ) -> Result<(), PluginError> {
     check_member_key(response)?;
     match response.status {
-        404 | 410 => Err(permanent(format!(
-            "MDBList has no {what} for this account (HTTP {})",
-            response.status
-        ))),
-        _ => check_status(response, Access::ServerKey, what),
+        404 | 410 => Err(with_debug(
+            permanent(format!("MDBList has no {what} for this account")),
+            format_args!("{what}: HTTP {}", response.status),
+        )),
+        _ => check_mdblist_status(response, Access::ServerKey, what),
     }
 }
 
+/// The shared status mapping, except that a 429 MDBList explains as its daily
+/// API allowance being spent is the open `quota_exceeded` code with the
+/// `Retry-After` MDBList gave. Any other 429 stays a rate limit. This is the
+/// one place MDBList's error text is read.
+fn check_mdblist_status(
+    response: &scryer_plugin_sdk::host::PluginHttpResponse,
+    access: Access,
+    what: &str,
+) -> Result<(), PluginError> {
+    if response.status == 429 && daily_limit_spent(response) {
+        return Err(with_debug(
+            quota_exceeded(
+                "the daily MDBList API allowance for this key is used up",
+                retry_after_seconds(response),
+            ),
+            format_args!("{what}: HTTP 429, daily API limit"),
+        ));
+    }
+    check_status(response, access, what)
+}
+
+fn daily_limit_spent(response: &scryer_plugin_sdk::host::PluginHttpResponse) -> bool {
+    serde_json::from_slice::<Value>(&response.body)
+        .ok()
+        .and_then(|body| {
+            body.get("error")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+        })
+        .is_some_and(|error| error.contains("daily") && error.contains("limit"))
+}
+
 /// Whose key this is and the lists they own. A key MDBList refuses is
-/// `auth_failed`, which is how the host learns the member typed a wrong one.
+/// `invalid_api_key`, which is how the host learns the member typed a wrong one.
 pub async fn account<H: ListHttp>(
     http: &H,
     credential: &ListCredential,
@@ -269,7 +308,7 @@ pub async fn account<H: ListHttp>(
     check_member_status(&response, "account")?;
     let user = json_body(&response)?;
     let external_user_id = json_id(user.get("user_id"))
-        .ok_or_else(|| permanent("MDBList did not say whose API key this is"))?;
+        .ok_or_else(|| invalid_response("MDBList did not say whose API key this is"))?;
     let username = json_text(user.get("username")).unwrap_or_else(|| external_user_id.clone());
 
     let response = http
@@ -474,13 +513,13 @@ async fn fetch_public<H: ListHttp>(
         encode_component(slug)
     );
     let response = http.send(get(url, USER_AGENT, ACCEPT)).await?;
-    check_status(&response, Access::Public, &what(list))?;
+    check_mdblist_status(&response, Access::Public, &what(list))?;
     let body = json_body(&response)?;
     if let Some(error) = body.get("error").and_then(Value::as_str) {
-        return Err(list_provider_common::error::not_found(format!(
-            "{} ({error})",
-            what(list)
-        )));
+        return Err(with_debug(
+            not_found(what(list)),
+            format_args!("{}: MDBList answered {error}", what(list)),
+        ));
     }
     Ok(single_page(
         entries(&body),
@@ -515,7 +554,7 @@ async fn fetch_api<H: ListHttp>(
     );
     let response = http.send(get(url, USER_AGENT, ACCEPT)).await?;
     check_member_key(&response)?;
-    check_status(&response, Access::ServerKey, &what(list))?;
+    check_mdblist_status(&response, Access::ServerKey, &what(list))?;
     let body = json_body(&response)?;
     let raw_count = count_entries(&body);
     let mut items = entries(&body);

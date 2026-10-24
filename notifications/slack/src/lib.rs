@@ -52,9 +52,10 @@
 //! `no_service` at 404 is a webhook URL that no longer exists,
 //! `channel_is_archived` at 410 is the `channel` setting, `action_prohibited` at
 //! 403 is a workspace restriction, and a 429 carries a `Retry-After` the core
-//! can act on. Those are three different lanes in Scryer's contract — typed
-//! `PluginError`, delivery failure with `retry_after_seconds`, and plain
-//! delivery failure — so the send lives here.
+//! can act on. Each is a typed `PluginError` with its own code
+//! (`invalid_api_key`, `InvalidConfig`, `AuthFailed`, `Permanent`,
+//! `RateLimited` with `retry_after_seconds`, `UpstreamUnavailable`), so the send
+//! lives here.
 //!
 //! # Upstream reference
 //!
@@ -173,6 +174,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(NotificationDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec![],
@@ -760,6 +762,8 @@ fn event_label(req: &PluginNotificationRequest) -> String {
         NotificationEventType::HealthIssue => "Health Issue".to_string(),
         NotificationEventType::HealthRestored => "Health Issue Resolved".to_string(),
         NotificationEventType::ApplicationUpdate => "Application Updated".to_string(),
+        // Not in `supported_events`, so the host never routes it here.
+        NotificationEventType::FileRestored => "File Restored".to_string(),
         NotificationEventType::Test => "Test".to_string(),
     }
 }
@@ -813,6 +817,7 @@ fn attachment_color(req: &PluginNotificationRequest) -> &'static str {
         | NotificationEventType::ListTitleLeft
         | NotificationEventType::ListSyncFailed
         | NotificationEventType::ListUnfollowed
+        | NotificationEventType::FileRestored
         | NotificationEventType::Test => COLOR_INFO,
     };
 
@@ -1442,17 +1447,14 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
             &response.body(),
             warnings,
         ),
-        Err(error) => {
-            // The host answers a refused or failed egress in-band; report it as
-            // a delivery failure rather than a channel misconfiguration.
-            let mut failure = error_response(format!("request failed: {error}"), None);
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        // The send is one request, so a request that got no answer at all is
+        // the send's failure, typed from the host's transport detail
+        // (unreachable, timeout, TLS).
+        Err(error) => PluginResult::Err(request_failure(&error)),
     }
 }
 
-/// Slack's incoming-webhook failures, mapped to Scryer's two error lanes.
+/// Slack's incoming-webhook failures, mapped to typed error codes.
 ///
 /// The **body** is authoritative and the status is the fallback: Slack answers
 /// with a plain-text error string
@@ -1476,27 +1478,41 @@ fn classify_response(
         return PluginResult::Ok(response);
     }
 
+    let debug = Some(format!("HTTP {status}: {detail}"));
+
     if status == 429 {
-        let mut failure = error_response(
-            format!("Slack rate-limited this webhook (HTTP 429): {detail}"),
-            Some("http_429".to_string()),
+        let error = scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::RateLimited,
+            "Slack is rate limiting this webhook",
+        )
+        .debug(redact_secrets(&format!("HTTP {status}: {detail}")));
+        return PluginResult::Err(
+            match retry_after_seconds(headers) {
+                Some(seconds) => error.retry_after_seconds(seconds),
+                None => error,
+            }
+            .build(),
         );
-        failure.retry_after_seconds = retry_after_seconds(headers);
-        failure.warnings = warnings;
-        return PluginResult::Ok(failure);
     }
 
     let code = detail.trim().to_ascii_lowercase();
     match code.as_str() {
-        // The webhook itself is gone or was never valid: the operator has to
-        // paste a new URL. Retrying changes nothing.
-        "no_service" | "no_service_id" | "no_active_hooks" | "invalid_token" | "no_team"
-        | "team_disabled" => PluginResult::Err(plugin_error(
+        // The webhook URL is the credential, and Slack no longer accepts it:
+        // the operator has to paste a new URL. Retrying changes nothing.
+        "no_service" | "no_service_id" | "no_active_hooks" | "invalid_token" => {
+            PluginResult::Err(plugin_error(
+                codes::INVALID_API_KEY,
+                "webhook_url was rejected by Slack. Recreate the incoming webhook and paste the new URL."
+                    .to_string(),
+                debug,
+            ))
+        }
+        // The workspace behind the webhook is gone or disabled.
+        "no_team" | "team_disabled" => PluginResult::Err(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "webhook_url was rejected by Slack (HTTP {status}: {code}). Recreate the incoming webhook and paste the new URL."
-            ),
-            Some(format!("HTTP {status}: {detail}")),
+            "webhook_url belongs to a Slack workspace that is gone or disabled. Recreate the incoming webhook and paste the new URL."
+                .to_string(),
+            debug,
         )),
         // The destination the operator named does not accept this message.
         "channel_not_found"
@@ -1504,52 +1520,50 @@ fn classify_response(
         | "user_not_found"
         | "posting_to_general_channel_denied" => PluginResult::Err(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!("channel was rejected by Slack (HTTP {status}: {code})"),
-            Some(format!("HTTP {status}: {detail}")),
+            "channel was rejected by Slack".to_string(),
+            debug,
         )),
         // A workspace-level restriction on this webhook: not a payload problem
         // and not something a new URL fixes.
         "action_prohibited" => PluginResult::Err(plugin_error(
             PluginErrorCode::AuthFailed,
-            format!("Slack refused this posting method (HTTP {status}: {code})"),
-            Some(format!("HTTP {status}: {detail}")),
+            "Slack refused this posting method".to_string(),
+            debug,
         )),
         // The payload this plugin built is wrong; retrying it changes nothing.
         "invalid_payload" | "no_text" | "too_many_attachments" => PluginResult::Err(plugin_error(
             PluginErrorCode::Permanent,
-            format!("Slack rejected the notification payload (HTTP {status}: {code})"),
-            Some(format!("HTTP {status}: {detail}")),
+            "Slack rejected the notification payload".to_string(),
+            debug,
         )),
         _ => match status {
             400 => PluginResult::Err(plugin_error(
                 PluginErrorCode::Permanent,
-                format!("Slack rejected the notification payload (HTTP 400): {detail}"),
-                Some(format!("HTTP 400: {detail}")),
+                "Slack rejected the notification payload".to_string(),
+                debug,
             )),
             401 | 403 => PluginResult::Err(plugin_error(
-                PluginErrorCode::AuthFailed,
-                format!("Slack refused this webhook (HTTP {status}): {detail}"),
-                Some(format!("HTTP {status}: {detail}")),
+                codes::INVALID_API_KEY,
+                "webhook_url was refused by Slack. Recreate the incoming webhook and paste the new URL."
+                    .to_string(),
+                debug,
             )),
             404 | 410 => PluginResult::Err(plugin_error(
-                PluginErrorCode::InvalidConfig,
-                format!(
-                    "webhook_url is no longer usable (HTTP {status}): {detail}. Recreate the incoming webhook and paste the new URL."
-                ),
-                Some(format!("HTTP {status}: {detail}")),
+                codes::ENDPOINT_NOT_FOUND,
+                "webhook_url is no longer usable. Recreate the incoming webhook and paste the new URL."
+                    .to_string(),
+                debug,
             )),
-            // Everything else — 5xx included — is the provider saying no for
-            // now. It stays on the delivery-result lane so the operator sees
-            // Slack's own answer, and so an outage is never reported as a
-            // broken channel. `tests/host_conformance.rs` pins this for 500.
-            _ => {
-                let mut failure = error_response(
-                    format!("HTTP {status}: {detail}"),
-                    Some(format!("http_{status}")),
-                );
-                failure.warnings = warnings;
-                PluginResult::Ok(failure)
-            }
+            500..=599 => PluginResult::Err(plugin_error(
+                PluginErrorCode::UpstreamUnavailable,
+                "Slack answered with a server error".to_string(),
+                debug,
+            )),
+            _ => PluginResult::Err(plugin_error(
+                PluginErrorCode::Permanent,
+                "Slack refused the notification".to_string(),
+                debug,
+            )),
         },
     }
 }
@@ -1593,17 +1607,16 @@ fn retry_after_seconds(headers: &BTreeMap<String, String>) -> Option<i64> {
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let error = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
+        None => error,
     }
+    .build()
 }
 
 /// The world's single `process` entry, dispatching the SDK's notification
@@ -2409,13 +2422,14 @@ mod tests {
 
     #[test]
     fn a_dead_webhook_names_the_webhook_url_setting() {
-        for (status, body) in [
-            (404, "no_service"),
-            (403, "invalid_token"),
-            (404, "no_team"),
+        for (status, body, code) in [
+            (404, "no_service", codes::INVALID_API_KEY),
+            (403, "invalid_token", codes::INVALID_API_KEY),
+            (404, "no_team", "invalid_config"),
         ] {
             let error = error_of(classify(status, body));
-            assert_eq!(error.code, PluginErrorCode::InvalidConfig, "{body}");
+            assert_eq!(error.code.as_str(), code, "{body}");
+            assert!(!error.public_message.contains(body), "{body}: {error:?}");
             assert!(
                 error.public_message.contains("webhook_url"),
                 "{body}: {error:?}"
@@ -2455,34 +2469,31 @@ mod tests {
     }
 
     #[test]
-    fn a_429_reports_retry_after_from_the_header() {
+    fn a_429_is_rate_limited_with_retry_after_from_the_header() {
         let headers = BTreeMap::from([("Retry-After".to_string(), "30".to_string())]);
-        let response = response_of(classify_response(
+        let error = error_of(classify_response(
             429,
             &headers,
             b"rate_limited",
             Vec::new(),
         ));
-        assert!(!response.success);
-        assert_eq!(response.retry_after_seconds, Some(30));
-        assert_eq!(response.provider_status.as_deref(), Some("http_429"));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(30));
     }
 
     #[test]
-    fn a_429_without_a_header_is_still_a_delivery_failure() {
-        let response = response_of(classify(429, ""));
-        assert!(!response.success);
-        assert_eq!(response.retry_after_seconds, None);
+    fn a_429_without_a_header_is_still_rate_limited() {
+        let error = error_of(classify(429, ""));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, None);
     }
 
-    /// `tests/host_conformance.rs` pins this: a provider outage stays on the
-    /// delivery-result lane so it is never reported as a broken channel.
     #[test]
-    fn a_5xx_stays_a_reported_delivery_failure() {
-        let response = response_of(classify(500, "rollup_error"));
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_500"));
-        assert!(response.error.unwrap().contains("rollup_error"));
+    fn a_5xx_is_upstream_unavailable_with_slacks_words_in_debug_only() {
+        let error = error_of(classify(500, "rollup_error"));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert!(!error.public_message.contains("rollup_error"));
+        assert!(error.debug_message.unwrap().contains("rollup_error"));
     }
 
     #[test]
@@ -2497,7 +2508,7 @@ mod tests {
         let error = error_of(classify(400, "something_new"));
         assert_eq!(error.code, PluginErrorCode::Permanent);
         let error = error_of(classify(410, "something_new"));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code.as_str(), codes::ENDPOINT_NOT_FOUND);
     }
 
     #[test]

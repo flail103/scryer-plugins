@@ -36,6 +36,8 @@ use scryer_plugin_sdk::current_sdk_constraint;
 /// Re-exported so `use notify_common::*;` keeps supplying `config::get`,
 /// `http::request`, `HttpRequest` and friends to every channel body.
 pub use scryer_plugin_pdk::{Error, FnResult, HttpRequest, HttpResponse, config, http, var};
+/// The shared open error codes and the PDK's error builder, for channel bodies.
+pub use scryer_plugin_pdk::{PluginErrorBuilder, PluginResultExt, codes};
 pub use scryer_plugin_sdk::command::{
     PluginActionRequest, PluginActionResponse, PluginNotificationCommand,
     PluginNotificationCommandResult,
@@ -70,6 +72,7 @@ pub fn build_notification_descriptor(
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(scryer_plugin_sdk::NotificationDescriptor {
             provider_type: provider_type.to_string(),
             provider_aliases: vec![],
@@ -329,7 +332,7 @@ pub fn error_response(
 ) -> PluginNotificationResponse {
     PluginNotificationResponse {
         success: false,
-        error: Some(error.into()),
+        error: Some(redact_secrets(&error.into())),
         delivery_id: None,
         provider_status,
         retry_after_seconds: None,
@@ -575,7 +578,7 @@ pub fn process_exec(request: ProcessExecRequest) -> Result<ProcessExecResponse, 
 fn process_error(error: scryer_plugin_pdk::host::HostCallError) -> ProcessError {
     match error {
         scryer_plugin_pdk::host::HostCallError::Service(error) => ProcessError {
-            code: process_error_code(error.code).to_string(),
+            code: process_error_code(error.code),
             message: error.public_message,
         },
         scryer_plugin_pdk::host::HostCallError::Unavailable => ProcessError {
@@ -589,8 +592,8 @@ fn process_error(error: scryer_plugin_pdk::host::HostCallError) -> ProcessError 
     }
 }
 
-fn process_error_code(code: PluginErrorCode) -> &'static str {
-    match code {
+fn process_error_code(code: PluginErrorCode) -> String {
+    let code = match code {
         PluginErrorCode::InvalidConfig => "invalid_config",
         PluginErrorCode::AuthFailed => "permission_denied",
         PluginErrorCode::RateLimited => "rate_limited",
@@ -598,7 +601,10 @@ fn process_error_code(code: PluginErrorCode) -> &'static str {
         PluginErrorCode::Unsupported => "unsupported",
         PluginErrorCode::Temporary => "temporary",
         PluginErrorCode::Permanent => "permanent",
-    }
+        // An open code from a newer host keeps its own spelling.
+        PluginErrorCode::Other(code) => return code,
+    };
+    code.to_string()
 }
 
 /// The in-band answer a channel with no action operation gives.
@@ -609,13 +615,13 @@ fn process_error_code(code: PluginErrorCode) -> &'static str {
 /// a guest trap would cost the host the plugin's own diagnosis and, under a
 /// component, the whole instance.
 pub fn unsupported_action(provider: &str) -> PluginResult<PluginActionResponse> {
-    PluginResult::Err(PluginError {
-        code: PluginErrorCode::Unsupported,
-        public_message: format!("{provider} does not implement notification actions"),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    })
+    PluginResult::Err(
+        scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::Unsupported,
+            format!("{provider} does not implement notification actions"),
+        )
+        .build(),
+    )
 }
 
 /// Turn a configuration-resolution failure into a typed plugin error.
@@ -625,13 +631,274 @@ pub fn unsupported_action(provider: &str) -> PluginResult<PluginActionResponse> 
 /// own result, which is what lets Scryer surface "this channel is not
 /// configured" to the operator instead of "the plugin crashed".
 pub fn config_error(error: impl std::fmt::Display) -> PluginError {
-    PluginError {
-        code: PluginErrorCode::InvalidConfig,
-        public_message: error.to_string(),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
+    scryer_plugin_pdk::plugin_error(PluginErrorCode::InvalidConfig, error.to_string()).build()
+}
+
+/// Which configured credential a channel's service checks, so a rejection can
+/// name the one the operator has to fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Credential {
+    /// An API key, token or webhook secret.
+    ApiKey,
+    /// A username and password.
+    UsernamePassword,
+    /// The service rejected the request without saying which credential.
+    Unknown,
+}
+
+impl Credential {
+    /// The error code a rejection of this credential carries.
+    pub fn code(self) -> PluginErrorCode {
+        match self {
+            Self::ApiKey => codes::INVALID_API_KEY.into(),
+            Self::UsernamePassword => codes::INVALID_USERNAME_PASSWORD.into(),
+            Self::Unknown => PluginErrorCode::AuthFailed,
+        }
     }
+
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::ApiKey => "the service rejected the configured key or token",
+            Self::UsernamePassword => "the service rejected the configured username or password",
+            Self::Unknown => "the service rejected the configured credentials",
+        }
+    }
+}
+
+/// The service rejected `credential`. `debug` goes to the host log only.
+pub fn rejected_credential(credential: Credential, debug: impl std::fmt::Display) -> PluginError {
+    scryer_plugin_pdk::plugin_error(credential.code(), credential.public_message())
+        .debug(redact_secrets(&debug.to_string()))
+        .build()
+}
+
+/// The typed error for a non-success HTTP answer a channel has no more
+/// specific reading of.
+///
+/// | Status | Code |
+/// |---|---|
+/// | 401, 403 | `credential`'s code |
+/// | 404 | `endpoint_not_found` |
+/// | 429 | `RateLimited`, with `retry_after_seconds` |
+/// | 5xx | `UpstreamUnavailable` |
+/// | any other | `Permanent` |
+///
+/// The public sentence never carries the status or the service's own text;
+/// `debug` (for example the status and response body) goes to the host log,
+/// through [`redact_secrets`].
+pub fn http_failure(
+    status: u16,
+    retry_after_seconds: Option<i64>,
+    credential: Credential,
+    debug: impl std::fmt::Display,
+) -> PluginError {
+    let builder = match status {
+        401 | 403 => {
+            scryer_plugin_pdk::plugin_error(credential.code(), credential.public_message())
+        }
+        404 => scryer_plugin_pdk::plugin_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "the configured address does not answer as this service",
+        ),
+        429 => {
+            let builder = scryer_plugin_pdk::plugin_error(
+                PluginErrorCode::RateLimited,
+                "the service is rate limiting requests",
+            );
+            match retry_after_seconds {
+                Some(seconds) => builder.retry_after_seconds(seconds),
+                None => builder,
+            }
+        }
+        500..=599 => scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "the service answered with a server error",
+        ),
+        _ => scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::Permanent,
+            "the service refused the notification",
+        ),
+    };
+    builder.debug(redact_secrets(&debug.to_string())).build()
+}
+
+/// The typed error for a request that never got an HTTP answer (refused
+/// egress, DNS, connection or TLS failure, timeout), classified by the PDK.
+///
+/// URL secrets in the debug text (the host's transport error usually quotes the
+/// request URL) are replaced by [`redact_secrets`].
+pub fn request_failure(error: &Error) -> PluginError {
+    let mut error = scryer_plugin_pdk::error::plugin_error_from(error);
+    error.debug_message = error.debug_message.map(|debug| redact_secrets(&debug));
+    error
+}
+
+/// A `Retry-After` header in delta-seconds, if the response carried one.
+pub fn retry_after_header(headers: &std::collections::BTreeMap<String, String>) -> Option<i64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (seconds.ceil() as i64).max(1))
+}
+
+// ---------------------------------------------------------------------------
+// Redacting secrets from debug text
+// ---------------------------------------------------------------------------
+//
+// The same helper as `scryer_plugin_pdk::error::redact_secrets` in PDK 0.8.1.
+// The channels build against PDK 0.8.0 from crates.io, so it is carried here
+// until they take a PDK that exports it; keep the two in step.
+
+/// What a redacted secret is replaced with.
+pub const REDACTED: &str = "<redacted>";
+
+/// Path segments after which every further segment of a URL is a secret: the
+/// webhook id and token of Discord (`/api/webhooks/<id>/<token>`), Slack
+/// (`/services/T…/B…/<secret>`), Mattermost and Rocket.Chat
+/// (`/hooks/<id>[/<token>]`), Home Assistant (`/api/webhook/<id>`) and an
+/// Apprise configuration key (`/notify/<key>`).
+const SECRET_PATH_MARKERS: &[&str] = &["webhooks", "webhook", "hooks", "services", "notify"];
+
+/// The shortest path segment the shape heuristic treats as an opaque token.
+const MIN_TOKEN_SEGMENT: usize = 20;
+
+/// Replace the secrets a URL can carry with [`REDACTED`], everywhere a URL
+/// appears in `text`.
+///
+/// Meant for debug text — a transport error, an upstream body — that may quote
+/// the request URL of a channel whose URL *is* the credential. Inside every
+/// `scheme://…` it redacts:
+///
+/// * userinfo (`https://user:pass@host` → `https://<redacted>@host`);
+/// * every query value (`?token=…`, `?key=…`, `?apikey=…`, and any other) and
+///   the fragment;
+/// * every path segment after a known hook path (`webhooks`, `webhook`,
+///   `hooks`, `services`, `notify`);
+/// * a Telegram bot token segment (`/bot<id>:<secret>/…`);
+/// * any other path segment that looks like an opaque token: at least
+///   20 characters of `[A-Za-z0-9-_.~:=+%]` mixing letters and digits.
+///
+/// Text outside URLs is returned unchanged.
+pub fn redact_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(separator) = rest.find("://") {
+        // Past the whole delimiter: it may be multibyte punctuation such as `：`.
+        let scheme_start = rest[..separator]
+            .char_indices()
+            .rfind(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |(index, c)| index + c.len_utf8());
+        if scheme_start == separator {
+            // `://` with no scheme in front of it is not a URL.
+            out.push_str(&rest[..separator + 3]);
+            rest = &rest[separator + 3..];
+            continue;
+        }
+        let end = rest[separator + 3..]
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | ')' | ']' | '}')
+            })
+            .map_or(rest.len(), |index| separator + 3 + index);
+        out.push_str(&rest[..scheme_start]);
+        out.push_str(&redact_url(&rest[scheme_start..end]));
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_url(url: &str) -> String {
+    let Some(separator) = url.find("://") else {
+        return url.to_string();
+    };
+    let (scheme, rest) = (&url[..separator + 3], &url[separator + 3..]);
+    let (before_fragment, fragment) = match rest.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (rest, None),
+    };
+    let (before_query, query) = match before_fragment.split_once('?') {
+        Some((before, query)) => (before, Some(query)),
+        None => (before_fragment, None),
+    };
+    let (authority, path) = match before_query.find('/') {
+        Some(index) => before_query.split_at(index),
+        None => (before_query, ""),
+    };
+
+    let mut out = String::with_capacity(url.len());
+    out.push_str(scheme);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => {
+            out.push_str(REDACTED);
+            out.push('@');
+            out.push_str(host);
+        }
+        None => out.push_str(authority),
+    }
+
+    let mut after_marker = false;
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        if segment.is_empty() {
+            continue;
+        }
+        if after_marker || looks_like_token(segment) {
+            out.push_str(REDACTED);
+        } else if segment.starts_with("bot") && segment.contains(':') {
+            out.push_str("bot");
+            out.push_str(REDACTED);
+        } else {
+            out.push_str(segment);
+        }
+        if SECRET_PATH_MARKERS
+            .iter()
+            .any(|marker| segment.eq_ignore_ascii_case(marker))
+        {
+            after_marker = true;
+        }
+    }
+
+    if let Some(query) = query {
+        out.push('?');
+        for (index, pair) in query.split('&').enumerate() {
+            if index > 0 {
+                out.push('&');
+            }
+            match pair.split_once('=') {
+                Some((key, value)) if !value.is_empty() => {
+                    out.push_str(key);
+                    out.push('=');
+                    out.push_str(REDACTED);
+                }
+                Some((key, _)) => {
+                    out.push_str(key);
+                    out.push('=');
+                }
+                None if looks_like_token(pair) => out.push_str(REDACTED),
+                None => out.push_str(pair),
+            }
+        }
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        if !fragment.is_empty() {
+            out.push_str(REDACTED);
+        }
+    }
+    out
+}
+
+fn looks_like_token(segment: &str) -> bool {
+    segment.len() >= MIN_TOKEN_SEGMENT
+        && segment.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | ':' | '=' | '+' | '%')
+        })
+        && segment.chars().any(|c| c.is_ascii_digit())
+        && segment.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 #[cfg(test)]
@@ -647,6 +914,167 @@ mod tests {
             "title_move": title_move,
         }))
         .expect("title_moved request deserializes")
+    }
+
+    #[test]
+    fn credential_rejections_name_the_configured_credential() {
+        let key = http_failure(401, None, Credential::ApiKey, "HTTP 401: bad token");
+        assert_eq!(key.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+        assert_eq!(key.debug_message.as_deref(), Some("HTTP 401: bad token"));
+        assert!(!key.public_message.contains("bad token"));
+
+        let login = http_failure(403, None, Credential::UsernamePassword, "HTTP 403");
+        assert_eq!(
+            login.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        assert_eq!(
+            http_failure(401, None, Credential::Unknown, "").code,
+            PluginErrorCode::AuthFailed
+        );
+    }
+
+    #[test]
+    fn http_failures_map_to_the_shared_codes() {
+        assert_eq!(
+            http_failure(404, None, Credential::ApiKey, "").code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        let limited = http_failure(429, Some(30), Credential::ApiKey, "");
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(30));
+        assert_eq!(
+            http_failure(503, None, Credential::ApiKey, "").code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            http_failure(400, None, Credential::ApiKey, "").code,
+            PluginErrorCode::Permanent
+        );
+    }
+
+    #[test]
+    fn retry_after_reads_delta_seconds_only() {
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("Retry-After".to_string(), "12".to_string());
+        assert_eq!(retry_after_header(&headers), Some(12));
+        headers.insert(
+            "Retry-After".to_string(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        );
+        assert_eq!(retry_after_header(&headers), None);
+    }
+
+    #[test]
+    fn redacts_url_userinfo() {
+        assert_eq!(
+            redact_secrets("GET https://operator:hunter2@example.invalid/api failed"),
+            "GET https://<redacted>@example.invalid/api failed"
+        );
+    }
+
+    #[test]
+    fn a_url_after_multibyte_punctuation_is_still_redacted() {
+        assert_eq!(
+            redact_secrets("Request failed：https://example.invalid/?token=secret"),
+            "Request failed：https://example.invalid/?token=<redacted>"
+        );
+    }
+
+    #[test]
+    fn redacts_every_query_value_and_the_fragment() {
+        assert_eq!(
+            redact_secrets(
+                "https://example.invalid/message?token=abc&key=def&apikey=ghi&empty=&flag#frag"
+            ),
+            "https://example.invalid/message?token=<redacted>&key=<redacted>&apikey=<redacted>&empty=&flag#<redacted>"
+        );
+    }
+
+    #[test]
+    fn redacts_a_discord_webhook_id_and_token() {
+        assert_eq!(
+            redact_secrets(
+                "error sending request for url (https://discord.invalid/api/webhooks/123/abc)"
+            ),
+            "error sending request for url (https://discord.invalid/api/webhooks/<redacted>/<redacted>)"
+        );
+    }
+
+    #[test]
+    fn redacts_a_slack_services_path() {
+        assert_eq!(
+            redact_secrets("https://hooks.slack.invalid/services/T000/B000/XXXX"),
+            "https://hooks.slack.invalid/services/<redacted>/<redacted>/<redacted>"
+        );
+    }
+
+    #[test]
+    fn redacts_hooks_webhook_and_notify_paths() {
+        assert_eq!(
+            redact_secrets("https://chat.invalid/hooks/abc/def"),
+            "https://chat.invalid/hooks/<redacted>/<redacted>"
+        );
+        assert_eq!(
+            redact_secrets("http://ha.invalid:8123/api/webhook/abc"),
+            "http://ha.invalid:8123/api/webhook/<redacted>"
+        );
+        assert_eq!(
+            redact_secrets("http://apprise.invalid/notify/key1"),
+            "http://apprise.invalid/notify/<redacted>"
+        );
+    }
+
+    #[test]
+    fn redacts_a_telegram_bot_token_segment() {
+        assert_eq!(
+            redact_secrets("https://api.telegram.invalid/bot12:ab/sendMessage"),
+            "https://api.telegram.invalid/bot<redacted>/sendMessage"
+        );
+    }
+
+    #[test]
+    fn redacts_an_opaque_token_shaped_segment() {
+        assert_eq!(
+            redact_secrets("https://push.invalid/a1b2c3d4e5f6a7b8c9d0/notifications/Example"),
+            "https://push.invalid/<redacted>/notifications/Example"
+        );
+        // Short, word-like or digit-only segments are left alone.
+        assert_eq!(
+            redact_secrets("http://signal.invalid:8080/v2/send"),
+            "http://signal.invalid:8080/v2/send"
+        );
+    }
+
+    #[test]
+    fn leaves_text_without_urls_alone_and_handles_several_urls() {
+        assert_eq!(
+            redact_secrets("HTTP 500: upstream exploded"),
+            "HTTP 500: upstream exploded"
+        );
+        assert_eq!(redact_secrets("odd :// marker"), "odd :// marker");
+        assert_eq!(
+            redact_secrets("a https://x.invalid/?k=1 b \"https://u:p@y.invalid\" c"),
+            "a https://x.invalid/?k=<redacted> b \"https://<redacted>@y.invalid\" c"
+        );
+    }
+
+    #[test]
+    fn shared_error_helpers_redact_their_debug_text() {
+        let url = "https://discord.invalid/api/webhooks/1/secret";
+        for error in [
+            http_failure(500, None, Credential::ApiKey, format!("POST {url}")),
+            rejected_credential(Credential::ApiKey, format!("POST {url}")),
+        ] {
+            let debug = error.debug_message.unwrap();
+            assert!(!debug.contains("secret"), "{debug}");
+            assert!(
+                debug.contains("/api/webhooks/<redacted>/<redacted>"),
+                "{debug}"
+            );
+        }
+        let failed = error_response(format!("request failed for {url}"), None);
+        assert!(!failed.error.unwrap().contains("secret"));
     }
 
     #[test]

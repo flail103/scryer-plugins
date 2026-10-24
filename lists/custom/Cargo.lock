@@ -61,7 +61,7 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
 name = "custom-list-provider"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "list-provider-common",
  "regex",
@@ -195,7 +195,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "list-provider-common"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "quick-xml",
  "scryer-plugin-pdk",
@@ -382,7 +382,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scryer-plugin-pdk"
-version = "0.7.0"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd05e4ac0d93f86458afce9cb834791f0f27e2a4a8b16d900cd637e42769a48f"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -395,9 +397,9 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-sdk"
-version = "3.12.0"
+version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b885a61a72e9776886c5e56ad454d2d5df4b1fa8b317ba333d383dd1f4858b8"
+checksum = "a045c679044705d66fa330cc0e59ba1d12dcab84e354c6f37705efdf7444b3f2"
 dependencies = [
  "base64",
  "schemars",

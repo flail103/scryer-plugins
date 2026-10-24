@@ -53,7 +53,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use scryer_plugin_pdk::sdk::command::{PluginSubtitleCommand, PluginSubtitleCommandResult};
-use scryer_plugin_pdk::{HttpRequest, HttpResponse, config, http};
+use scryer_plugin_pdk::{HttpRequest, HttpResponse, codes, config, http, plugin_error};
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldType, ConfigFieldValueSource, PluginDescriptor, PluginError,
@@ -289,34 +289,28 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         // `SubtitleCapabilities::mode` and never routes a generate here, so
         // this arm answers in-band rather than trapping.
         PluginSubtitleCommand::Generate(_) => {
-            PluginSubtitleCommandResult::Generate(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "OpenSubtitles is a catalog subtitle provider and cannot \
-                                 generate subtitles"
-                    .to_string(),
-                debug_message: Some(
-                    "SubtitleProviderMode::Catalog advertises no generate capability".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
+            PluginSubtitleCommandResult::Generate(PluginResult::Err(
+                plugin_error(
+                    PluginErrorCode::Unsupported,
+                    "OpenSubtitles is a catalog subtitle provider and cannot generate subtitles",
+                )
+                .debug("SubtitleProviderMode::Catalog advertises no generate capability")
+                .build(),
+            ))
         }
         // Alignment moved into this envelope when the subtitle-sync plugin
         // migrated off its own transport, so every subtitle provider now sees
         // the operation whether or not it can serve one. OpenSubtitles cannot: it has
         // no audio decoder and advertises no `sync` capability. Same in-band
         // refusal as `Generate`, for the same reason.
-        PluginSubtitleCommand::Sync(_) => {
-            PluginSubtitleCommandResult::Sync(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "OpenSubtitles cannot align subtitles".to_string(),
-                debug_message: Some(
-                    "SubtitleCapabilities::sync is None for this provider".to_string(),
-                ),
-                retry_after_seconds: None,
-                details: None,
-            }))
-        }
+        PluginSubtitleCommand::Sync(_) => PluginSubtitleCommandResult::Sync(PluginResult::Err(
+            plugin_error(
+                PluginErrorCode::Unsupported,
+                "OpenSubtitles cannot align subtitles",
+            )
+            .debug("SubtitleCapabilities::sync is None for this provider")
+            .build(),
+        )),
     }
 }
 
@@ -346,11 +340,11 @@ fn validate_config(
 fn search(request: &SubtitlePluginSearchRequest) -> PluginResult<SubtitlePluginSearchResponse> {
     let config = match OpenSubtitlesConfig::from_host() {
         Ok(config) => config,
-        Err(error) => return PluginResult::Err(plugin_error(error)),
+        Err(error) => return PluginResult::Err(classify_error(error)),
     };
     match search_subtitles_impl(&config, request) {
         Ok(results) => PluginResult::Ok(SubtitlePluginSearchResponse { results }),
-        Err(error) => PluginResult::Err(plugin_error(error)),
+        Err(error) => PluginResult::Err(classify_error(error)),
     }
 }
 
@@ -359,46 +353,93 @@ fn download(
 ) -> PluginResult<SubtitlePluginDownloadResponse> {
     let config = match OpenSubtitlesConfig::from_host() {
         Ok(config) => config,
-        Err(error) => return PluginResult::Err(plugin_error(error)),
+        Err(error) => return PluginResult::Err(classify_error(error)),
     };
     match download_subtitle_impl(&config, request) {
         Ok(response) => PluginResult::Ok(response),
-        Err(error) => PluginResult::Err(plugin_error(error)),
+        Err(error) => PluginResult::Err(classify_error(error)),
     }
 }
 
 /// The typed counterpart of [`validation_error_response`].
 ///
 /// It reads the same messages `http_error` produces and reaches the same
-/// verdicts, so a search or download failure and a validation failure now
-/// describe the same problem the same way — which they could not do while the
-/// old channel flattened everything but the text.
-fn plugin_error(error: String) -> PluginError {
-    let (code, retry_after_seconds) = if error.contains("authentication failed") {
-        (PluginErrorCode::AuthFailed, None)
-    } else if error.contains("rate limited") {
+/// verdicts, so a search or download failure and a validation failure
+/// describe the same problem the same way. The message itself can carry
+/// upstream text and the API host, so it goes to the debug detail; the public
+/// sentence is fixed per verdict. Configuration messages are the plugin's own
+/// wording and stay public.
+fn classify_error(error: String) -> PluginError {
+    let (code, public_message): (PluginErrorCode, &str) = if error.contains(API_KEY_REJECTED) {
         (
-            PluginErrorCode::RateLimited,
-            retry_after_from_message(&error),
+            codes::INVALID_API_KEY.into(),
+            "OpenSubtitles rejected the API key.",
         )
+    } else if error.contains(CREDENTIALS_REJECTED) {
+        (
+            codes::INVALID_USERNAME_PASSWORD.into(),
+            "OpenSubtitles rejected the username or password.",
+        )
+    } else if error.contains("authentication failed") {
+        (
+            PluginErrorCode::AuthFailed,
+            "OpenSubtitles rejected the credentials.",
+        )
+    } else if error.contains(QUOTA_REACHED) {
+        (
+            codes::QUOTA_EXCEEDED.into(),
+            "The OpenSubtitles daily download quota is used up.",
+        )
+    } else if error.contains("rate limited") {
+        let mut builder = plugin_error(
+            PluginErrorCode::RateLimited,
+            "OpenSubtitles is rate limiting requests.",
+        )
+        .debug(&error);
+        if let Some(seconds) = retry_after_from_message(&error) {
+            builder = builder.retry_after_seconds(seconds);
+        }
+        return builder.build();
     } else if error.contains("required")
         || error.contains("missing")
         || error == EMAIL_USERNAME_ERROR
     {
-        (PluginErrorCode::InvalidConfig, None)
+        return plugin_error(PluginErrorCode::InvalidConfig, error).build();
+    } else if error.contains(TLS_FAILED) {
+        (
+            codes::TLS_ERROR.into(),
+            "A secure connection to OpenSubtitles could not be established.",
+        )
     } else if error.contains("request failed") {
-        (PluginErrorCode::UpstreamUnavailable, None)
+        (
+            PluginErrorCode::UpstreamUnavailable,
+            "OpenSubtitles could not be reached.",
+        )
+    } else if error.contains(SERVER_ERROR) {
+        (
+            PluginErrorCode::UpstreamUnavailable,
+            "OpenSubtitles answered with a server error.",
+        )
+    } else if error.contains("parse error") {
+        (
+            codes::INVALID_RESPONSE.into(),
+            "OpenSubtitles returned a response Scryer could not read.",
+        )
     } else {
-        (PluginErrorCode::Temporary, None)
+        (
+            PluginErrorCode::Temporary,
+            "The OpenSubtitles request could not be completed.",
+        )
     };
-    PluginError {
-        code,
-        public_message: error,
-        debug_message: None,
-        retry_after_seconds,
-        details: None,
-    }
+    plugin_error(code, public_message).debug(error).build()
 }
+
+/// Phrases `http_error` writes and `classify_error` reads back.
+const API_KEY_REJECTED: &str = "rejected the API key";
+const CREDENTIALS_REJECTED: &str = "rejected the username or password";
+const QUOTA_REACHED: &str = "daily quota reached";
+const SERVER_ERROR: &str = "server error";
+const TLS_FAILED: &str = "request failed (tls)";
 
 fn retry_after_from_message(error: &str) -> Option<i64> {
     let (_, tail) = error.split_once("retry after ")?;
@@ -428,6 +469,7 @@ fn descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Subtitle(SubtitleDescriptor {
             provider_type: "opensubtitles".to_string(),
             provider_aliases: vec![],
@@ -1414,8 +1456,15 @@ fn send_open_subtitles_request(
     body: Option<Vec<u8>>,
 ) -> Result<HttpResponse, String> {
     wait_for_api_request_slot()?;
-    http::request::<Vec<u8>>(request, body)
-        .map_err(|error| format!("OpenSubtitles request failed: {error}"))
+    http::request::<Vec<u8>>(request, body).map_err(|error| {
+        let tls = scryer_plugin_pdk::error::plugin_error_from(&error).code
+            == PluginErrorCode::from(codes::TLS_ERROR);
+        if tls {
+            format!("OpenSubtitles {TLS_FAILED}: {error}")
+        } else {
+            format!("OpenSubtitles request failed: {error}")
+        }
+    })
 }
 
 fn wait_for_api_request_slot() -> Result<(), String> {
@@ -1476,6 +1525,16 @@ fn retry_after_seconds(response: &HttpResponse) -> Option<u64> {
 }
 
 fn validation_error_response(error: &str) -> SubtitlePluginValidateConfigResponse {
+    let public = classify_error(error.to_string()).public_message;
+    let error = error.to_string();
+    let response = validation_status(&error);
+    SubtitlePluginValidateConfigResponse {
+        message: Some(public),
+        ..response
+    }
+}
+
+fn validation_status(error: &str) -> SubtitlePluginValidateConfigResponse {
     if error.contains("authentication failed") {
         SubtitlePluginValidateConfigResponse {
             status: SubtitleValidateConfigStatus::AuthFailed,
@@ -1514,35 +1573,66 @@ fn validation_error_response(error: &str) -> SubtitlePluginValidateConfigRespons
 }
 
 fn http_error(config: &OpenSubtitlesConfig, action: &str, response: &HttpResponse) -> String {
-    let status = response.status_code();
     let body = String::from_utf8_lossy(&response.body()).trim().to_string();
+    describe_http_failure(
+        action,
+        response.status_code(),
+        &body,
+        retry_after_seconds(response),
+        current_token(config).is_some(),
+        &current_api_host(),
+    )
+}
+
+/// The message for a failed OpenSubtitles call, worded so `classify_error`
+/// and `validation_error_response` can read the verdict back.
+///
+/// OpenSubtitles answers a bad or missing `Api-Key` with 403, and a refused
+/// login with 401 whose body says which half was wrong; any other 401 is a
+/// bearer token it no longer accepts after the one re-login retry.
+fn describe_http_failure(
+    action: &str,
+    status: u16,
+    body: &str,
+    retry_after: Option<u64>,
+    bearer_present: bool,
+    api_host: &str,
+) -> String {
+    let lowered = body.to_ascii_lowercase();
+    let names_api_key = lowered.contains("api key")
+        || lowered.contains("apikey")
+        || lowered.contains("api-key")
+        || lowered.contains("consume this service");
     match status {
+        401 | 403 if names_api_key || status == 403 => format!(
+            "OpenSubtitles {action} authentication failed: {API_KEY_REJECTED} on {api_host}: {}",
+            compact_error_body(body)
+        ),
+        401 if action == "login" => format!(
+            "OpenSubtitles {action} authentication failed: {CREDENTIALS_REJECTED} on {api_host}: {}",
+            compact_error_body(body)
+        ),
         401 => format!(
-            "OpenSubtitles {action} authentication failed on {} (bearer={}): {}",
-            current_api_host(),
-            if current_token(config).is_some() {
-                "present"
-            } else {
-                "missing"
-            },
-            compact_error_body(&body)
+            "OpenSubtitles {action} authentication failed on {api_host} (bearer={}): {}",
+            if bearer_present { "present" } else { "missing" },
+            compact_error_body(body)
         ),
         406 => format!(
-            "OpenSubtitles daily quota reached during {action}: {}",
-            compact_error_body(&body)
+            "OpenSubtitles {QUOTA_REACHED} during {action}: {}",
+            compact_error_body(body)
         ),
         410 => format!("OpenSubtitles {action} link expired"),
         429 => {
-            let retry_after = retry_after_seconds(response).unwrap_or(DEFAULT_RETRY_AFTER_SECONDS);
+            let retry_after = retry_after.unwrap_or(DEFAULT_RETRY_AFTER_SECONDS);
             format!("OpenSubtitles rate limited — retry after {retry_after}s")
         }
         500..=599 => format!(
-            "OpenSubtitles {action} failed with HTTP {status}: {}",
-            compact_error_body(&body)
+            "OpenSubtitles {action} failed with HTTP {status} ({SERVER_ERROR}): {}",
+            compact_error_body(body)
         ),
         _ => format!(
             "OpenSubtitles {action} returned HTTP {status}: {}",
-            compact_error_body(&body)
+            compact_error_body(body)
         ),
     }
 }
@@ -1952,10 +2042,13 @@ mod tests {
         config_auth_fingerprint, descriptor, encode_query, from_opensubtitles_language,
         is_real_forced, to_opensubtitles_language, validate_username,
     };
+    use super::{classify_error, describe_http_failure};
+    use scryer_plugin_pdk::codes;
     use scryer_plugin_sdk::{
         ConfigFieldValueSource, PluginHostBindingId, ProviderDescriptor, SubtitleMatchHintKind,
         SubtitlePluginCandidate, SubtitlePluginSearchRequest,
     };
+    use scryer_plugin_sdk::{PluginError, PluginErrorCode};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2066,12 +2159,84 @@ mod tests {
             error,
             "OpenSubtitles requires the account username, not the email address"
         );
-        let structured = super::plugin_error(error);
+        let structured = super::classify_error(error);
         assert_eq!(
             structured.code,
             scryer_plugin_sdk::PluginErrorCode::InvalidConfig
         );
         assert!(structured.retry_after_seconds.is_none());
+    }
+
+    fn verdict(action: &str, status: u16, body: &str) -> PluginError {
+        classify_error(describe_http_failure(
+            action,
+            status,
+            body,
+            Some(120),
+            true,
+            "api.fixture.invalid",
+        ))
+    }
+
+    #[test]
+    fn a_refused_login_reports_which_credential_was_wrong() {
+        let password = verdict(
+            "login",
+            401,
+            r#"{"message":"Error, invalid username/password","status":401}"#,
+        );
+        assert_eq!(
+            password.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        assert!(!password.public_message.contains("fixture"));
+        assert!(
+            !password
+                .public_message
+                .contains("invalid username/password")
+        );
+        assert!(
+            password
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("invalid username/password")
+        );
+
+        let api_key = verdict(
+            "search",
+            403,
+            r#"{"message":"You cannot consume this service","status":403}"#,
+        );
+        assert_eq!(api_key.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+        let login_api_key = verdict("login", 401, r#"{"message":"Invalid API key"}"#);
+        assert_eq!(
+            login_api_key.code,
+            PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
+    }
+
+    #[test]
+    fn quota_rate_limit_and_unreadable_bodies_carry_their_codes() {
+        let quota = verdict(
+            "download",
+            406,
+            r#"{"message":"You have downloaded your allowed 20 subtitles for 24h"}"#,
+        );
+        assert_eq!(quota.code, PluginErrorCode::from(codes::QUOTA_EXCEEDED));
+
+        let limited = verdict("search", 429, "");
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(120));
+
+        assert_eq!(
+            verdict("search", 503, "busy").code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            classify_error("OpenSubtitles search parse error: expected value".to_string()).code,
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
     }
 
     #[test]

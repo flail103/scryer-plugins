@@ -8,7 +8,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use scryer_plugin_pdk::{Error, FnResult, component, sdk};
+use scryer_plugin_pdk::{
+    CONFIG_FIELDS_ACTION, ConfigFieldsRequest, ConfigFieldsResponse, Error, FnResult, component,
+    plugin_error, sdk,
+};
 use scryer_plugin_sdk::command::{PluginActionRequest, PluginActionResponse};
 use serde_json::Value;
 use url::Url;
@@ -18,6 +21,7 @@ mod definition;
 mod filters;
 #[cfg(test)]
 mod gate;
+mod info_text;
 mod runtime;
 mod template;
 
@@ -39,11 +43,10 @@ fn build_descriptor() -> sdk::PluginDescriptor {
         id: "cardigann-engine".to_string(),
         name: "Advanced Indexers".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        // The JSON endpoint-resolution extension requires the 3.16 host contract,
-        // even while the typed PDK uses the older SDK surface.
-        sdk_version: "3.16.0".to_string(),
-        sdk_constraint: ">=3.16.0, <4.0.0".to_string(),
+        sdk_version: sdk::SDK_VERSION.to_string(),
+        sdk_constraint: sdk::current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: sdk::ProviderDescriptor::Indexer(sdk::IndexerDescriptor {
             provider_type: "cardigann".to_string(),
             provider_aliases: vec![],
@@ -126,6 +129,14 @@ fn build_descriptor() -> sdk::PluginDescriptor {
                     sdk::IndexerSearchInput::Offset,
                     sdk::IndexerSearchInput::Limit,
                 ],
+                // Tracker origins come from the configured definition, so the
+                // host asks the engine for them instead of a static allowlist.
+                resolve_network_endpoints: true,
+                // A bundled definition's own settings become form fields once
+                // the operator picks it.
+                dynamic_config_fields: Some(sdk::DynamicConfigFieldsCapability {
+                    trigger_keys: vec!["definition".to_string()],
+                }),
                 ..sdk::IndexerCapabilities::default()
             },
             scoring_policies: vec![],
@@ -204,17 +215,17 @@ fn config_fields() -> Vec<sdk::ConfigFieldDef> {
                 Some("Optional initial tracker cookie."),
             )
         },
-        sdk::ConfigFieldDef {
-            advanced: true,
-            ..field(
-                "cardigannCaptcha",
-                "CAPTCHA Answer",
-                sdk::ConfigFieldType::String,
-                false,
-                None,
-                Some("Answer returned for a Cardigann image CAPTCHA."),
-            )
-        },
+        // Shown only for a definition whose login has a CAPTCHA; Scryer then
+        // fetches the image through `checkCaptcha` and shows it beside this
+        // field.
+        field(
+            "cardigannCaptcha",
+            "CAPTCHA Answer",
+            sdk::ConfigFieldType::String,
+            false,
+            Some(sdk::ConfigFieldRole::LoginChallengeAnswer),
+            Some("Type the characters in the CAPTCHA image, then save."),
+        ),
     ]
 }
 
@@ -252,7 +263,7 @@ fn field(
 }
 
 async fn search(request: sdk::PluginSearchRequest) -> FnResult<sdk::PluginSearchResponse> {
-    let (definition, config) = load_definition_and_config().map_err(Error::msg)?;
+    let (definition, config) = load_definition_and_config()?;
     runtime::search(definition, request, config)
         .await
         .map_err(engine_error)
@@ -278,29 +289,222 @@ fn engine_error(error: runtime::EngineError) -> Error {
 /// Anything else is reported as unsupported so the host can keep its own
 /// fallbacks.
 async fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> {
+    if request.action == CONFIG_FIELDS_ACTION {
+        let request: ConfigFieldsRequest =
+            serde_json::from_value(request.payload).map_err(|error| {
+                plugin_error(
+                    sdk::PluginErrorCode::Permanent,
+                    "The config fields request was malformed.",
+                )
+                .debug(error)
+                .into_error()
+            })?;
+        let response = dynamic_config_fields(&request)?;
+        return Ok(PluginActionResponse {
+            payload: serde_json::to_value(response)?,
+        });
+    }
     if request.action == "resolve_network_endpoints" {
-        let (definition, config) = load_definition_and_config().map_err(Error::msg)?;
+        let (definition, config) = load_definition_and_config()?;
         let origins =
-            runtime::resolve_network_endpoints(&definition, &config).map_err(Error::msg)?;
+            runtime::resolve_network_endpoints(&definition, &config).map_err(endpoint_error)?;
         return Ok(PluginActionResponse {
             payload: serde_json::json!({ "origins": origins }),
         });
     }
     let action = match request.action.as_str() {
         "checkCaptcha" | "check_captcha" => EngineAction::CheckCaptcha,
-        "grab" => EngineAction::Grab(action_url(&request.payload).map_err(Error::msg)?),
+        "grab" => EngineAction::Grab(action_url(&request.payload).map_err(|error| {
+            plugin_error(
+                sdk::PluginErrorCode::Permanent,
+                "The grab action needs a release URL.",
+            )
+            .debug(error)
+            .into_error()
+        })?),
         action => {
             return Err(component::structured_plugin_error(
                 component::action_unsupported(action),
             ));
         }
     };
-    let (definition, config) = load_definition_and_config().map_err(Error::msg)?;
+    let (definition, config) = load_definition_and_config()?;
     Ok(PluginActionResponse {
         payload: runtime::action(definition, action, config)
             .await
             .map_err(engine_error)?,
     })
+}
+
+/// Static setting keys a definition setting can never reuse as a dynamic
+/// field: the host rejects a dynamic field that shadows a static one, and the
+/// engine already reads these from their static fields.
+const STATIC_CONFIG_KEYS: [&str; 8] = [
+    "definition",
+    "base_url",
+    "definition_yaml",
+    "extra_field_data_json",
+    "username",
+    "password",
+    "cookie",
+    "cardigannCaptcha",
+];
+
+/// Static credential fields a definition may or may not use.
+const CREDENTIAL_KEYS: [&str; 4] = ["username", "password", "cookie", "cardigannCaptcha"];
+
+/// The form fields for the selected definition.
+///
+/// A bundled definition contributes its own settings as fields and hides the
+/// static credential fields it does not use. With no definition selected the
+/// credential fields are hidden until one is. Custom keeps the static form:
+/// its settings live in the pasted YAML, which is not a trigger value.
+fn dynamic_config_fields(request: &ConfigFieldsRequest) -> FnResult<ConfigFieldsResponse> {
+    let selected = request
+        .values
+        .get("definition")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let Some(id) = selected else {
+        return Ok(ConfigFieldsResponse {
+            fields: Vec::new(),
+            hidden_field_keys: CREDENTIAL_KEYS.iter().map(|key| key.to_string()).collect(),
+        });
+    };
+    if id == CUSTOM_DEFINITION_ID {
+        return Ok(ConfigFieldsResponse::default());
+    }
+    let yaml = baked::definition_yaml(id)
+        .map_err(|error| invalid_setting("definition", error))?
+        .ok_or_else(|| invalid_setting("definition", format!("`{id}` is not bundled")))?;
+    let definition =
+        parse_definition(&yaml).map_err(|error| invalid_setting("definition", error))?;
+    Ok(definition_config_fields(&definition))
+}
+
+fn definition_config_fields(definition: &Definition) -> ConfigFieldsResponse {
+    let fields = definition
+        .settings
+        .iter()
+        .filter(|setting| !STATIC_CONFIG_KEYS.contains(&setting.name.as_str()))
+        .filter_map(setting_field)
+        .take(256)
+        .collect();
+    let uses = |key: &str| match key {
+        "cardigannCaptcha" => definition
+            .login
+            .as_ref()
+            .is_some_and(|login| login.captcha.is_some()),
+        key => definition
+            .settings
+            .iter()
+            .any(|setting| setting.name == key),
+    };
+    let hidden_field_keys = CREDENTIAL_KEYS
+        .into_iter()
+        .filter(|key| !uses(key))
+        .map(str::to_string)
+        .collect();
+    ConfigFieldsResponse {
+        fields,
+        hidden_field_keys,
+    }
+}
+
+/// One definition setting as a form field. Informational settings become
+/// read-only notes that never take a value; setting types the engine does not
+/// bind are left out.
+fn setting_field(setting: &Setting) -> Option<sdk::ConfigFieldDef> {
+    let key = setting.name.trim();
+    if key.is_empty() || key.len() > 128 {
+        return None;
+    }
+    if setting.setting_type.starts_with("info") {
+        let default_text = setting
+            .default_value
+            .as_ref()
+            .and_then(definition::scalar_to_string);
+        let (label, text) = info_text::info_note(
+            &setting.setting_type,
+            setting.label.as_deref(),
+            default_text.as_deref(),
+        )?;
+        return Some(field(
+            key,
+            &label,
+            sdk::ConfigFieldType::Info,
+            false,
+            None,
+            (!text.is_empty()).then_some(text.as_str()),
+        ));
+    }
+    let default = setting
+        .default_value
+        .as_ref()
+        .and_then(definition::scalar_to_string);
+    let (field_type, options, default_value) = match setting.setting_type.as_str() {
+        "text" => (sdk::ConfigFieldType::String, Vec::new(), default),
+        "password" => (sdk::ConfigFieldType::Password, Vec::new(), None),
+        "checkbox" => (
+            sdk::ConfigFieldType::Bool,
+            Vec::new(),
+            default.map(|value| {
+                let on = value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("on");
+                on.to_string()
+            }),
+        ),
+        "select" => {
+            let options = select_options(setting.options.as_ref());
+            if options.is_empty() {
+                return None;
+            }
+            let default_value =
+                default.filter(|value| options.iter().any(|option| &option.value == value));
+            (sdk::ConfigFieldType::Select, options, default_value)
+        }
+        _ => return None,
+    };
+    let label = setting
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(key);
+    // The engine falls back to the definition's default, so an operator only
+    // has to fill in a required setting that has none.
+    let required = setting.required && default_value.is_none();
+    Some(sdk::ConfigFieldDef {
+        default_value,
+        options,
+        ..field(
+            key,
+            label,
+            field_type,
+            required,
+            None,
+            setting.help_text.as_deref(),
+        )
+    })
+}
+
+fn select_options(options: Option<&serde_yaml::Value>) -> Vec<sdk::ConfigFieldOption> {
+    let Some(serde_yaml::Value::Mapping(options)) = options else {
+        return Vec::new();
+    };
+    options
+        .iter()
+        .filter_map(|(value, label)| {
+            let value = definition::scalar_to_string(value)?;
+            let label = definition::scalar_to_string(label).unwrap_or_else(|| value.clone());
+            Some(sdk::ConfigFieldOption {
+                value,
+                label,
+                config_overrides: BTreeMap::new(),
+            })
+        })
+        .collect()
 }
 
 fn action_url(payload: &Value) -> Result<String, String> {
@@ -322,11 +526,46 @@ fn action_url(payload: &Value) -> Result<String, String> {
 /// indexer from Custom to a bundled tracker would otherwise keep silently using
 /// the stale paste. Custom — the contrib and testing escape hatch — is the only
 /// mode that requires `definition_yaml`, and says so when it is missing.
-fn load_definition_source() -> Result<String, String> {
-    resolve_definition_source(
-        host_config("definition")?.as_deref(),
-        host_config("definition_yaml")?.as_deref(),
+/// The source YAML and the setting key that supplied it, which is the key an
+/// invalid definition is reported against.
+fn load_definition_source() -> Result<(String, &'static str), Error> {
+    let selected = host_config("definition").map_err(Error::msg)?;
+    let pasted = host_config("definition_yaml").map_err(Error::msg)?;
+    let key = definition_source_key(selected.as_deref());
+    resolve_definition_source(selected.as_deref(), pasted.as_deref())
+        .map(|source| (source, key))
+        .map_err(|error| invalid_setting(key, error))
+}
+
+/// `definition_yaml` when the operator pastes the definition (Custom, or no
+/// selection), otherwise `definition`.
+fn definition_source_key(selected: Option<&str>) -> &'static str {
+    match selected.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some(CUSTOM_DEFINITION_ID) => "definition_yaml",
+        Some(_) => "definition",
+    }
+}
+
+/// Endpoints the configured URL or the definition name that the plugin
+/// cannot declare to the host: a setting the operator has to fix.
+fn endpoint_error(detail: impl std::fmt::Display) -> Error {
+    plugin_error(
+        sdk::PluginErrorCode::InvalidConfig,
+        "The indexer's URL or definition names an endpoint the plugin cannot use.",
     )
+    .debug(detail)
+    .into_error()
+}
+
+/// A missing or invalid setting, named for the operator; the detail stays in
+/// the debug message.
+fn invalid_setting(key: &str, detail: impl std::fmt::Display) -> Error {
+    plugin_error(
+        sdk::PluginErrorCode::InvalidConfig,
+        format!("The {key} setting is missing or invalid."),
+    )
+    .debug(detail)
+    .into_error()
 }
 
 fn resolve_definition_source(
@@ -352,9 +591,10 @@ fn resolve_definition_source(
     }
 }
 
-fn load_definition_and_config() -> Result<(Definition, BTreeMap<String, String>), String> {
-    let definition_yaml = load_definition_source()?;
-    let definition = parse_definition(&definition_yaml)?;
+fn load_definition_and_config() -> Result<(Definition, BTreeMap<String, String>), Error> {
+    let (definition_yaml, source_key) = load_definition_source()?;
+    let definition =
+        parse_definition(&definition_yaml).map_err(|error| invalid_setting(source_key, error))?;
     let mut config = BTreeMap::new();
     for key in HOST_CONFIG_KEYS.into_iter().chain(
         definition
@@ -362,20 +602,25 @@ fn load_definition_and_config() -> Result<(Definition, BTreeMap<String, String>)
             .iter()
             .map(|setting| setting.name.as_str()),
     ) {
-        if let Some(value) = host_config(key)?
+        if let Some(value) = host_config(key).map_err(Error::msg)?
             && !value.trim().is_empty()
         {
             config.insert(key.to_string(), value);
         }
     }
-    merge_extra_field_data(&mut config, host_config("extra_field_data_json")?)?;
+    merge_extra_field_data(
+        &mut config,
+        host_config("extra_field_data_json").map_err(Error::msg)?,
+    )
+    .map_err(|error| invalid_setting("extra_field_data_json", error))?;
     if config
         .get("base_url")
         .is_none_or(|base_url| base_url.trim().is_empty())
     {
-        return Err("base_url must be configured".to_string());
+        return Err(invalid_setting("base_url", "base_url must be configured"));
     }
-    validate_configured_base_url(&definition, &config)?;
+    validate_configured_base_url(&definition, &config)
+        .map_err(|error| invalid_setting("base_url", error))?;
     Ok((definition, config))
 }
 
@@ -487,6 +732,15 @@ fn validate_metadata(definition: &Definition) -> Result<(), String> {
 mod component_abi_tests {
     use super::*;
 
+    #[test]
+    fn an_unusable_endpoint_is_an_invalid_setting() {
+        let error = scryer_plugin_pdk::error::plugin_error_from(&endpoint_error(
+            "Endpoint authorities must be HTTP(S) URLs without credentials",
+        ));
+        assert_eq!(error.code, sdk::PluginErrorCode::InvalidConfig);
+        assert!(!error.public_message.contains("credentials"));
+    }
+
     const DEFINITION: &str = r#"
 id: example
 name: Example Tracker
@@ -506,13 +760,12 @@ search:
     /// PDK's result adapter; anything else stays the generic component error.
     #[test]
     fn engine_errors_reach_the_host_with_their_sdk_code() {
-        let typed = sdk::PluginError {
-            code: sdk::PluginErrorCode::AuthFailed,
-            public_message: "Tracker login failed: synthetic reason".to_string(),
-            debug_message: Some("detail".to_string()),
-            retry_after_seconds: None,
-            details: None,
-        };
+        let typed = plugin_error(
+            sdk::PluginErrorCode::AuthFailed,
+            "Tracker login failed: synthetic reason",
+        )
+        .debug("detail")
+        .build();
         let result = component::to_plugin_result::<()>(Err(engine_error(
             runtime::EngineError::Plugin(typed.clone()),
         )));
@@ -533,6 +786,215 @@ search:
         assert_eq!(error.debug_message.as_deref(), Some("engine detail"));
     }
 
+    fn config_fields_for(definition: Option<&str>) -> ConfigFieldsResponse {
+        let mut values = BTreeMap::new();
+        if let Some(definition) = definition {
+            values.insert("definition".to_string(), definition.to_string());
+        }
+        match dynamic_config_fields(&ConfigFieldsRequest { values }) {
+            Ok(response) => response,
+            Err(error) => panic!("config fields failed: {error}"),
+        }
+    }
+
+    /// With nothing selected the credential fields wait for a definition;
+    /// Custom keeps the whole static form.
+    #[test]
+    fn config_fields_hide_credentials_until_a_definition_is_chosen() {
+        for none in [None, Some(""), Some("  ")] {
+            let response = config_fields_for(none);
+            assert!(response.fields.is_empty());
+            assert_eq!(
+                response.hidden_field_keys,
+                vec!["username", "password", "cookie", "cardigannCaptcha"]
+            );
+        }
+        assert_eq!(
+            config_fields_for(Some(CUSTOM_DEFINITION_ID)),
+            ConfigFieldsResponse::default()
+        );
+        let error = component::to_plugin_result::<()>(
+            dynamic_config_fields(&ConfigFieldsRequest {
+                values: BTreeMap::from([(
+                    "definition".to_string(),
+                    "synthetic-not-bundled".to_string(),
+                )]),
+            })
+            .map(|_| ()),
+        );
+        let sdk::PluginResult::Err(error) = error else {
+            panic!("unknown definition must be rejected")
+        };
+        assert_eq!(error.code, sdk::PluginErrorCode::InvalidConfig);
+        assert!(error.public_message.contains("definition"));
+    }
+
+    /// A definition's settings become fields typed the way the engine binds
+    /// them, info settings become read-only notes, credentials it does not use
+    /// are hidden, and settings that shadow a static field stay out.
+    #[test]
+    fn config_fields_turn_definition_settings_into_fields() {
+        let definition = parse_definition(&format!(
+            "{DEFINITION}settings:\n  - {{name: cookie, type: text, label: Cookie}}\n  - {{name: info_note, type: info, label: Note, default: Read me}}\n  - {{name: apikey, type: text, label: API Key}}\n  - {{name: passkey, type: password, label: Passkey, default: should-not-leak}}\n  - {{name: freeleech, type: checkbox, label: Freeleech only, default: true}}\n  - {{name: sort, type: select, label: Sort, default: seeders, options: {{created: Created, seeders: Seeders, 7: Week}}}}\n  - {{name: order, type: select, label: Order, default: missing, options: {{asc: Up, desc: Down}}}}\n  - {{name: required_key, type: text, label: Required, required: true}}\n"
+        ))
+        .unwrap();
+        let response = definition_config_fields(&definition);
+        let keys: Vec<_> = response
+            .fields
+            .iter()
+            .map(|field| field.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "info_note",
+                "apikey",
+                "passkey",
+                "freeleech",
+                "sort",
+                "order",
+                "required_key"
+            ]
+        );
+        let field = |key: &str| {
+            response
+                .fields
+                .iter()
+                .find(|field| field.key == key)
+                .unwrap()
+        };
+        // An info setting is a read-only note: its text is help, never a value.
+        assert_eq!(field("info_note").field_type, sdk::ConfigFieldType::Info);
+        assert_eq!(field("info_note").label, "Note");
+        assert_eq!(field("info_note").help_text.as_deref(), Some("Read me"));
+        assert_eq!(field("info_note").default_value, None);
+        assert_eq!(field("apikey").field_type, sdk::ConfigFieldType::String);
+        assert_eq!(field("apikey").label, "API Key");
+        assert_eq!(field("passkey").field_type, sdk::ConfigFieldType::Password);
+        assert_eq!(field("passkey").default_value, None);
+        assert_eq!(field("freeleech").field_type, sdk::ConfigFieldType::Bool);
+        assert_eq!(field("freeleech").default_value.as_deref(), Some("true"));
+        assert_eq!(field("sort").field_type, sdk::ConfigFieldType::Select);
+        assert_eq!(field("sort").default_value.as_deref(), Some("seeders"));
+        assert_eq!(
+            field("sort")
+                .options
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            ["created", "seeders", "7"]
+        );
+        // A default that names no option is dropped rather than rejected.
+        assert_eq!(field("order").default_value, None);
+        assert!(field("required_key").required);
+        assert!(!field("apikey").required);
+        assert!(response.fields.iter().all(|field| {
+            field.value_source == sdk::ConfigFieldValueSource::User
+                && field.role.is_none()
+                && field.host_binding.is_none()
+        }));
+        // `cookie` is used, so only the unused credentials are hidden.
+        assert_eq!(
+            response.hidden_field_keys,
+            vec!["username", "password", "cardigannCaptcha"]
+        );
+    }
+
+    /// Every bundled definition answers within the host's rules: unique keys
+    /// that never shadow a static field, select fields with options, and
+    /// defaults the field type accepts.
+    #[test]
+    fn config_fields_for_every_bundled_definition_pass_host_rules() {
+        let rows = baked::index().unwrap();
+        let mut with_fields = 0;
+        let mut with_notes = 0;
+        for row in &rows {
+            let response = config_fields_for(Some(&row.id));
+            let mut keys = HashSet::new();
+            assert!(response.fields.len() <= 256, "{}", row.id);
+            for field in &response.fields {
+                assert!(
+                    keys.insert(field.key.clone()),
+                    "{}: duplicate {}",
+                    row.id,
+                    field.key
+                );
+                assert!(
+                    !STATIC_CONFIG_KEYS.contains(&field.key.as_str()),
+                    "{}: shadows {}",
+                    row.id,
+                    field.key
+                );
+                if let Some(default) = field.default_value.as_deref() {
+                    match field.field_type {
+                        sdk::ConfigFieldType::Bool => {
+                            assert!(matches!(default, "true" | "false"), "{}", row.id)
+                        }
+                        sdk::ConfigFieldType::Select => assert!(
+                            field.options.iter().any(|option| option.value == default),
+                            "{}: {}",
+                            row.id,
+                            field.key
+                        ),
+                        _ => {}
+                    }
+                }
+                if field.field_type == sdk::ConfigFieldType::Select {
+                    assert!(!field.options.is_empty(), "{}: {}", row.id, field.key);
+                }
+                // The host refuses a note that asks for a value.
+                if field.field_type == sdk::ConfigFieldType::Info {
+                    assert!(
+                        !field.required
+                            && field.required_when.is_none()
+                            && field.options.is_empty()
+                            && field.default_value.is_none()
+                            && !field.label.trim().is_empty(),
+                        "{}: {}",
+                        row.id,
+                        field.key
+                    );
+                    with_notes += 1;
+                }
+            }
+            for key in &response.hidden_field_keys {
+                assert!(CREDENTIAL_KEYS.contains(&key.as_str()), "{}", row.id);
+            }
+            with_fields += usize::from(!response.fields.is_empty());
+        }
+        assert!(with_fields > 0);
+        assert!(with_notes > 0, "bundled definitions carry info settings");
+    }
+
+    /// Config failures name the setting the operator has to fix.
+    #[test]
+    fn config_errors_name_the_setting() {
+        assert_eq!(definition_source_key(None), "definition_yaml");
+        assert_eq!(
+            definition_source_key(Some(CUSTOM_DEFINITION_ID)),
+            "definition_yaml"
+        );
+        assert_eq!(definition_source_key(Some("synthetic")), "definition");
+        let result = component::to_plugin_result::<()>(Err(invalid_setting(
+            "base_url",
+            "base_url `https://tracker.example/` has an origin not declared",
+        )));
+        let sdk::PluginResult::Err(error) = result else {
+            panic!("typed error expected")
+        };
+        assert_eq!(error.code, sdk::PluginErrorCode::InvalidConfig);
+        assert_eq!(
+            error.public_message,
+            "The base_url setting is missing or invalid."
+        );
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("origin not declared"))
+        );
+    }
+
     #[test]
     fn descriptor_is_a_connection_scoped_component_indexer() {
         let descriptor = build_descriptor();
@@ -543,11 +1005,15 @@ search:
         assert!(indexer.allowed_hosts.is_empty());
         assert!(indexer.capabilities.search);
         let wire: Value = serde_json::from_slice(&descriptor_bytes()).unwrap();
-        assert_eq!(wire["sdk_version"], "3.16.0");
-        assert_eq!(wire["sdk_constraint"], ">=3.16.0, <4.0.0");
+        assert_eq!(wire["sdk_version"], sdk::SDK_VERSION);
+        assert_eq!(wire["sdk_constraint"], sdk::current_sdk_constraint());
         assert_eq!(
             wire["provider"]["capabilities"]["resolve_network_endpoints"],
             true
+        );
+        assert_eq!(
+            wire["provider"]["capabilities"]["dynamic_config_fields"]["trigger_keys"],
+            serde_json::json!(["definition"])
         );
         assert_eq!(
             indexer
@@ -699,12 +1165,17 @@ search:
             .filter(|field| field.advanced)
             .map(|field| field.key.as_str())
             .collect();
-        assert_eq!(
-            advanced,
-            vec!["extra_field_data_json", "cookie", "cardigannCaptcha"]
-        );
-        // The things an operator needs to connect at all stay up front.
-        for key in ["definition", "base_url", "username", "password"] {
+        assert_eq!(advanced, vec!["extra_field_data_json", "cookie"]);
+        // The things an operator needs to connect at all stay up front, and
+        // so does the CAPTCHA answer: it is shown only when the login asks
+        // for one, with the image beside it.
+        for key in [
+            "definition",
+            "base_url",
+            "username",
+            "password",
+            "cardigannCaptcha",
+        ] {
             assert!(
                 fields
                     .iter()
@@ -880,13 +1351,8 @@ search:
     }
 }
 
-// Advertise the host's optional endpoint capability through the existing JSON
-// channel until the published SDK includes the field. Keep this adapter local
-// so other plugins continue using the unchanged PDK entrypoint.
 fn descriptor_bytes() -> Vec<u8> {
-    let mut value = serde_json::to_value(build_descriptor()).expect("JSON descriptor");
-    value["provider"]["capabilities"]["resolve_network_endpoints"] = Value::Bool(true);
-    serde_json::to_vec(&value).expect("JSON descriptor")
+    serde_json::to_vec(&build_descriptor()).expect("JSON descriptor")
 }
 
 fn install_component_runtime() {

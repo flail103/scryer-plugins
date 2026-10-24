@@ -267,6 +267,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(NotificationDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             // Sonarr calls this channel "ntfy.sh" (`Ntfy.cs:16`). The core does
@@ -484,6 +485,15 @@ impl Auth {
                 "access_token",
                 "this topic requires authorization, but no access token and no username and password are configured",
             ),
+        }
+    }
+
+    /// The error code a 401/403 carries: which credential ntfy refused.
+    fn rejected_code(&self) -> PluginErrorCode {
+        match self {
+            Auth::Token(_) => codes::INVALID_API_KEY.into(),
+            Auth::Basic(..) => codes::INVALID_USERNAME_PASSWORD.into(),
+            Auth::None => PluginErrorCode::AuthFailed,
         }
     }
 }
@@ -1074,6 +1084,7 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<Line> {
         | NotificationEventType::ListTitleLeft
         | NotificationEventType::ListSyncFailed
         | NotificationEventType::ListUnfollowed
+        | NotificationEventType::FileRestored
         | NotificationEventType::Test => {}
     }
     lines
@@ -1772,12 +1783,15 @@ enum Outcome {
     /// error so a run in which *every* topic says the same thing can be reported
     /// on the typed lane.
     Misconfigured(PluginError),
-    /// The provider said no, for now.
+    /// The provider said no, for now. `error` is the typed failure reported
+    /// when this was the only topic; with several topics the outcome stays on
+    /// the per-topic delivery lane.
     Rejected {
         status: Option<u16>,
         detail: String,
         provider_status: String,
         retry_after_seconds: Option<i64>,
+        error: PluginError,
     },
 }
 
@@ -1843,11 +1857,17 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
                 failures.push(format!("{topic}: {}", error.public_message));
                 misconfigurations.push(error);
             }
+            // A single topic is a single request: its failure is the send's
+            // failure and goes on the typed lane with its code.
+            Outcome::Rejected { error, .. } if settings.topics.len() == 1 => {
+                return PluginResult::Err(error);
+            }
             Outcome::Rejected {
                 status,
                 detail,
                 provider_status,
                 retry_after_seconds: retry_after,
+                error: _,
             } => {
                 if let Some(retry_after) = retry_after {
                     retry_after_seconds =
@@ -1964,23 +1984,19 @@ fn publish(
             &response.body(),
             auth,
         ),
-        // The host answers a refused or failed egress in-band. On a connection
-        // test that is Sonarr's `ValidationFailure("ServerUrl", …)`
-        // (`NtfyProxy.cs:102`); on a live send it is the provider being
-        // unreachable, which must not be reported to the operator as a broken
-        // setting just because the network blinked.
-        Err(error) if strict => Outcome::Misconfigured(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "could not reach the ntfy server at {url}: {error}. Check server_url and that Scryer is allowed to reach it."
-            ),
-            Some(error.to_string()),
-        )),
+        // The host answers a refused or failed egress in-band, and the PDK
+        // reads its transport detail into the code (TLS, timeout,
+        // unreachable). On a connection test every topic failing that way is
+        // reported on the typed lane, like Sonarr's
+        // `ValidationFailure("ServerUrl", …)` (`NtfyProxy.cs:102`); on a live
+        // send with several topics it stays a per-topic delivery failure.
+        Err(error) if strict => Outcome::Misconfigured(request_failure(&error)),
         Err(error) => Outcome::Rejected {
             status: None,
-            detail: format!("request failed: {error}"),
+            detail: redact_secrets(&format!("request failed: {error}")),
             provider_status: "request_failed".to_string(),
             retry_after_seconds: None,
+            error: request_failure(&error),
         },
     }
 }
@@ -2127,10 +2143,9 @@ fn classify_response(
     // which is exactly what Sonarr's 401 branch does.
     if !answer.is_json && !(500..600).contains(&status) && status != 429 {
         return Outcome::Misconfigured(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "server_url did not answer like an ntfy server (HTTP {status}): {detail}. Check the ntfy URL and anything proxying it."
-            ),
+            codes::ENDPOINT_NOT_FOUND,
+            "server_url did not answer like an ntfy server; check the ntfy URL and anything proxying it"
+                .to_string(),
             Some(debug),
         ));
     }
@@ -2142,7 +2157,7 @@ fn classify_response(
         Some(40009 | 40010) => {
             return Outcome::Misconfigured(plugin_error(
                 PluginErrorCode::InvalidConfig,
-                format!("ntfy refused the topic: {detail}"),
+                "ntfy refused a configured topic; check topics".to_string(),
                 Some(debug),
             ));
         }
@@ -2150,7 +2165,7 @@ fn classify_response(
         Some(40007) => {
             return Outcome::Misconfigured(plugin_error(
                 PluginErrorCode::InvalidConfig,
-                format!("ntfy refused the priority: {detail}"),
+                "ntfy refused the priority; check priority and failure_priority".to_string(),
                 Some(debug),
             ));
         }
@@ -2161,18 +2176,17 @@ fn classify_response(
         401 | 403 => {
             let (field, explanation) = auth.rejected_field();
             Outcome::Misconfigured(plugin_error(
-                PluginErrorCode::AuthFailed,
-                format!("{field}: {explanation} (HTTP {status}): {detail}"),
+                auth.rejected_code(),
+                format!("{field}: {explanation}"),
                 Some(debug),
             ))
         }
         // ntfy serves the publish route on `/` on every version, so a 404 means
         // `server_url` is wrong or points at something else.
         404 => Outcome::Misconfigured(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "server_url does not expose ntfy's publish endpoint (HTTP 404): {detail}. Check the ntfy URL, including any path prefix."
-            ),
+            codes::ENDPOINT_NOT_FOUND,
+            "server_url does not expose ntfy's publish endpoint; check the ntfy URL, including any path prefix"
+                .to_string(),
             Some(debug),
         )),
         // The message this plugin built is wrong, or too large. The operator has
@@ -2180,19 +2194,45 @@ fn classify_response(
         // message rather than as a retryable one.
         400 | 413 => Outcome::Misconfigured(plugin_error(
             PluginErrorCode::Permanent,
-            format!("ntfy rejected the message this plugin built (HTTP {status}): {detail}"),
+            "ntfy rejected the message this plugin built".to_string(),
             Some(debug),
         )),
-        // The provider saying "not now": the delivery lane, not the
-        // configuration lane. ntfy does not send `Retry-After` today, but a
-        // reverse proxy in front of it does and it is the one thing the core
-        // could act on.
-        _ => Outcome::Rejected {
-            status: Some(status),
-            detail,
-            provider_status: format!("http_{status}"),
-            retry_after_seconds: retry_after,
-        },
+        // The provider saying "not now". ntfy does not send `Retry-After`
+        // today, but a reverse proxy in front of it does and it is the one
+        // thing the core could act on.
+        _ => {
+            let error = match status {
+                429 => {
+                    let error = scryer_plugin_pdk::plugin_error(
+                        PluginErrorCode::RateLimited,
+                        "ntfy is rate limiting requests",
+                    )
+                    .debug(redact_secrets(&debug));
+                    match retry_after {
+                        Some(seconds) => error.retry_after_seconds(seconds),
+                        None => error,
+                    }
+                    .build()
+                }
+                500..=599 => plugin_error(
+                    PluginErrorCode::UpstreamUnavailable,
+                    "the ntfy server answered with a server error".to_string(),
+                    Some(debug),
+                ),
+                _ => plugin_error(
+                    PluginErrorCode::Permanent,
+                    "ntfy refused the notification".to_string(),
+                    Some(debug),
+                ),
+            };
+            Outcome::Rejected {
+                status: Some(status),
+                detail,
+                provider_status: format!("http_{status}"),
+                retry_after_seconds: retry_after,
+                error,
+            }
+        }
     }
 }
 
@@ -2204,17 +2244,16 @@ fn header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a s
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let error = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
+        None => error,
     }
+    .build()
 }
 
 /// The world's single `process` entry, dispatching the SDK's notification
@@ -3325,8 +3364,11 @@ mod tests {
             r#"{"code":40101,"http":401,"error":"unauthorized"}"#,
             Auth::Token("tk_abc".to_string()),
         ));
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
         assert!(error.public_message.contains("access_token"));
+        assert!(!error.public_message.contains("401"));
+        assert!(!error.public_message.contains("tk_abc"));
+        assert!(error.debug_message.unwrap().contains("40101"));
 
         // `NtfyProxy.cs:91-95`: Basic credentials are configured.
         let error = misconfiguration(classify(
@@ -3334,7 +3376,10 @@ mod tests {
             r#"{"code":40301,"http":403,"error":"forbidden"}"#,
             Auth::Basic("user".to_string(), "pass".to_string()),
         ));
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
         assert!(error.public_message.contains("username"));
 
         // `NtfyProxy.cs:97-98`: neither is configured.
@@ -3354,13 +3399,15 @@ mod tests {
             r#"{"code":40401,"http":404,"error":"page not found"}"#,
             Auth::None,
         ));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
         assert!(error.public_message.contains("server_url"));
 
         // An authenticating reverse proxy answering HTML is not ntfy saying no.
         let error = misconfiguration(classify(401, "<html>Sign in</html>", Auth::None));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
         assert!(error.public_message.contains("server_url"));
+        assert!(!error.public_message.contains("Sign in"));
+        assert!(error.debug_message.unwrap().contains("Sign in"));
     }
 
     #[test]
@@ -3372,10 +3419,10 @@ mod tests {
         ));
         assert_eq!(error.code, PluginErrorCode::InvalidConfig);
         assert!(error.public_message.contains("topic"));
+        let debug = error.debug_message.unwrap();
         assert!(
-            error.public_message.contains("40010"),
-            "the operator sees ntfy's own code: {}",
-            error.public_message
+            debug.contains("40010"),
+            "the host log carries ntfy's own code: {debug}"
         );
 
         let error = misconfiguration(classify(
@@ -3418,6 +3465,7 @@ mod tests {
             retry_after_seconds,
             provider_status,
             detail,
+            error,
         } = outcome
         else {
             panic!("a 429 is the provider saying not now");
@@ -3427,6 +3475,9 @@ mod tests {
         assert_eq!(provider_status, "http_429");
         assert!(detail.contains("too many requests"));
         assert!(detail.contains("42901"));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(42));
+        assert!(!error.public_message.contains("too many requests"));
 
         // ntfy itself does not send Retry-After; the field is then absent.
         let outcome = classify(
@@ -3436,12 +3487,14 @@ mod tests {
         );
         let Outcome::Rejected {
             retry_after_seconds,
+            error,
             ..
         } = outcome
         else {
             panic!("a 429 is the provider saying not now");
         };
         assert_eq!(retry_after_seconds, None);
+        assert_eq!(error.retry_after_seconds, None);
     }
 
     #[test]
@@ -3455,20 +3508,22 @@ mod tests {
             (502, "<html>Bad Gateway</html>"),
         ] {
             let outcome = classify(status, body, Auth::None);
-            assert!(
-                matches!(outcome, Outcome::Rejected { .. }),
-                "HTTP {status} must stay on the delivery lane"
-            );
+            let Outcome::Rejected { error, .. } = outcome else {
+                panic!("HTTP {status} must stay on the delivery lane");
+            };
+            assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
         }
     }
 
     #[test]
-    fn upstream_error_text_is_quoted_but_bounded() {
+    fn upstream_error_text_is_logged_but_bounded() {
         let long = "x".repeat(MAX_QUOTED_ERROR * 2);
         let body = json!({ "code": 40024, "http": 400, "error": long }).to_string();
         let error = misconfiguration(classify(400, &body, Auth::None));
-        assert!(error.public_message.chars().count() < MAX_QUOTED_ERROR + 120);
-        assert!(error.public_message.contains('…'));
+        assert!(!error.public_message.contains("xxx"));
+        let debug = error.debug_message.unwrap();
+        assert!(debug.chars().count() < MAX_QUOTED_ERROR + 120);
+        assert!(debug.contains('…'));
     }
 
     #[test]

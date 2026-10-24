@@ -48,11 +48,12 @@
 //! # Why the delivery path is local rather than `notify_common::send_json`
 //!
 //! The shared helper collapses every non-2xx into `error_response("HTTP N:
-//! body", "http_N")`. Gotify's failures are three different lanes in Scryer's
-//! contract: a `401`/`403` is the application token, a `404` or a body that is
-//! not Gotify's error JSON is the `server` URL (an auth proxy or an unrelated
-//! service is answering), a `400` is the payload this plugin built, and only a
-//! `429`/`5xx` is the provider saying "not now".
+//! body", "http_N")`. Gotify's failures each carry their own code: a `401`/`403` is the
+//! application token (`invalid_api_key`), a `404` or a body that is not
+//! Gotify's error JSON is the `server` URL (`endpoint_not_found`: an auth proxy
+//! or an unrelated service is answering), a `400` is the payload this plugin
+//! built (`Permanent`), and only a `429`/`5xx` is the provider saying "not
+//! now" (`RateLimited` / `UpstreamUnavailable`).
 //!
 //! # Upstream reference
 //!
@@ -260,6 +261,7 @@ fn build_descriptor() -> PluginDescriptor {
             },
             config_fields: config_fields(),
         }),
+        settings: Vec::new(),
     }
 }
 
@@ -842,7 +844,8 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<Line> {
         }
         // Not in `supported_events`, so the host never routes them here; the
         // summary lines are all such a notification would carry.
-        NotificationEventType::ListTitleAdded
+        NotificationEventType::FileRestored
+        | NotificationEventType::ListTitleAdded
         | NotificationEventType::ListRequestSubmitted
         | NotificationEventType::ListItemHeld
         | NotificationEventType::ListTitleLeft
@@ -1483,13 +1486,9 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
             &response.body(),
             warnings,
         ),
-        Err(error) => {
-            // The host answers a refused or failed egress in-band; that is the
-            // provider being unreachable, not a misconfigured channel.
-            let mut failure = error_response(format!("request failed: {error}"), None);
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        // A refused egress, DNS, connection or TLS failure, or a timeout: the
+        // PDK classifies it from the host's own error.
+        Err(error) => PluginResult::Err(request_failure(&error)),
     }
 }
 
@@ -1671,66 +1670,39 @@ fn classify_response(
     // to the wrong setting, which is exactly what Sonarr's 401 branch does.
     if !answer.is_json && !(500..600).contains(&status) && status != 429 {
         return PluginResult::Err(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "server did not answer like a Gotify server (HTTP {status}): {detail}. Check the Gotify URL and anything proxying it."
-            ),
+            codes::ENDPOINT_NOT_FOUND,
+            "server did not answer like a Gotify server".to_string(),
             Some(debug),
         ));
     }
 
+    let retry_after = header(headers, "retry-after")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|seconds| *seconds >= 0)
+        .map(|seconds| seconds.max(1));
     match status {
         // "Unauthorized - AuthToken is invalid" (`GotifyProxy.cs:42`). 403 is the
         // same setting from the other side: a token that exists but may not push
         // to this application.
-        401 | 403 => PluginResult::Err(plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!(
-                "app_token was rejected by Gotify (HTTP {status}): {detail}. Gotify 3 shows an application token only when it is created or rotated."
-            ),
-            Some(debug),
-        )),
-        // Gotify serves `/message` on every version; a 404 means the base URL is
-        // wrong or points at something else.
-        404 => PluginResult::Err(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "server does not expose Gotify's /message endpoint (HTTP 404): {detail}. Check the Gotify URL, including any path prefix."
-            ),
-            Some(debug),
-        )),
+        401 | 403 => PluginResult::Err(rejected_credential(Credential::ApiKey, debug)),
         // The message this plugin built is wrong. The operator has nothing to
         // fix; this is a plugin bug and is reported as one.
         400 => PluginResult::Err(plugin_error(
             PluginErrorCode::Permanent,
-            format!("Gotify rejected the message this plugin built: {detail}"),
+            "Gotify rejected the message this plugin built".to_string(),
             Some(debug),
         )),
-        // Gotify itself does not rate-limit, but a reverse proxy in front of it
-        // does, and `Retry-After` is the one thing the core can act on.
-        429 => {
-            let mut failure =
-                error_response(format!("HTTP 429: {detail}"), Some("http_429".to_string()));
-            failure.retry_after_seconds = header(headers, "retry-after")
-                .and_then(|value| value.parse::<i64>().ok())
-                .filter(|seconds| *seconds >= 0)
-                .map(|seconds| seconds.max(1));
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
-        // The provider saying "not now": the delivery lane, not the
-        // configuration lane.
+        // Gotify serves `/message` on every version, so a 404 means the base URL
+        // is wrong or points at something else (`endpoint_not_found`). Gotify
+        // itself does not rate-limit, but a reverse proxy in front of it does,
+        // and `Retry-After` is the one thing the core can act on; a 5xx keeps
+        // the proxy's delay too.
         _ => {
-            let mut failure = error_response(
-                format!("HTTP {status}: {detail}"),
-                Some(format!("http_{status}")),
-            );
-            failure.retry_after_seconds = header(headers, "retry-after")
-                .and_then(|value| value.parse::<i64>().ok())
-                .filter(|seconds| *seconds >= 0)
-                .map(|seconds| seconds.max(1));
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
+            let mut error = http_failure(status, retry_after, Credential::ApiKey, debug);
+            if (500..600).contains(&status) {
+                error.retry_after_seconds = retry_after;
+            }
+            PluginResult::Err(error)
         }
     }
 }
@@ -1743,16 +1715,14 @@ fn header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a s
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let builder = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug) => builder.debug(redact_secrets(&debug)).build(),
+        None => builder.build(),
     }
 }
 
@@ -2656,79 +2626,87 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_token_is_auth_failed_naming_app_token() {
+    fn a_rejected_token_is_an_invalid_api_key() {
         for status in [401u16, 403] {
             let error = expect_error(classify(
                 status,
                 r#"{"error":"Unauthorized","errorCode":401,"errorDescription":"you need to provide a valid access token or user credentials to access this api"}"#,
             ));
-            assert_eq!(error.code, PluginErrorCode::AuthFailed);
-            assert!(error.public_message.contains("app_token"));
-            assert!(error.public_message.contains("valid access token"));
+            assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+            assert!(!error.public_message.contains("valid access token"));
+            assert!(
+                error
+                    .debug_message
+                    .as_deref()
+                    .is_some_and(|debug| debug.contains("valid access token"))
+            );
         }
     }
 
     #[test]
-    fn a_404_is_invalid_config_naming_server() {
+    fn a_404_is_an_endpoint_not_found() {
         let error = expect_error(classify(
             404,
             r#"{"error":"Not Found","errorCode":404,"errorDescription":"page not found"}"#,
         ));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
-        assert!(error.public_message.contains("server"));
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
     }
 
     #[test]
-    fn a_non_json_failure_body_is_invalid_config_naming_server_not_the_token() {
+    fn a_non_json_failure_body_is_an_endpoint_not_found_not_the_token() {
         // An authenticating reverse proxy in front of Gotify answers 401 with an
         // HTML login page. Sonarr blames the token here.
         let error = expect_error(classify(401, "<html><body>Sign in</body></html>"));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
         assert!(error.public_message.contains("server"));
         assert!(!error.public_message.contains("app_token"));
     }
 
     #[test]
-    fn a_400_quotes_gotifys_error_description_as_a_permanent_plugin_fault() {
+    fn a_400_keeps_gotifys_error_description_in_debug_as_a_permanent_plugin_fault() {
         let error = expect_error(classify(
             400,
             r#"{"error":"Bad Request","errorCode":400,"errorDescription":"json: cannot unmarshal number into Go struct field"}"#,
         ));
         assert_eq!(error.code, PluginErrorCode::Permanent);
-        assert!(error.public_message.contains("cannot unmarshal"));
+        assert!(!error.public_message.contains("cannot unmarshal"));
+        assert!(error.debug_message.unwrap().contains("cannot unmarshal"));
     }
 
     #[test]
-    fn a_5xx_is_a_delivery_failure_carrying_the_provider_status() {
-        let response = expect_response(classify(503, r#"{"error":"unavailable"}"#));
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_503"));
-        assert!(response.error.as_deref().unwrap().contains("unavailable"));
+    fn a_5xx_is_upstream_unavailable_with_the_body_in_debug() {
+        let error = expect_error(classify(503, r#"{"error":"unavailable"}"#));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert!(error.debug_message.unwrap().contains("unavailable"));
     }
 
     #[test]
-    fn a_non_json_5xx_stays_in_the_delivery_lane() {
-        let response = expect_response(classify(502, "<html>bad gateway</html>"));
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_502"));
+    fn a_non_json_5xx_is_upstream_unavailable_not_a_wrong_server() {
+        let error = expect_error(classify_response(
+            502,
+            &headers(&[("Retry-After", "12")]),
+            b"<html>bad gateway</html>",
+            Vec::new(),
+        ));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert_eq!(error.retry_after_seconds, Some(12));
     }
 
     #[test]
-    fn a_429_carries_retry_after_seconds_from_the_header() {
+    fn a_429_is_rate_limited_with_retry_after_seconds_from_the_header() {
         let result = classify_response(
             429,
             &headers(&[("Retry-After", "30")]),
             b"rate limited",
             Vec::new(),
         );
-        let response = expect_response(result);
-        assert!(!response.success);
-        assert_eq!(response.retry_after_seconds, Some(30));
-        assert_eq!(response.provider_status.as_deref(), Some("http_429"));
+        let error = expect_error(result);
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(30));
     }
 
     #[test]
-    fn warnings_survive_every_classification_lane() {
+    fn warnings_survive_a_successful_delivery() {
         let warning = vec!["poster dropped".to_string()];
         let ok = expect_response(classify_response(
             200,
@@ -2737,21 +2715,14 @@ mod tests {
             warning.clone(),
         ));
         assert_eq!(ok.warnings, warning);
-
-        let failed = expect_response(classify_response(
-            500,
-            &BTreeMap::new(),
-            b"{}",
-            warning.clone(),
-        ));
-        assert_eq!(failed.warnings, warning);
     }
 
     #[test]
-    fn an_error_body_is_quoted_but_bounded() {
+    fn an_error_body_stays_out_of_the_public_message_and_is_bounded_in_debug() {
         let long = "x".repeat(1000);
         let error = expect_error(classify(404, &format!(r#"{{"error":"{long}"}}"#)));
-        assert!(error.public_message.chars().count() < 500);
+        assert!(!error.public_message.contains("xxxx"));
+        assert!(error.debug_message.unwrap().chars().count() < 600);
     }
 
     // -----------------------------------------------------------------

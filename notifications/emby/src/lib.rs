@@ -12,6 +12,12 @@
 //! re-export of [`scryer_plugin_pdk`] rather than the removed core-module host
 //! ABI. `result_json` is gone: the world's dispatch owns the `PluginResult`
 //! envelope now, so the send path returns the typed response.
+//!
+//! Every failure is a typed `PluginResult::Err`: a missing or invalid setting
+//! is `InvalidConfig`, a rejected API key `invalid_api_key`, a 404
+//! `endpoint_not_found`, 429 `RateLimited`, 5xx and unanswered requests
+//! `UpstreamUnavailable` (or the PDK's transport reading), an unreadable lookup
+//! body `invalid_response`, and a title Emby does not know `item_not_found`.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -240,7 +246,7 @@ fn handle_notification_command(
 ) -> PluginNotificationCommandResult {
     match command {
         PluginNotificationCommand::Send(request) => {
-            PluginNotificationCommandResult::Send(PluginResult::Ok(send_notification(&request)))
+            PluginNotificationCommandResult::Send(send_notification(&request))
         }
         PluginNotificationCommand::Action(_) => {
             PluginNotificationCommandResult::Action(unsupported_action(PROVIDER_TYPE))
@@ -248,26 +254,36 @@ fn handle_notification_command(
     }
 }
 
-fn send_notification(request: &PluginNotificationRequest) -> PluginNotificationResponse {
-    let config = match EmbyConfig::from_host() {
-        Ok(config) => config,
-        Err(error) => {
-            return error_response(error, Some("invalid_config".into()));
-        }
-    };
+fn send_notification(
+    request: &PluginNotificationRequest,
+) -> PluginResult<PluginNotificationResponse> {
+    let outcome = EmbyConfig::from_host()
+        .map_err(config_error)
+        .and_then(|config| {
+            if matches!(request.event_type, NotificationEventType::Test) {
+                return execute_http(build_system_info_request(&config), "Emby server test")
+                    .map(|_| ());
+            }
+            build_media_refresh_plan(request, &config.path_mappings)
+                .map_err(|error| plugin_error(PluginErrorCode::Permanent, error, None))
+                .and_then(|plan| execute_media_refresh(plan, &config))
+        });
 
-    if matches!(request.event_type, NotificationEventType::Test) {
-        return match execute_http(build_system_info_request(&config), "Emby server test") {
-            Ok(_) => ok_response(),
-            Err(error) => error_response(error, None),
-        };
+    match outcome {
+        Ok(()) => PluginResult::Ok(ok_response()),
+        Err(error) => PluginResult::Err(error),
     }
+}
 
-    match build_media_refresh_plan(request, &config.path_mappings)
-        .and_then(|plan| execute_media_refresh(plan, &config))
-    {
-        Ok(()) => ok_response(),
-        Err(error) => error_response(error, None),
+fn plugin_error(
+    code: impl Into<PluginErrorCode>,
+    public_message: impl Into<String>,
+    debug_message: Option<String>,
+) -> PluginError {
+    let builder = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug) => builder.debug(redact_secrets(&debug)).build(),
+        None => builder.build(),
     }
 }
 
@@ -620,21 +636,33 @@ fn dedupe_updates(updates: &mut Vec<MediaUpdate>) {
     updates.retain(|update| seen.insert((update.path.clone(), update.update_type)));
 }
 
-fn execute_media_refresh(mut plan: MediaRefreshPlan, config: &EmbyConfig) -> Result<(), String> {
+fn execute_media_refresh(
+    mut plan: MediaRefreshPlan,
+    config: &EmbyConfig,
+) -> Result<(), PluginError> {
     if let Some(lookup) = &plan.lookup {
         let body = execute_http(
             build_item_lookup_request(lookup, config),
             "Emby item lookup",
         )?;
-        let value: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|_| "Emby item lookup returned invalid JSON".to_string())?;
+        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+            plugin_error(
+                codes::INVALID_RESPONSE,
+                "Emby answered the item lookup with a body that is not valid JSON",
+                Some(format!("Emby item lookup body: {error}")),
+            )
+        })?;
         let paths = matching_item_paths(&value, lookup);
         merge_lookup_paths(&mut plan, paths)?;
     }
 
     dedupe_updates(&mut plan.updates);
     if plan.updates.is_empty() {
-        return Err("Emby notification did not resolve any media paths".to_string());
+        return Err(plugin_error(
+            PluginErrorCode::Permanent,
+            "Emby notification did not resolve any media paths",
+            None,
+        ));
     }
     execute_http(
         build_media_updated_request(&plan.updates, config)?,
@@ -643,9 +671,13 @@ fn execute_media_refresh(mut plan: MediaRefreshPlan, config: &EmbyConfig) -> Res
     Ok(())
 }
 
-fn merge_lookup_paths(plan: &mut MediaRefreshPlan, paths: Vec<String>) -> Result<(), String> {
+fn merge_lookup_paths(plan: &mut MediaRefreshPlan, paths: Vec<String>) -> Result<(), PluginError> {
     if paths.is_empty() {
-        return Err("Emby item lookup found no matching paths".to_string());
+        return Err(plugin_error(
+            codes::ITEM_NOT_FOUND,
+            "Emby has no library item matching this title",
+            None,
+        ));
     }
     for path in paths {
         for update_type in &plan.lookup_update_types {
@@ -679,7 +711,7 @@ fn build_item_lookup_request(lookup: &ItemLookup, config: &EmbyConfig) -> Prepar
 fn build_media_updated_request(
     updates: &[MediaUpdate],
     config: &EmbyConfig,
-) -> Result<PreparedHttpRequest, String> {
+) -> Result<PreparedHttpRequest, PluginError> {
     let payload_updates = updates
         .iter()
         .map(|update| {
@@ -689,8 +721,15 @@ fn build_media_updated_request(
             })
         })
         .collect::<Vec<_>>();
-    let body = serde_json::to_vec(&serde_json::json!({ "Updates": payload_updates }))
-        .map_err(|_| "failed to encode Emby media update payload".to_string())?;
+    let body = serde_json::to_vec(&serde_json::json!({ "Updates": payload_updates })).map_err(
+        |error| {
+            plugin_error(
+                PluginErrorCode::Permanent,
+                "the Emby media update payload could not be encoded",
+                Some(error.to_string()),
+            )
+        },
+    )?;
     Ok(base_request(
         "POST",
         &format!("{}/Library/Media/Updated", config.base_url),
@@ -707,22 +746,37 @@ fn base_request(method: &str, url: &str, config: &EmbyConfig) -> PreparedHttpReq
         .with_header("User-Agent", "scryer-emby-plugin/0.1")
 }
 
-fn execute_http(prepared: PreparedHttpRequest, operation: &str) -> Result<Vec<u8>, String> {
+fn execute_http(prepared: PreparedHttpRequest, operation: &str) -> Result<Vec<u8>, PluginError> {
     let (request, body) = prepared.into_http_request();
-    let response = http::request::<Vec<u8>>(&request, body)
-        .map_err(|_| format!("{operation} request failed"))?;
+    let response =
+        http::request::<Vec<u8>>(&request, body).map_err(|error| request_failure(&error))?;
     let status = response.status_code();
     if !(200..300).contains(&status) {
-        return Err(http_status_error(operation, status));
+        return Err(http_status_error(
+            operation,
+            status,
+            retry_after_header(response.headers()),
+        ));
     }
     if response.body().len() > MAX_JSON_RESPONSE_BYTES {
-        return Err(format!("{operation} response exceeded the size limit"));
+        return Err(plugin_error(
+            codes::INVALID_RESPONSE,
+            "Emby answered with a response larger than the plugin accepts",
+            Some(format!("{operation} response exceeded the size limit")),
+        ));
     }
     Ok(response.body())
 }
 
-fn http_status_error(operation: &str, status: u16) -> String {
-    format!("{operation} failed with HTTP {status}")
+/// A non-success Emby answer. Emby checks only the API key, so a 401 or 403
+/// is a rejected key.
+fn http_status_error(operation: &str, status: u16, retry_after: Option<i64>) -> PluginError {
+    http_failure(
+        status,
+        retry_after,
+        Credential::ApiKey,
+        format!("{operation} answered HTTP {status}"),
+    )
 }
 
 fn matching_item_paths(value: &serde_json::Value, lookup: &ItemLookup) -> Vec<String> {
@@ -912,6 +966,7 @@ mod tests {
             mal_ids: Vec::new(),
             kitsu_ids: Vec::new(),
             by_source: Default::default(),
+            by_source_key: Default::default(),
         }
     }
 
@@ -1326,9 +1381,54 @@ mod tests {
 
     #[test]
     fn errors_do_not_echo_response_bodies_or_api_keys() {
-        let error = http_status_error("Emby item lookup", 401);
-        assert_eq!(error, "Emby item lookup failed with HTTP 401");
-        assert!(!error.contains("secret"));
-        assert!(!error.contains("response body"));
+        let error = http_status_error("Emby item lookup", 401, None);
+        assert_eq!(
+            error.debug_message.as_deref(),
+            Some("Emby item lookup answered HTTP 401")
+        );
+        assert!(!error.public_message.contains("secret"));
+        assert!(!error.public_message.contains("401"));
+    }
+
+    #[test]
+    fn a_rejected_api_key_carries_the_invalid_api_key_code() {
+        for status in [401, 403] {
+            let error = http_status_error("Emby server test", status, None);
+            assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+            assert_eq!(
+                error.debug_message.as_deref(),
+                Some(format!("Emby server test answered HTTP {status}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn other_emby_answers_map_to_their_codes() {
+        assert_eq!(
+            http_status_error("Emby media update", 404, None).code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        let limited = http_status_error("Emby media update", 429, Some(7));
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(7));
+        assert_eq!(
+            http_status_error("Emby media update", 503, None).code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            http_status_error("Emby media update", 400, None).code,
+            PluginErrorCode::Permanent
+        );
+    }
+
+    #[test]
+    fn a_lookup_with_no_matching_item_is_item_not_found() {
+        let mut plan = MediaRefreshPlan {
+            updates: Vec::new(),
+            lookup: None,
+            lookup_update_types: vec![MediaUpdateType::Created],
+        };
+        let error = merge_lookup_paths(&mut plan, Vec::new()).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
     }
 }

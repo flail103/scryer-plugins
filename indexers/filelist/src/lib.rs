@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use scryer_plugin_pdk::component::{self, StartRateGate, structured_plugin_error};
+use scryer_plugin_pdk::component::{self, StartRateGate};
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
@@ -28,7 +28,7 @@ use scryer_plugin_sdk::{
     IndexerCategoryValueKind, IndexerDescriptor, IndexerFeedMode, IndexerLimitCapabilities,
     IndexerProtocol, IndexerResponseFeatures, IndexerSearchIncompleteReason, IndexerSearchInput,
     IndexerSearchInvalidResponseKind, IndexerSearchPluginError, IndexerSourceKind,
-    IndexerTorrentCapabilities, PluginDescriptor, PluginError, PluginErrorCode, PluginErrorDetails,
+    IndexerTorrentCapabilities, PluginDescriptor, PluginErrorCode, PluginErrorDetails,
     PluginSearchRequest as SearchRequest, PluginSearchRequestKind,
     PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult, ProviderDescriptor,
     SDK_VERSION, derive_indexer_flags, torrent_result,
@@ -199,6 +199,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "filelist".to_string(),
             provider_aliases: vec!["filelist.io".to_string()],
@@ -210,6 +211,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 // FileList's only id search is `type=imdb`; Sonarr searches
                 // series and anime with it and Radarr searches movies with it.
                 supported_ids: HashMap::from([
@@ -263,6 +267,7 @@ fn build_descriptor() -> PluginDescriptor {
                     rate_limit_hint_seconds: Some(2),
                     api_quota_supported: false,
                     grab_quota_supported: false,
+                    paged_search: false,
                 }),
                 torrent: Some(IndexerTorrentCapabilities {
                     reports_seeders: true,
@@ -783,6 +788,15 @@ fn classify_response(
                 body_excerpt(body)
             )));
         }
+        404 => {
+            return Err(typed_error(
+                PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND),
+                "the FileList API endpoint was not found".to_string(),
+                format!("FileList returned HTTP 404: {}", body_excerpt(body)),
+                None,
+                None,
+            ));
+        }
         429 => {
             return Err(rate_limited_error(retry_after_seconds(headers)));
         }
@@ -876,13 +890,14 @@ fn typed_error(
     retry_after_seconds: Option<i64>,
     details: Option<IndexerSearchPluginError>,
 ) -> Error {
-    structured_plugin_error(PluginError {
-        code,
-        public_message,
-        debug_message: Some(debug_message),
-        retry_after_seconds,
-        details: details.map(PluginErrorDetails::IndexerSearch),
-    })
+    let mut error = plugin_error(code, public_message).debug(debug_message);
+    if let Some(seconds) = retry_after_seconds {
+        error = error.retry_after_seconds(seconds);
+    }
+    if let Some(details) = details {
+        error = error.details(PluginErrorDetails::IndexerSearch(details));
+    }
+    error.into_error()
 }
 
 /// A configuration fault. Deliberately NOT a deferred error: the host must
@@ -899,7 +914,7 @@ fn invalid_config_error(field: &str, detail: String) -> Error {
 
 fn auth_failed_error(detail: String) -> Error {
     typed_error(
-        PluginErrorCode::AuthFailed,
+        PluginErrorCode::from(codes::INVALID_PASSKEY),
         "FileList rejected the configured 'username' and 'passkey'".to_string(),
         detail,
         None,
@@ -945,7 +960,7 @@ fn deferred_error(
 
 fn invalid_response_error(kind: IndexerSearchInvalidResponseKind, detail: String) -> Error {
     typed_error(
-        PluginErrorCode::UpstreamUnavailable,
+        PluginErrorCode::from(codes::INVALID_RESPONSE),
         "FileList returned a response Scryer could not read".to_string(),
         detail,
         None,
@@ -2192,7 +2207,10 @@ mod tests {
             br#"{"error":"Username and passkey cannot be empty."}"#,
         )
         .expect_err("401 should fail");
-        assert_eq!(plugin_error(&error).code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            plugin_error(&error).code,
+            PluginErrorCode::from(codes::INVALID_PASSKEY)
+        );
         assert!(plugin_error(&error).details.is_none());
     }
 
@@ -2200,7 +2218,10 @@ mod tests {
     fn a_forbidden_response_reports_an_auth_failure() {
         let error = classify_response(403, &json_headers(), br#"{"error":"Invalid passkey."}"#)
             .expect_err("403 should fail");
-        assert_eq!(plugin_error(&error).code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            plugin_error(&error).code,
+            PluginErrorCode::from(codes::INVALID_PASSKEY)
+        );
     }
 
     #[test]
@@ -2329,7 +2350,10 @@ mod tests {
     fn an_api_error_about_the_passkey_reports_an_auth_failure() {
         let error = parse_torrents(&test_config(), r#"{"error":"Invalid passkey!"}"#)
             .expect_err("an API error should fail");
-        assert_eq!(plugin_error(&error).code, PluginErrorCode::AuthFailed);
+        assert_eq!(
+            plugin_error(&error).code,
+            PluginErrorCode::from(codes::INVALID_PASSKEY)
+        );
     }
 
     #[test]
@@ -2712,5 +2736,161 @@ mod tests {
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].title, "first");
         assert_eq!(deduped[1].title, "third");
+    }
+
+    /// A host that answers every HTTP request on this thread with one canned
+    /// response, so a handler runs end to end without a network.
+    mod canned_host {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        use scryer_plugin_pdk::runtime::{
+            HostError, HostRuntime, PluginHttpFieldsResponse, PluginHttpRequest,
+            install_host_runtime,
+        };
+
+        #[derive(Default)]
+        struct Canned {
+            active: bool,
+            config: HashMap<String, String>,
+            status: u16,
+            body: String,
+            /// Monotonic time; a sleep advances it by exactly its duration.
+            now_ms: u64,
+        }
+
+        thread_local! {
+            static CANNED: RefCell<Canned> = RefCell::new(Canned::default());
+        }
+
+        struct CannedHost;
+
+        static HOST: CannedHost = CannedHost;
+
+        impl HostRuntime for CannedHost {
+            fn http_fields(
+                &self,
+                _request: PluginHttpRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<PluginHttpFieldsResponse, HostError>> + '_>>
+            {
+                Box::pin(async move {
+                    CANNED.with(|canned| {
+                        let canned = canned.borrow();
+                        if !canned.active {
+                            return Err(HostError::Transport);
+                        }
+                        Ok(PluginHttpFieldsResponse {
+                            status: canned.status,
+                            headers: Vec::new(),
+                            body: canned.body.clone().into_bytes(),
+                        })
+                    })
+                })
+            }
+
+            fn sleep(&self, duration_ms: u64) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+                CANNED.with(|canned| {
+                    let mut canned = canned.borrow_mut();
+                    canned.now_ms = canned.now_ms.saturating_add(duration_ms);
+                });
+                Box::pin(async {})
+            }
+
+            fn monotonic_now_ms(&self) -> u64 {
+                CANNED.with(|canned| canned.borrow().now_ms)
+            }
+
+            fn operation_deadline_monotonic_ms(&self) -> u64 {
+                u64::MAX
+            }
+
+            fn wall_now_ms(&self) -> u64 {
+                0
+            }
+
+            fn config_get(&self, key: &str) -> Option<String> {
+                CANNED.with(|canned| canned.borrow().config.get(key).cloned())
+            }
+
+            fn provider_profile_bytes(&self) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_get(&self, _key: &str) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn state_cas(
+                &self,
+                _key: &str,
+                _expected: Option<&[u8]>,
+                _replacement: Option<&[u8]>,
+            ) -> bool {
+                true
+            }
+
+            fn log(&self, _level: scryer_plugin_pdk::log::LogLevel, _message: &str) {}
+        }
+
+        /// Answer every request on this thread with `status` and `body`, and
+        /// serve `config` as the instance settings.
+        pub fn answer(config: &[(&str, &str)], status: u16, body: &str) {
+            install_host_runtime(&HOST);
+            CANNED.with(|canned| {
+                *canned.borrow_mut() = Canned {
+                    active: true,
+                    config: config
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                    status,
+                    body: body.to_string(),
+                    now_ms: 1_000_000,
+                }
+            });
+        }
+
+        /// Drive `future` to completion; the canned host never suspends.
+        pub fn run<T>(future: impl Future<Output = T>) -> T {
+            let mut future = std::pin::pin!(future);
+            match future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                Poll::Ready(output) => output,
+                Poll::Pending => panic!("the canned host never suspends"),
+            }
+        }
+    }
+
+    fn fetch_error(status: u16, body: &str) -> PluginError {
+        canned_host::answer(&[], status, body);
+        let error = canned_host::run(async {
+            let body =
+                fetch_json("https://filelist.example.invalid/api.php?action=latest-torrents")
+                    .await?;
+            parse_torrents(&test_config(), &body)
+        })
+        .expect_err("the request fails");
+        scryer_plugin_pdk::error::plugin_error_from(&error)
+    }
+
+    #[test]
+    fn a_rejected_passkey_reaches_the_host_as_invalid_passkey() {
+        let error = fetch_error(403, r#"{"error":"Invalid passkey."}"#);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_PASSKEY));
+        assert!(!error.public_message.contains("Invalid passkey."));
+
+        let error = fetch_error(200, r#"{"error":"Invalid passkey!"}"#);
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_PASSKEY));
+    }
+
+    #[test]
+    fn a_missing_api_root_is_endpoint_not_found() {
+        let error = fetch_error(404, "");
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
     }
 }

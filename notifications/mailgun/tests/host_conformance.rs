@@ -7,7 +7,12 @@
 
 // conformance: bespoke
 
-use scryer_plugin_conformance::notification::NotificationConformance;
+use scryer_plugin_conformance::notification::{
+    NotificationConformance, call_notification, instantiate, test_request,
+};
+use scryer_plugin_conformance::{HttpScript, Script};
+use scryer_plugin_sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
+use scryer_plugin_sdk::{NotificationEventType, PluginErrorCode, PluginResult};
 
 /// A prefix rather than a whole URL: what is pinned is that the sending domain
 /// and the region both come from the resolved configuration and are used
@@ -17,15 +22,7 @@ const EXPECTED_URL_PREFIX: &str = "https://api.mailgun.net/v3/mg.test.invalid/me
 
 #[test]
 fn mailgun_release_wasm_conforms_to_the_notification_host_contract() {
-    let outcome = NotificationConformance::new(env!("CARGO_MANIFEST_DIR"), "mailgun")
-        .wasm("mailgun_notification.wasm")
-        .config("sender_domain", "mg.test.invalid")
-        .config("from", "scryer@test.invalid")
-        .config("recipients", "ops@test.invalid")
-        .config("api_key", "mailgunkey")
-        .expects_url_prefix(EXPECTED_URL_PREFIX)
-        .required_setting("sender_domain")
-        .run();
+    let outcome = conformance().run();
 
     // Mailgun is posted to as a URL-encoded form, and every field that decides
     // where the mail goes travels in that body — never in the URL.
@@ -50,5 +47,42 @@ fn mailgun_release_wasm_conforms_to_the_notification_host_contract() {
         !outcome.send.urls.iter().any(|url| url.contains('?')),
         "no message content may travel in the URL: {:?}",
         outcome.send.urls
+    );
+
+    // The shared suite accepts a 5xx answered as a typed `UpstreamUnavailable`
+    // error; this pins that answer and keeps the upstream text out of the
+    // public message.
+    assert_a_server_error_is_upstream_unavailable(&conformance());
+}
+
+fn conformance() -> NotificationConformance {
+    NotificationConformance::new(env!("CARGO_MANIFEST_DIR"), "mailgun")
+        .wasm("mailgun_notification.wasm")
+        .config("sender_domain", "mg.test.invalid")
+        .config("from", "scryer@test.invalid")
+        .config("recipients", "ops@test.invalid")
+        .config("api_key", "mailgunkey")
+        .expects_url_prefix(EXPECTED_URL_PREFIX)
+        .required_setting("sender_domain")
+}
+
+fn assert_a_server_error_is_upstream_unavailable(conformance: &NotificationConformance) {
+    let script = Script {
+        http: HttpScript::status(500, b"synthetic upstream failure".to_vec()),
+        ..conformance.script()
+    };
+    let (mut store, plugin) = instantiate(&conformance.wasm_path(), script);
+    let result = call_notification(
+        &mut store,
+        &plugin,
+        PluginNotificationCommand::Send(test_request(NotificationEventType::Test)),
+    );
+    let PluginNotificationCommandResult::Send(PluginResult::Err(error)) = result else {
+        panic!("a server error must be a typed plugin error: {result:?}");
+    };
+    assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+    assert!(
+        !error.public_message.contains("synthetic upstream failure"),
+        "the upstream text belongs in the debug message: {error:?}"
     );
 }

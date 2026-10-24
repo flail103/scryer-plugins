@@ -96,7 +96,7 @@ fn series_title() -> PluginNotificationTitle {
     }
 }
 
-fn reply(status: u16, body: &str) -> Result<Reply, String> {
+fn reply(status: u16, body: &str) -> Result<Reply, PluginError> {
     Ok(Reply {
         status,
         headers: BTreeMap::new(),
@@ -104,7 +104,11 @@ fn reply(status: u16, body: &str) -> Result<Reply, String> {
     })
 }
 
-fn reply_with_headers(status: u16, body: &str, headers: &[(&str, &str)]) -> Result<Reply, String> {
+fn reply_with_headers(
+    status: u16,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Result<Reply, PluginError> {
     Ok(Reply {
         status,
         headers: headers
@@ -115,10 +119,19 @@ fn reply_with_headers(status: u16, body: &str, headers: &[(&str, &str)]) -> Resu
     })
 }
 
-fn pushed(iden: &str) -> Result<Reply, String> {
+fn pushed(iden: &str) -> Result<Reply, PluginError> {
     reply(
         200,
         &format!(r#"{{"active":true,"iden":"{iden}","type":"note"}}"#),
+    )
+}
+
+/// What the host transport reports when the request got no HTTP answer.
+fn egress_refused() -> PluginError {
+    plugin_error(
+        PluginErrorCode::UpstreamUnavailable,
+        "Pushbullet could not be reached".to_string(),
+        Some("egress refused".to_string()),
     )
 }
 
@@ -147,7 +160,7 @@ const QUOTA_BODY: &str = r#"{"error":{"code":"pushbullet_pro_required","type":"i
 fn run(
     req: &PluginNotificationRequest,
     settings: &Settings,
-    replies: Vec<Result<Reply, String>>,
+    replies: Vec<Result<Reply, PluginError>>,
 ) -> (PluginResult<PluginNotificationResponse>, Vec<Outbound>) {
     let mut replies = replies.into_iter();
     let mut sent = Vec::new();
@@ -549,7 +562,7 @@ fn a_manual_interaction_link_wins_over_the_metadata_link() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_rejected_token_is_auth_failed_on_api_key_and_stops_sending() {
+fn a_rejected_token_is_invalid_api_key_on_api_key_and_stops_sending() {
     let settings = with_channels(&["alpha-channel", "beta-channel"]);
     let (result, sent) = run(
         &live(),
@@ -560,8 +573,18 @@ fn a_rejected_token_is_auth_failed_on_api_key_and_stops_sending() {
         )],
     );
     let error = err(result);
-    assert_eq!(error.code, PluginErrorCode::AuthFailed);
+    assert_eq!(error.code.as_str(), codes::INVALID_API_KEY);
     assert!(error.public_message.contains("api_key"), "{error:?}");
+    assert!(
+        !error.public_message.contains("Access token is missing"),
+        "the provider's text stays in the debug detail: {error:?}"
+    );
+    assert!(
+        error
+            .debug_message
+            .as_deref()
+            .is_some_and(|debug| debug.contains("Access token is missing or invalid."))
+    );
     assert_eq!(sent.len(), 1, "the second channel would fail the same way");
 }
 
@@ -615,7 +638,7 @@ fn a_refused_channel_is_invalid_config_on_channel_tags_but_a_refused_broadcast_i
         )],
     );
     let error = err(result);
-    assert_eq!(error.code, PluginErrorCode::AuthFailed);
+    assert_eq!(error.code.as_str(), codes::INVALID_API_KEY);
     assert!(error.public_message.contains("api_key"), "{error:?}");
 }
 
@@ -708,11 +731,18 @@ fn the_monthly_quota_is_reported_as_such_and_not_retried_across_targets() {
         let settings = with_channels(&["alpha-channel", "beta-channel"]);
         let (result, sent) = run(&live(), &settings, vec![reply(status, QUOTA_BODY)]);
         let error = err(result);
-        assert_eq!(error.code, PluginErrorCode::RateLimited, "HTTP {status}");
+        assert_eq!(error.code.as_str(), codes::QUOTA_EXCEEDED, "HTTP {status}");
         assert!(
             error.public_message.contains("monthly push limit")
                 && error.public_message.contains("500")
                 && error.public_message.contains("Pushbullet Pro"),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("pushbullet_pro_required")),
             "{error:?}"
         );
         assert_eq!(
@@ -734,7 +764,7 @@ fn the_monthly_quota_after_a_partial_delivery_reports_what_was_delivered() {
     assert_eq!(sent.len(), 2);
     let response = ok(result);
     assert!(!response.success);
-    assert_eq!(response.provider_status.as_deref(), Some("rate_limited"));
+    assert_eq!(response.provider_status.as_deref(), Some("quota_exceeded"));
     assert!(
         response
             .error
@@ -751,7 +781,7 @@ fn the_monthly_quota_after_a_partial_delivery_reports_what_was_delivered() {
         statuses,
         vec![
             Some("delivered"),
-            Some("rate_limited"),
+            Some("quota_exceeded"),
             Some("not_attempted")
         ]
     );
@@ -831,11 +861,48 @@ fn a_server_error_is_a_retryable_delivery_failure_for_that_target_only() {
 }
 
 #[test]
-fn a_single_target_server_error_reports_the_provider_status() {
+fn a_single_target_server_error_is_upstream_unavailable() {
     let (result, _) = run(&live(), &settings(), vec![reply(500, "boom")]);
+    let error = err(result);
+    assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+    assert!(!error.public_message.contains("boom"), "{error:?}");
+    assert!(!error.public_message.contains("500"), "{error:?}");
+}
+
+#[test]
+fn a_single_target_rate_limit_is_rate_limited_with_its_delay() {
+    let (result, _) = run(
+        &live(),
+        &settings(),
+        vec![reply_with_headers(
+            429,
+            "slow down",
+            &[("Retry-After", "30")],
+        )],
+    );
+    let error = err(result);
+    assert_eq!(error.code, PluginErrorCode::RateLimited);
+    assert!(
+        error
+            .retry_after_seconds
+            .is_some_and(|seconds| seconds >= 1)
+    );
+}
+
+#[test]
+fn a_server_error_on_one_of_several_targets_stays_a_per_target_delivery_failure() {
+    let settings = with_channels(&["alpha-channel", "beta-channel"]);
+    let (result, _) = run(
+        &live(),
+        &settings,
+        vec![reply(500, "boom"), pushed("push-2")],
+    );
     let response = ok(result);
     assert!(!response.success);
-    assert_eq!(response.provider_status.as_deref(), Some("http_500"));
+    assert_eq!(
+        response.target_results[0].status.as_deref(),
+        Some("http_500")
+    );
 }
 
 #[test]
@@ -847,13 +914,20 @@ fn an_unrecognised_rejection_is_a_permanent_error_about_the_push_itself() {
     );
     let error = err(result);
     assert_eq!(error.code, PluginErrorCode::Permanent);
-    assert!(error.public_message.contains("Invalid type."), "{error:?}");
+    assert!(!error.public_message.contains("Invalid type."), "{error:?}");
+    assert!(
+        error
+            .debug_message
+            .as_deref()
+            .is_some_and(|debug| debug.contains("Invalid type.")),
+        "{error:?}"
+    );
 }
 
 #[test]
 fn an_unreachable_host_is_a_delivery_failure_live_and_a_typed_error_on_test() {
     let settings = with_channels(&["alpha-channel", "beta-channel"]);
-    let (result, sent) = run(&live(), &settings, vec![Err("egress refused".to_string())]);
+    let (result, sent) = run(&live(), &settings, vec![Err(egress_refused())]);
     assert_eq!(sent.len(), 1);
     let response = ok(result);
     assert!(!response.success);
@@ -862,11 +936,7 @@ fn an_unreachable_host_is_a_delivery_failure_live_and_a_typed_error_on_test() {
         Some("request_failed")
     );
 
-    let (result, _) = run(
-        &test_event(),
-        &settings,
-        vec![Err("egress refused".to_string())],
-    );
+    let (result, _) = run(&test_event(), &settings, vec![Err(egress_refused())]);
     assert_eq!(err(result).code, PluginErrorCode::UpstreamUnavailable);
 }
 
@@ -964,7 +1034,7 @@ fn a_test_follows_the_device_list_cursor() {
 }
 
 #[test]
-fn a_test_whose_device_list_is_refused_for_the_token_is_auth_failed() {
+fn a_test_whose_device_list_is_refused_for_the_token_is_invalid_api_key() {
     let settings = with_devices(&["udevone"]);
     let (result, sent) = run(
         &test_event(),
@@ -976,7 +1046,7 @@ fn a_test_whose_device_list_is_refused_for_the_token_is_auth_failed() {
     );
     assert_eq!(sent.len(), 1);
     let error = err(result);
-    assert_eq!(error.code, PluginErrorCode::AuthFailed);
+    assert_eq!(error.code.as_str(), codes::INVALID_API_KEY);
     assert!(error.public_message.contains("api_key"));
 }
 
@@ -1046,7 +1116,7 @@ fn a_live_send_does_not_list_devices() {
 
 fn options(
     token: Option<&str>,
-    replies: Vec<Result<Reply, String>>,
+    replies: Vec<Result<Reply, PluginError>>,
 ) -> PluginResult<PluginActionResponse> {
     let mut replies = replies.into_iter();
     device_options(token.map(str::to_string), &mut |outbound: &Outbound| {
@@ -1091,7 +1161,7 @@ fn the_device_list_action_without_a_token_offers_nothing_and_calls_nothing() {
 }
 
 #[test]
-fn the_device_list_action_reports_a_rejected_token_as_auth_failed() {
+fn the_device_list_action_reports_a_rejected_token_as_invalid_api_key() {
     let result = options(
         Some(TOKEN),
         vec![reply(
@@ -1102,5 +1172,5 @@ fn the_device_list_action_reports_a_rejected_token_as_auth_failed() {
     let PluginResult::Err(error) = result else {
         panic!("{result:?}");
     };
-    assert_eq!(error.code, PluginErrorCode::AuthFailed);
+    assert_eq!(error.code.as_str(), codes::INVALID_API_KEY);
 }

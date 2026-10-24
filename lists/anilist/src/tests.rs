@@ -557,7 +557,10 @@ fn a_missing_custom_list_is_not_found_but_an_empty_one_is_empty() {
         &["Fixture Queue"],
     );
     let error = block_on(fetch(&answering(&body), &custom_request("Fixture Archive"))).unwrap_err();
-    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        error.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(error.public_message.contains("not found"));
     assert!(
         !error.public_message.contains("Fixture Archive"),
@@ -822,7 +825,11 @@ fn http_failures_map_to_host_classes() {
     let cases = [
         (401, PluginErrorCode::AuthFailed, false),
         (403, PluginErrorCode::UpstreamUnavailable, false),
-        (404, PluginErrorCode::Permanent, true),
+        (
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
         (429, PluginErrorCode::RateLimited, false),
         (500, PluginErrorCode::UpstreamUnavailable, false),
         (502, PluginErrorCode::UpstreamUnavailable, false),
@@ -842,19 +849,17 @@ fn http_failures_map_to_host_classes() {
         }
         assert_no_secret(&error);
     }
+    let unreadable = PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE);
     let html = answering("<html><body>maintenance</body></html>");
-    assert_eq!(
-        block_on(fetch(&html, &status_request("current")))
-            .unwrap_err()
-            .code,
-        PluginErrorCode::Permanent
-    );
+    let error = block_on(fetch(&html, &status_request("current"))).unwrap_err();
+    assert_eq!(error.code, unreadable);
+    assert!(!error.public_message.contains("maintenance"));
     let empty = answering(r#"{ "data": { "MediaListCollection": null } }"#);
     assert_eq!(
         block_on(fetch(&empty, &status_request("current")))
             .unwrap_err()
             .code,
-        PluginErrorCode::Permanent
+        unreadable
     );
 }
 
@@ -882,10 +887,34 @@ fn graphql_errors_map_to_host_classes_even_with_http_200() {
             PluginErrorCode::RateLimited,
             false,
         ),
-        (404, "Not Found.", 404, PluginErrorCode::Permanent, true),
-        (404, "User not found", 404, PluginErrorCode::Permanent, true),
-        (404, "Private User", 404, PluginErrorCode::Permanent, true),
-        (200, "User not found", 404, PluginErrorCode::Permanent, true),
+        (
+            404,
+            "Not Found.",
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
+        (
+            404,
+            "User not found",
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
+        (
+            404,
+            "Private User",
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
+        (
+            200,
+            "User not found",
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
         (
             403,
             "The AniList API has been temporarily disabled due to severe stability issues.",
@@ -1089,4 +1118,40 @@ fn a_full_chunk_without_a_next_chunk_flag_fails_instead_of_ending_the_list() {
     let response = block_on(fetch(&http, &status_request("completed"))).unwrap();
     assert_eq!(keys(&response), vec![("anilist:950999", Some(1))]);
     assert!(response.next_cursor.is_none());
+}
+
+#[test]
+fn a_rejected_token_is_auth_failed_on_account_and_fetch() {
+    // The host expires the linked account and asks for a reconnect only on
+    // the well-known `auth_failed` code, so a refused token keeps it.
+    let body = r#"{"errors":[{"message":"Invalid token","status":400}],"data":null}"#;
+    let http = RecordedHttp::new().with(API_URL, 400, body);
+    let result = block_on(run(
+        &http,
+        PluginListCommand::Account(ListPluginAccountRequest {
+            credential: credential(),
+        }),
+    ));
+    let refused = match result {
+        PluginListCommandResult::Account(PluginResult::Err(error)) => error,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(refused.code, PluginErrorCode::AuthFailed);
+    assert!(!refused.public_message.contains("Invalid token"));
+    assert_eq!(
+        refused.debug_message.as_deref(),
+        Some("AniList account: HTTP 400 GraphQL errors: 400 Invalid token")
+    );
+    assert_no_secret(&refused);
+
+    let http = RecordedHttp::new().with(API_URL, 401, "");
+    let lapsed = block_on(fetch(&http, &status_request("current"))).unwrap_err();
+    assert_eq!(lapsed.code, PluginErrorCode::AuthFailed);
+    assert!(
+        lapsed
+            .debug_message
+            .as_deref()
+            .is_some_and(|debug| debug.ends_with("HTTP 401"))
+    );
+    assert_no_secret(&lapsed);
 }

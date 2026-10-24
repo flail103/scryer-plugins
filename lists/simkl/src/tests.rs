@@ -827,7 +827,11 @@ fn upstream_failures_map_to_host_classes() {
         (401, PluginErrorCode::AuthFailed, false),
         // A 403 Simkl gives no reason for is a refusal retrying cannot fix.
         (403, PluginErrorCode::Permanent, false),
-        (404, PluginErrorCode::Permanent, true),
+        (
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            true,
+        ),
         (412, PluginErrorCode::UpstreamUnavailable, false),
         (429, PluginErrorCode::RateLimited, false),
         (500, PluginErrorCode::UpstreamUnavailable, false),
@@ -870,15 +874,23 @@ fn upstream_failures_map_to_host_classes() {
 }
 
 #[test]
-fn rejected_tokens_name_simkls_reason_but_never_the_token() {
+fn rejected_tokens_log_simkls_reason_but_never_the_token() {
     let named = RecordedHttp::new().with(
         &activities_url(),
         401,
         r#"{"error":"invalid_token","code":401,"message":"Token expired"}"#,
     );
     let error = fetch_err(&named, &request(SOURCE_WATCHING, None, None));
+    // `auth_failed`, not `invalid_api_key`: the host expires the linked
+    // account and asks for a reconnect only on this well-known code.
     assert_eq!(error.code, PluginErrorCode::AuthFailed);
-    assert!(error.public_message.contains("HTTP 401, invalid_token"));
+    assert!(!error.public_message.contains("invalid_token"));
+    assert!(
+        error
+            .debug_message
+            .as_deref()
+            .is_some_and(|debug| debug.ends_with("HTTP 401, invalid_token"))
+    );
 
     let echoed = RecordedHttp::new().with(
         &activities_url(),
@@ -897,8 +909,14 @@ fn rejected_tokens_name_simkls_reason_but_never_the_token() {
     );
     let error = fetch_err(&refused, &request(SOURCE_WATCHING, None, None));
     assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
-    assert!(error.public_message.contains("client_id_failed"));
-    assert!(!error.public_message.contains(CLIENT_ID));
+    assert!(!error.public_message.contains("client_id_failed"));
+    assert!(
+        error
+            .debug_message
+            .as_deref()
+            .is_some_and(|debug| debug.contains("client_id_failed"))
+    );
+    assert!(!format!("{error:?}").contains(CLIENT_ID));
 }
 
 #[test]
@@ -911,7 +929,14 @@ fn a_403_that_only_a_new_link_fixes_asks_for_one() {
         );
         let error = fetch_err(&http, &request(SOURCE_WATCHING, None, None));
         assert_eq!(error.code, PluginErrorCode::AuthFailed, "{name}");
-        assert!(error.public_message.contains(name), "{name}");
+        assert!(!error.public_message.contains(name), "{name}");
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains(name)),
+            "{name}"
+        );
     }
     for name in ["forbidden", "private_list"] {
         let http = RecordedHttp::new().with(
@@ -927,18 +952,19 @@ fn a_403_that_only_a_new_link_fixes_asks_for_one() {
 
 #[test]
 fn malformed_library_responses_are_permanent_failures() {
-    for body in [
-        "<html>maintenance</html>",
-        r#"{"shows": {"title": "Fixture"}}"#,
-        r#"[{"show": {}}]"#,
-        r#""text""#,
-        r#"{"error": "fixture_error"}"#,
+    let unreadable = PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE);
+    for (body, code) in [
+        ("<html>maintenance</html>", unreadable.clone()),
+        (r#"{"shows": {"title": "Fixture"}}"#, unreadable.clone()),
+        (r#"[{"show": {}}]"#, unreadable.clone()),
+        (r#""text""#, unreadable.clone()),
+        (r#"{"error": "fixture_error"}"#, PluginErrorCode::Permanent),
     ] {
         let http = RecordedHttp::new()
             .with(&activities_url(), 200, ACTIVITIES)
             .with(&items_url("shows", SOURCE_WATCHING), 200, body);
         let error = fetch_err(&http, &request(SOURCE_WATCHING, Some("shows"), None));
-        assert_eq!(error.code, PluginErrorCode::Permanent, "{body}");
+        assert_eq!(error.code, code, "{body}");
         assert!(!error.public_message.contains("not found"), "{body}");
     }
 }
@@ -1023,7 +1049,10 @@ fn account_tolerates_a_private_profile_but_needs_an_id() {
 
     let anonymous = RecordedHttp::new().with(&api("/users/settings"), 200, r#"{"user": {}}"#);
     let error = block_on(account(&anonymous, CLIENT_ID, &credential())).unwrap_err();
-    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        error.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE)
+    );
 
     let revoked = RecordedHttp::new().with(
         &api("/users/settings"),
@@ -1121,14 +1150,20 @@ fn a_burst_429_retries_shortly_and_ignores_retry_after() {
 #[test]
 fn a_spent_daily_allowance_waits_for_the_reset_and_names_whose_it_is() {
     let member = limited(r#"{"error":"user_limit_exceeded","code":429}"#, "5400");
-    assert_eq!(member.code, PluginErrorCode::RateLimited);
+    assert_eq!(
+        member.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::QUOTA_EXCEEDED)
+    );
     assert_eq!(member.retry_after_seconds, Some(5400));
     assert!(member.public_message.contains("this member's daily"));
     assert!(!member.public_message.contains("unavailable"));
     assert!(!member.public_message.contains(TOKEN));
 
     let app = limited(r#"{"error":"app_limit_exceeded","code":429}"#, "600");
-    assert_eq!(app.code, PluginErrorCode::RateLimited);
+    assert_eq!(
+        app.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::QUOTA_EXCEEDED)
+    );
     assert_eq!(app.retry_after_seconds, Some(600));
     assert!(app.public_message.contains("app's daily"));
 }
@@ -1144,7 +1179,12 @@ fn a_status_too_large_to_build_is_a_permanent_failure_that_says_why() {
         );
     let error = fetch_err(&http, &request(SOURCE_COMPLETED, Some("shows"), None));
     assert_eq!(error.code, PluginErrorCode::Permanent);
-    assert!(error.public_message.contains("max_items"));
+    assert!(
+        error
+            .debug_message
+            .as_deref()
+            .is_some_and(|debug| debug.contains("max_items"))
+    );
     assert!(error.public_message.contains("too large"));
     assert!(!error.public_message.contains("not found"));
     assert!(!error.public_message.contains("Too many episodes"));
@@ -1334,7 +1374,7 @@ fn custom_lists_never_treat_errors_or_partial_data_as_empty_membership() {
     wrong_kind["items"][0]["type"] = "episode".into();
     let mut unknown_anime = custom_body("anime", custom_media("anime", 9900301));
     unknown_anime["items"][0]["anime_type"] = Value::Null;
-    for body in [
+    for (index, body) in [
         serde_json::from_str(PREMIUM).unwrap(),
         missing,
         truncated,
@@ -1342,17 +1382,26 @@ fn custom_lists_never_treat_errors_or_partial_data_as_empty_membership() {
         mismatched,
         wrong_kind,
         unknown_anime,
-    ] {
-        let http = RecordedHttp::new().with(&custom_url(1), 200, &body.to_string());
-        assert_eq!(
-            fetch_err(&http, &custom_request()).code,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A PRO-only refusal is Simkl's own answer; the rest are malformed.
+        let expected = if index == 0 {
             PluginErrorCode::Permanent
-        );
+        } else {
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE)
+        };
+        let http = RecordedHttp::new().with(&custom_url(1), 200, &body.to_string());
+        assert_eq!(fetch_err(&http, &custom_request()).code, expected);
     }
     for (status, code) in [
         (401, PluginErrorCode::AuthFailed),
         (403, PluginErrorCode::Permanent),
-        (404, PluginErrorCode::Permanent),
+        (
+            404,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+        ),
         (429, PluginErrorCode::RateLimited),
         (503, PluginErrorCode::UpstreamUnavailable),
     ] {
@@ -1484,7 +1533,7 @@ fn custom_auto_duplicate_pages_and_verification_outages_fail_closed() {
         .with(&custom_url(2), 200, &second.to_string());
     assert_eq!(
         fetch_err(&http, &custom_request()).code,
-        PluginErrorCode::Permanent
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE)
     );
     let (_, second) = auto_pages();
     let http = RebuiltAutoList {

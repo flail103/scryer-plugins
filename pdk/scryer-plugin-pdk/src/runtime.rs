@@ -68,8 +68,8 @@ use std::{fmt, mem};
 // without depending on the SDK's module layout.
 pub use scryer_plugin_sdk::host::{PluginHttpRequest, PluginHttpResponse};
 use scryer_plugin_sdk::{
-    IndexerSearchIncompleteReason, IndexerSearchPluginError, PluginError, PluginErrorCode,
-    PluginErrorDetails, PluginProviderProfile,
+    IndexerSearchIncompleteReason, IndexerSearchPluginError, PluginErrorCode, PluginErrorDetails,
+    PluginProviderProfile,
 };
 
 mod imports {
@@ -498,20 +498,19 @@ pub async fn sleep_until_deadline(duration_ms: u64) -> Result<(), DeadlineExceed
 pub fn deadline_deferred_error(wait: DeadlineExceeded) -> crate::Error {
     let retry_after_seconds =
         i64::try_from(wait.retry_after_ms.div_ceil(1_000)).unwrap_or(i64::MAX);
-    crate::component::structured_plugin_error(PluginError {
-        code: PluginErrorCode::UpstreamUnavailable,
-        public_message: "indexer search deferred by upstream pacing".to_string(),
-        debug_message: Some(
-            "the operation deadline expires before the next upstream request may start".to_string(),
-        ),
-        retry_after_seconds: Some(retry_after_seconds),
-        details: Some(PluginErrorDetails::IndexerSearch(
-            IndexerSearchPluginError::Deferred {
-                reason: IndexerSearchIncompleteReason::RateLimited,
-                retry_after_seconds: Some(retry_after_seconds),
-            },
-        )),
-    })
+    crate::error::plugin_error(
+        PluginErrorCode::UpstreamUnavailable,
+        "indexer search deferred by upstream pacing",
+    )
+    .debug("the operation deadline expires before the next upstream request may start")
+    .retry_after_seconds(retry_after_seconds)
+    .details(PluginErrorDetails::IndexerSearch(
+        IndexerSearchPluginError::Deferred {
+            reason: IndexerSearchIncompleteReason::RateLimited,
+            retry_after_seconds: Some(retry_after_seconds),
+        },
+    ))
+    .into_error()
 }
 
 /// A plugin-owned, component-instance start-rate gate.

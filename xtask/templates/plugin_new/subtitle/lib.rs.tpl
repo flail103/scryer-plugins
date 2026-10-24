@@ -85,6 +85,8 @@ fn build_descriptor() -> PluginDescriptor {
             },
             config_fields: vec![],
         }),
+        // Installation-wide settings, shared by every instance of the plugin.
+        settings: vec![],
     }
 }
 

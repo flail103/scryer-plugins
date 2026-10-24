@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, HashMap};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
-use scryer_plugin_pdk::component::{self, LogLevel, StartRateGate, structured_plugin_error};
+use scryer_plugin_pdk::component::{self, LogLevel, StartRateGate};
 use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
@@ -42,7 +42,7 @@ use scryer_plugin_sdk::{
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchIncompleteReason, IndexerSearchInput, IndexerSearchInvalidResponseKind,
     IndexerSearchPluginError, IndexerSourceKind, IndexerStrategyPlanCapability,
-    IndexerTorrentCapabilities, PluginDescriptor, PluginError, PluginErrorCode, PluginErrorDetails,
+    IndexerTorrentCapabilities, PluginDescriptor, PluginErrorCode, PluginErrorDetails,
     PluginSearchRequest as SearchRequest, PluginSearchRequestKind,
     PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult,
     PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION, torrent_result,
@@ -133,6 +133,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: PROVIDER_ID.to_string(),
             provider_aliases: vec![],
@@ -147,6 +148,9 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
+                resolve_network_endpoints: false,
+                http: None,
+                dynamic_config_fields: None,
                 // Nyaa has no id lookup of any kind: the only search input is
                 // the free-text term.
                 supported_ids: HashMap::new(),
@@ -202,6 +206,7 @@ fn build_descriptor() -> PluginDescriptor {
                     rate_limit_hint_seconds: Some(2),
                     api_quota_supported: false,
                     grab_quota_supported: false,
+                    paged_search: false,
                 }),
                 torrent: Some(IndexerTorrentCapabilities {
                     reports_seeders: true,
@@ -867,8 +872,8 @@ fn classify_response(
         }
         401 | 403 => {
             if is_html_delivery(headers, body) {
-                return Err(invalid_response_error(
-                    IndexerSearchInvalidResponseKind::UnexpectedContentType,
+                return Err(html_page_error(
+                    body,
                     format!(
                         "Nyaa answered HTTP {status} with an HTML page: the site is likely \
                          blocking Scryer (a CDN challenge) rather than rejecting a credential — \
@@ -883,6 +888,15 @@ fn classify_response(
                  configured 'username'/'password' or 'cookie': {}",
                 body_excerpt(body)
             )));
+        }
+        404 => {
+            return Err(typed_error(
+                PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND),
+                "the Nyaa RSS endpoint was not found".to_string(),
+                format!("Nyaa returned HTTP 404: {}", body_excerpt(body)),
+                None,
+                None,
+            ));
         }
         429 => return Err(rate_limited_error(retry_after_seconds(headers))),
         _ => {
@@ -913,8 +927,8 @@ fn classify_response(
     })?;
 
     if is_html_delivery(headers, body) {
-        return Err(invalid_response_error(
-            IndexerSearchInvalidResponseKind::UnexpectedContentType,
+        return Err(html_page_error(
+            body,
             format!(
                 "Nyaa returned content type {:?} instead of RSS: the site is likely blocking \
                  Scryer, or 'base_url' does not point at a Nyaa instance: {}",
@@ -979,13 +993,14 @@ fn typed_error(
     retry_after_seconds: Option<i64>,
     details: Option<IndexerSearchPluginError>,
 ) -> Error {
-    structured_plugin_error(PluginError {
-        code,
-        public_message,
-        debug_message: Some(debug_message),
-        retry_after_seconds,
-        details: details.map(PluginErrorDetails::IndexerSearch),
-    })
+    let mut error = plugin_error(code, public_message).debug(debug_message);
+    if let Some(seconds) = retry_after_seconds {
+        error = error.retry_after_seconds(seconds);
+    }
+    if let Some(details) = details {
+        error = error.details(PluginErrorDetails::IndexerSearch(details));
+    }
+    error.into_error()
 }
 
 /// A configuration fault. Deliberately NOT a deferred error: the host must
@@ -1058,11 +1073,36 @@ fn deferred_error(
 
 fn invalid_response_error(kind: IndexerSearchInvalidResponseKind, detail: String) -> Error {
     typed_error(
-        PluginErrorCode::UpstreamUnavailable,
+        PluginErrorCode::from(codes::INVALID_RESPONSE),
         "Nyaa returned a response Scryer could not read".to_string(),
         detail,
         None,
         Some(IndexerSearchPluginError::InvalidResponse { kind }),
+    )
+}
+
+/// An HTML page where the feed belongs: a challenge page asks for a CAPTCHA;
+/// anything else is unreadable.
+fn html_page_error(body: &[u8], detail: String) -> Error {
+    let page = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if page.contains("captcha")
+        || page.contains("cf-challenge")
+        || page.contains("challenge-platform")
+        || page.contains("attention required")
+    {
+        return typed_error(
+            PluginErrorCode::from(codes::CAPTCHA_REQUIRED),
+            "Nyaa answered with a CAPTCHA challenge".to_string(),
+            detail,
+            None,
+            Some(IndexerSearchPluginError::InvalidResponse {
+                kind: IndexerSearchInvalidResponseKind::UnexpectedContentType,
+            }),
+        );
+    }
+    invalid_response_error(
+        IndexerSearchInvalidResponseKind::UnexpectedContentType,
+        detail,
     )
 }
 
@@ -2950,7 +2990,10 @@ mod tests {
         let error = parse_feed(r#"<html><body>nope</body></html>"#, FEED_URL)
             .expect_err("no channel is an error");
         let structured = structured(&error);
-        assert_eq!(structured.code, PluginErrorCode::UpstreamUnavailable);
+        assert_eq!(
+            structured.code,
+            PluginErrorCode::from(codes::INVALID_RESPONSE)
+        );
         assert!(matches!(
             structured.details,
             Some(PluginErrorDetails::IndexerSearch(
@@ -3502,6 +3545,31 @@ mod tests {
         assert_eq!(
             dedupe_strings(vec!["a".into(), "a".into(), "b".into()]),
             vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn a_captcha_page_is_captcha_required() {
+        let error = classify_response(
+            403,
+            &headers(&[("Content-Type", "text/html")]),
+            b"<html><div id=\"cf-challenge\">Please complete the captcha</div></html>",
+        )
+        .expect_err("a challenge page is an error");
+        let structured = structured(&error);
+        assert_eq!(
+            structured.code,
+            PluginErrorCode::from(codes::CAPTCHA_REQUIRED)
+        );
+        assert!(!structured.public_message.contains("cf-challenge"));
+    }
+
+    #[test]
+    fn a_missing_feed_is_endpoint_not_found() {
+        let error = classify_response(404, &headers(&[]), b"").expect_err("404 is an error");
+        assert_eq!(
+            structured(&error).code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
         );
     }
 }

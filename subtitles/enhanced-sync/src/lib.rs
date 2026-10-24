@@ -128,15 +128,13 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
 }
 
 fn catalog_unsupported() -> PluginError {
-    PluginError {
-        code: PluginErrorCode::Unsupported,
-        public_message: format!(
+    scryer_plugin_pdk::plugin_error(
+        PluginErrorCode::Unsupported,
+        format!(
             "{PLUGIN_NAME} aligns existing subtitles and does not search, download or generate them"
         ),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+    )
+    .build()
 }
 
 fn handle_command(request: SubtitleSyncPluginProcessRequest) -> SubtitleSyncPluginProcessResponse {
@@ -164,6 +162,7 @@ fn descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::Subtitle(SubtitleDescriptor {
             provider_type: PLUGIN_ID.to_string(),
             provider_aliases: vec![],

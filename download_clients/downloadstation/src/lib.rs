@@ -49,15 +49,17 @@ struct DsError {
     public_message: String,
     debug_message: Option<String>,
     api_code: Option<i64>,
+    retry_after_seconds: Option<i64>,
 }
 
 impl DsError {
-    fn new(code: PluginErrorCode, public_message: impl Into<String>) -> Self {
+    fn new(code: impl Into<PluginErrorCode>, public_message: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.into(),
             public_message: public_message.into(),
             debug_message: None,
             api_code: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -78,13 +80,14 @@ impl DsError {
     }
 
     fn into_plugin_error(self) -> PluginError {
-        PluginError {
-            code: self.code,
-            public_message: self.public_message,
-            debug_message: self.debug_message,
-            retry_after_seconds: None,
-            details: None,
+        let mut error = plugin_error(self.code, self.public_message);
+        if let Some(debug) = self.debug_message {
+            error = error.debug(debug);
         }
+        if let Some(seconds) = self.retry_after_seconds {
+            error = error.retry_after_seconds(seconds);
+        }
+        error.build()
     }
 }
 
@@ -232,12 +235,32 @@ fn api_error_code(api: DsApi, code: i64) -> PluginErrorCode {
         // Session timeout / duplicate login / missing sid. The call has already
         // been retried once with a fresh session by the time this classifies.
         (_, 106 | 107 | 119) => PluginErrorCode::Temporary,
-        (DsApi::Auth, 400..=410) => PluginErrorCode::AuthFailed,
-        // Destination denied / does not exist / no default destination / set
-        // destination failed — all of them are the operator's Download Station
-        // configuration, not a transient fault.
-        (DsApi::DownloadStationTask | DsApi::DownloadStation2Task, 402 | 403 | 406 | 407) => {
+        // No such account or incorrect password; an expired password that has
+        // to be changed before DSM lets the account in.
+        (DsApi::Auth, 400 | 408 | 409 | 410) => codes::INVALID_USERNAME_PASSWORD.into(),
+        (DsApi::Auth, 401) => codes::ACCOUNT_DISABLED.into(),
+        (DsApi::Auth, 403 | 404 | 406) => codes::TWO_FACTOR_REQUIRED.into(),
+        // A login DSM blocks rather than judges: 407 is its auto-block of the
+        // address after failed logins ("Blocked IP source"); 405 is read the
+        // same way.
+        (DsApi::Auth, 405 | 407) => codes::ACCOUNT_BANNED.into(),
+        // Denied permission: the credentials were right, but the account may
+        // not sign in to this service. No shared code names that.
+        (DsApi::Auth, _) => PluginErrorCode::AuthFailed,
+        // File upload failed / max number of tasks reached.
+        (DsApi::DownloadStationTask | DsApi::DownloadStation2Task, 400 | 401) => {
+            codes::DOWNLOAD_REJECTED.into()
+        }
+        // Destination denied / does not exist / set destination failed.
+        (DsApi::DownloadStationTask | DsApi::DownloadStation2Task, 402 | 403 | 407) => {
+            codes::PATH_NOT_WRITABLE.into()
+        }
+        // No default destination is a Download Station setting.
+        (DsApi::DownloadStationTask | DsApi::DownloadStation2Task, 406) => {
             PluginErrorCode::InvalidConfig
+        }
+        (DsApi::DownloadStationTask | DsApi::DownloadStation2Task, 404) => {
+            codes::ITEM_NOT_FOUND.into()
         }
         (DsApi::FileStationList, 160 | 408) => PluginErrorCode::InvalidConfig,
         // "API/method/version does not exist" is a capability answer, not a
@@ -376,13 +399,16 @@ struct CachedApis {
     apis: ApiSelection,
 }
 
+/// DSM omits `data` from a failed call (`{"success": false, "error": {..}}`),
+/// so it is read only once `success` says there is one.
 #[derive(Deserialize)]
-struct DiskResponse<T> {
+struct DiskResponse {
     #[serde(default)]
     success: bool,
     #[serde(default)]
     error: Option<DiskError>,
-    data: T,
+    #[serde(default)]
+    data: serde_json::Value,
 }
 
 #[derive(Default, Deserialize)]
@@ -631,6 +657,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "downloadstation".to_string(),
             provider_aliases: vec!["synology-download-station".to_string()],
@@ -669,6 +696,8 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
                 per_download_directory: true,
                 host_fs_required: false,
                 test_connection: true,
+                // Download Station's plain-HTTP tasks are not offered to Scryer.
+                http: None,
                 torrent: Some(DownloadTorrentCapabilities {
                     supported_sources: vec![
                         DownloadInputKind::MagnetUri,
@@ -1371,7 +1400,7 @@ fn authenticate(config: &DsConfig, auth: &ApiInfo, force: bool) -> Result<String
     let data: AuthData = request_disk_json(DsApi::Auth, "GET", &url, None)?;
     if data.sid.is_empty() {
         return Err(DsError::new(
-            PluginErrorCode::AuthFailed,
+            codes::INVALID_RESPONSE,
             "Download Station did not return a session id",
         ));
     }
@@ -1439,39 +1468,40 @@ fn request_disk_json<T: DeserializeOwned>(
     let request = HttpRequest::new(url)
         .with_method(method)
         .with_header("User-Agent", user_agent());
-    let response = http::request::<Vec<u8>>(&request, body).map_err(|error| {
-        DsError::new(
-            PluginErrorCode::UpstreamUnavailable,
-            "Unable to connect to Diskstation, please check your settings",
-        )
-        .with_debug(error.to_string())
-    })?;
+    let response =
+        http::request::<Vec<u8>>(&request, body).map_err(|error| transport_error(&error))?;
     let status = response.status_code();
     let text = String::from_utf8_lossy(&response.body()).to_string();
     if status >= 300 {
-        return Err(http_status_error(status, &text));
+        return Err(http_status_error(status, retry_after(&response), &text));
     }
     parse_disk_response(api, &text)
 }
 
 fn parse_disk_response<T: DeserializeOwned>(api: DsApi, text: &str) -> Result<T, DsError> {
-    let parsed: DiskResponse<T> = serde_json::from_str(text).map_err(|error| {
+    let parsed: DiskResponse = serde_json::from_str(text).map_err(|error| {
         if text.trim_start().starts_with('<') {
             DsError::new(
-                PluginErrorCode::InvalidConfig,
+                codes::ENDPOINT_NOT_FOUND,
                 "This host answered with a web page instead of the DiskStation API; check the address, port and SSL setting",
             )
             .with_debug(format!("{error}: {}", truncate(text, 300)))
         } else {
             DsError::new(
-                PluginErrorCode::Temporary,
+                codes::INVALID_RESPONSE,
                 "Download Station returned a response Scryer could not parse",
             )
             .with_debug(format!("{error}: {}", truncate(text, 300)))
         }
     })?;
     if parsed.success {
-        return Ok(parsed.data);
+        return serde_json::from_value(parsed.data).map_err(|error| {
+            DsError::new(
+                codes::INVALID_RESPONSE,
+                "Download Station returned a response Scryer could not parse",
+            )
+            .with_debug(format!("{error}: {}", truncate(text, 300)))
+        });
     }
     let code = parsed.error.map(|error| error.code).unwrap_or_default();
     let error = disk_station_error(api, code);
@@ -1481,23 +1511,58 @@ fn parse_disk_response<T: DeserializeOwned>(api: DsApi, text: &str) -> Result<T,
     Err(error)
 }
 
-fn http_status_error(status: u16, body: &str) -> DsError {
-    let code = match status {
-        300..=399 => PluginErrorCode::InvalidConfig,
-        401 | 403 => PluginErrorCode::AuthFailed,
-        404 => PluginErrorCode::InvalidConfig,
-        429 => PluginErrorCode::RateLimited,
-        500..=599 => PluginErrorCode::Temporary,
-        _ => PluginErrorCode::Permanent,
+fn http_status_error(status: u16, retry_after: Option<i64>, body: &str) -> DsError {
+    let (code, message): (PluginErrorCode, String) = match status {
+        401 | 403 => (
+            codes::INVALID_USERNAME_PASSWORD.into(),
+            "Download Station rejected the credentials".to_string(),
+        ),
+        300..=399 | 404 => (
+            codes::ENDPOINT_NOT_FOUND.into(),
+            format!("Download Station is not reachable at this address (HTTP {status})"),
+        ),
+        429 => (
+            PluginErrorCode::RateLimited,
+            format!("Download Station returned HTTP {status}"),
+        ),
+        500..=599 => (
+            PluginErrorCode::UpstreamUnavailable,
+            format!("Download Station returned HTTP {status}"),
+        ),
+        _ => (
+            PluginErrorCode::Permanent,
+            format!("Download Station returned HTTP {status}"),
+        ),
     };
-    let message = match code {
-        PluginErrorCode::AuthFailed => "Download Station rejected the credentials".to_string(),
-        PluginErrorCode::InvalidConfig => {
-            format!("Download Station is not reachable at this address (HTTP {status})")
-        }
-        _ => format!("Download Station returned HTTP {status}"),
+    let mut error =
+        DsError::new(code, message).with_debug(format!("HTTP {status}: {}", truncate(body, 300)));
+    if status == 429 {
+        error.retry_after_seconds = retry_after;
+    }
+    error
+}
+
+fn retry_after(response: &HttpResponse) -> Option<i64> {
+    response
+        .headers()
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds >= 0)
+}
+
+/// The PDK classifies the host's transport error (TLS, timeout, unreachable);
+/// the sentence stays Download Station's own.
+fn transport_error(error: &Error) -> DsError {
+    let classified = scryer_plugin_pdk::error::plugin_error_from(error);
+    let message = if classified.code == PluginErrorCode::from(codes::TLS_ERROR) {
+        "Unable to connect to Diskstation: certificate validation failed"
+    } else if classified.code == PluginErrorCode::UpstreamUnavailable {
+        "Unable to connect to Diskstation, please check your settings"
+    } else {
+        "Diskstation did not answer in time"
     };
-    DsError::new(code, message).with_debug(format!("HTTP {status}: {}", truncate(body, 300)))
+    DsError::new(classified.code, message).with_debug(format!("{error:#}"))
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -1683,17 +1748,12 @@ fn api_multipart(
                 format!("multipart/form-data; boundary={boundary}"),
             )
             .with_header("User-Agent", user_agent());
-        let response = http::request::<Vec<u8>>(&request, Some(body)).map_err(|error| {
-            DsError::new(
-                PluginErrorCode::UpstreamUnavailable,
-                "Unable to connect to Diskstation, please check your settings",
-            )
-            .with_debug(error.to_string())
-        })?;
+        let response = http::request::<Vec<u8>>(&request, Some(body))
+            .map_err(|error| transport_error(&error))?;
         let status = response.status_code();
         let text = String::from_utf8_lossy(&response.body()).to_string();
         if status >= 300 {
-            return Err(http_status_error(status, &text));
+            return Err(http_status_error(status, retry_after(&response), &text));
         }
         match parse_disk_response::<serde_json::Value>(upload.api, &text) {
             Err(error) if error.is_session_error() && !force_login => {
@@ -2255,6 +2315,8 @@ fn build_item(
         removed: Some(false),
         raw_state: Some(status_name(task.status).to_string()),
         completed_at: unix_to_rfc3339(task.detail_i64("completed_time")),
+        added_at: unix_to_rfc3339(task.detail_i64("create_time")),
+        http: None,
     }
 }
 
@@ -2292,6 +2354,7 @@ fn build_completed(
             completed_at: unix_to_rfc3339(task.detail_i64("completed_time")),
             parameters: Vec::new(),
             release_name: None,
+            subtitle_paths: Vec::new(),
         });
     }
     Ok(downloads)
@@ -2494,6 +2557,8 @@ fn source_url(request: &PluginDownloadClientAddRequest) -> Option<String> {
         // `PluginDownloadSource` has no `nzb_url`: an NZB that is not supplied
         // as bytes arrives as `download_url`.
         DownloadInputKind::Nzb | DownloadInputKind::NzbUrl => source.download_url.clone(),
+        // Download Station's own HTTP downloads are not wired up.
+        DownloadInputKind::HttpResource => None,
     };
     candidate.filter(|value| !value.trim().is_empty())
 }
@@ -3462,19 +3527,46 @@ mod tests {
     fn diskstation_error_codes_are_classified_rather_than_all_temporary() {
         assert_eq!(
             api_error_code(DsApi::Auth, 400),
-            PluginErrorCode::AuthFailed
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        assert_eq!(
+            api_error_code(DsApi::Auth, 401),
+            PluginErrorCode::from(codes::ACCOUNT_DISABLED)
         );
         assert_eq!(
             api_error_code(DsApi::Auth, 403),
+            PluginErrorCode::from(codes::TWO_FACTOR_REQUIRED)
+        );
+        assert_eq!(
+            api_error_code(DsApi::Auth, 404),
+            PluginErrorCode::from(codes::TWO_FACTOR_REQUIRED)
+        );
+        assert_eq!(
+            api_error_code(DsApi::Auth, 402),
             PluginErrorCode::AuthFailed
         );
+        for blocked in [405, 407] {
+            assert_eq!(
+                api_error_code(DsApi::Auth, blocked),
+                PluginErrorCode::from(codes::ACCOUNT_BANNED),
+                "{blocked}"
+            );
+        }
         assert_eq!(
             api_error_code(DsApi::DsmInfo, 105),
             PluginErrorCode::AuthFailed
         );
         assert_eq!(
             api_error_code(DsApi::DownloadStationTask, 402),
+            PluginErrorCode::from(codes::PATH_NOT_WRITABLE)
+        );
+        assert_eq!(
+            api_error_code(DsApi::DownloadStationTask, 406),
             PluginErrorCode::InvalidConfig
+        );
+        assert_eq!(
+            api_error_code(DsApi::DownloadStation2Task, 404),
+            PluginErrorCode::from(codes::ITEM_NOT_FOUND)
         );
         assert_eq!(
             api_error_code(DsApi::FileStationList, 160),
@@ -3486,7 +3578,33 @@ mod tests {
         );
         assert_eq!(
             api_error_code(DsApi::DownloadStationTask, 401),
+            PluginErrorCode::from(codes::DOWNLOAD_REJECTED)
+        );
+        assert_eq!(
+            api_error_code(DsApi::DownloadStationTask, 999),
             PluginErrorCode::Temporary
+        );
+    }
+
+    /// DSM answers a wrong account or password with HTTP 200 and
+    /// `{"success": false, "error": {"code": 400}}` from `SYNO.API.Auth`.
+    #[test]
+    fn a_rejected_login_names_the_username_and_password() {
+        let error = parse_disk_response::<serde_json::Value>(
+            DsApi::Auth,
+            r#"{"success": false, "error": {"code": 400}}"#,
+        )
+        .expect_err("a refused login is an error");
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        let PluginResult::Err(plugin) = PluginResult::<()>::Err(error.into_plugin_error()) else {
+            unreachable!();
+        };
+        assert_eq!(
+            plugin.public_message,
+            "Download Station: No such account or incorrect password"
         );
     }
 
@@ -3505,21 +3623,26 @@ mod tests {
             "<html><body>Sign in</body></html>",
         )
         .expect_err("not json");
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
     }
 
     #[test]
     fn http_statuses_map_to_distinct_codes() {
-        assert_eq!(http_status_error(401, "").code, PluginErrorCode::AuthFailed);
         assert_eq!(
-            http_status_error(302, "").code,
-            PluginErrorCode::InvalidConfig
+            http_status_error(401, None, "").code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
         );
-        assert_eq!(http_status_error(503, "").code, PluginErrorCode::Temporary);
         assert_eq!(
-            http_status_error(429, "").code,
-            PluginErrorCode::RateLimited
+            http_status_error(302, None, "").code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
         );
+        assert_eq!(
+            http_status_error(503, None, "").code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        let limited = http_status_error(429, Some(20), "");
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.into_plugin_error().retry_after_seconds, Some(20));
     }
 
     #[test]

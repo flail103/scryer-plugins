@@ -2,6 +2,8 @@
 
 use scryer_plugin_sdk::ListAccountList;
 
+use scryer_plugin_pdk::error::codes;
+
 use super::*;
 
 const PAGE_LIMIT: u32 = 500;
@@ -35,7 +37,8 @@ pub(super) fn source_item() -> ListProviderItem {
 }
 
 fn malformed() -> PluginError {
-    permanent(
+    plugin_error(
+        codes::INVALID_RESPONSE,
         "Simkl returned incomplete or inconsistent custom-list data; no list changes were applied",
     )
 }
@@ -140,8 +143,9 @@ impl<H: ListHttp> Client<'_, H> {
         if response.status == 403
             && response_error_name(&response).as_deref() == Some("private_list")
         {
-            return Err(permanent(
-                "Simkl custom list not found or no longer accessible (private_list)",
+            return Err(with_debug(
+                permanent("Simkl custom list not found or no longer accessible"),
+                "Simkl custom list: HTTP 403, private_list",
             ));
         }
         check_simkl_status(&response, "Simkl custom list")?;

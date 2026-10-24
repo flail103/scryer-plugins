@@ -1346,7 +1346,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scryer-plugin-conformance"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "base64 0.23.1",
  "postcard",
@@ -1358,7 +1358,9 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-pdk"
-version = "0.7.0"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd05e4ac0d93f86458afce9cb834791f0f27e2a4a8b16d900cd637e42769a48f"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1371,9 +1373,9 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-sdk"
-version = "3.11.0"
+version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed82740ae081bbbdce615fd871cf83817aeb197caa129d393d8aea4aa6b1058f"
+checksum = "a045c679044705d66fa330cc0e59ba1d12dcab84e354c6f37705efdf7444b3f2"
 dependencies = [
  "base64 0.22.1",
  "schemars",
@@ -1746,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "usenet-blackhole-download-client"
-version = "2.0.2"
+version = "2.1.0"
 dependencies = [
  "base64 0.23.1",
  "scryer-plugin-conformance",

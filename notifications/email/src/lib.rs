@@ -33,11 +33,11 @@
 //! gone rather than duplicated; see [`socket_failure`].
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use scryer_plugin_pdk::config;
 use scryer_plugin_pdk::host::{
     HostCallError, socket_close, socket_open, socket_read, socket_starttls, socket_write,
 };
 use scryer_plugin_pdk::sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
+use scryer_plugin_pdk::{codes, config};
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldOption, ConfigFieldType, NotificationCapabilities,
     NotificationDeliveryMode, NotificationDescriptor, NotificationEventType,
@@ -192,6 +192,7 @@ fn descriptor() -> PluginDescriptor {
                 },
             ],
         }),
+        settings: Vec::new(),
     }
 }
 
@@ -272,13 +273,11 @@ fn handle_notification_command(
 }
 
 fn unsupported_action_error() -> PluginError {
-    PluginError {
-        code: PluginErrorCode::Unsupported,
-        public_message: format!("{PROVIDER_TYPE} does not implement notification actions"),
-        debug_message: None,
-        retry_after_seconds: None,
-        details: None,
-    }
+    scryer_plugin_pdk::plugin_error(
+        PluginErrorCode::Unsupported,
+        format!("{PROVIDER_TYPE} does not implement notification actions"),
+    )
+    .build()
 }
 
 fn send_notification(
@@ -637,37 +636,94 @@ fn socket_io_error(error: HostCallError) -> IoError {
     IoError::new(error.to_string())
 }
 
+/// Classify an SMTP failure. The server's own reply text, which can quote the
+/// addresses or the login, goes to the debug log only; the public sentence
+/// names the setting to look at.
 fn smtp_failure(error: SmtpError) -> EmailFailure {
-    let code = match &error {
-        SmtpError::Auth(AuthError::Rejected { .. }) => PluginErrorCode::AuthFailed,
-        SmtpError::Auth(AuthError::UnsupportedMechanism) => PluginErrorCode::InvalidConfig,
-        SmtpError::Auth(_) => PluginErrorCode::AuthFailed,
-        SmtpError::InvalidInput(_) => PluginErrorCode::InvalidConfig,
-        SmtpError::Io(_) => PluginErrorCode::UpstreamUnavailable,
+    let (code, public_message): (PluginErrorCode, &str) = match &error {
+        // SMTP AUTH only runs with both username and password configured.
+        SmtpError::Auth(AuthError::Rejected { code, .. }) if (400..500).contains(code) => (
+            PluginErrorCode::Temporary,
+            "the SMTP server could not check the login right now",
+        ),
+        SmtpError::Auth(AuthError::Rejected { .. }) => (
+            codes::INVALID_USERNAME_PASSWORD.into(),
+            "the SMTP server rejected the configured username or password",
+        ),
+        SmtpError::Auth(AuthError::UnsupportedMechanism) => (
+            PluginErrorCode::InvalidConfig,
+            "the SMTP server offers no login method this plugin supports for username and password",
+        ),
+        SmtpError::Auth(AuthError::MalformedChallenge(_)) => (
+            codes::INVALID_RESPONSE.into(),
+            "the SMTP server answered the login with a challenge that could not be read",
+        ),
+        SmtpError::Auth(_) => (
+            PluginErrorCode::AuthFailed,
+            "the SMTP login did not complete",
+        ),
+        SmtpError::InvalidInput(_) => (
+            PluginErrorCode::InvalidConfig,
+            "an address or the message could not be sent as given",
+        ),
+        SmtpError::Io(_) => (
+            PluginErrorCode::UpstreamUnavailable,
+            "the connection to the SMTP server failed",
+        ),
         SmtpError::Protocol(ProtocolError::ExtensionUnavailable { name })
             if *name == "STARTTLS" =>
         {
-            PluginErrorCode::Unsupported
+            (
+                PluginErrorCode::Unsupported,
+                "the SMTP server does not offer STARTTLS; change the security setting",
+            )
         }
-        SmtpError::Protocol(ProtocolError::UnexpectedCode { actual, during, .. })
+        SmtpError::Protocol(ProtocolError::UnexpectedCode { actual, .. })
             if (400..500).contains(actual) =>
         {
-            PluginErrorCode::Temporary
+            (
+                PluginErrorCode::Temporary,
+                "the SMTP server deferred the message",
+            )
         }
         SmtpError::Protocol(ProtocolError::UnexpectedCode { during, .. })
             if matches!(*during, SmtpOp::MailFrom | SmtpOp::RcptTo) =>
         {
-            PluginErrorCode::InvalidConfig
+            (
+                PluginErrorCode::InvalidConfig,
+                "the SMTP server refused from_address or to_addresses",
+            )
         }
         SmtpError::Protocol(ProtocolError::UnexpectedCode { during, .. })
             if matches!(*during, SmtpOp::StartTls) =>
         {
-            PluginErrorCode::Unsupported
+            (
+                PluginErrorCode::Unsupported,
+                "the SMTP server refused STARTTLS; change the security setting",
+            )
         }
-        SmtpError::Policy(_) => PluginErrorCode::Permanent,
-        SmtpError::Protocol(_) => PluginErrorCode::Permanent,
+        SmtpError::Protocol(ProtocolError::UnexpectedClose) => (
+            PluginErrorCode::UpstreamUnavailable,
+            "the SMTP server closed the connection",
+        ),
+        SmtpError::Protocol(
+            ProtocolError::Malformed(_)
+            | ProtocolError::LineTooLong
+            | ProtocolError::InconsistentMultiline { .. },
+        ) => (
+            codes::INVALID_RESPONSE.into(),
+            "the SMTP server answered with a reply that is not valid SMTP",
+        ),
+        SmtpError::Policy(_) => (
+            PluginErrorCode::Permanent,
+            "the message was refused before it was sent",
+        ),
+        SmtpError::Protocol(_) => (
+            PluginErrorCode::Permanent,
+            "the SMTP server refused the message",
+        ),
     };
-    EmailFailure::new(code, error.to_string())
+    EmailFailure::new(code, public_message).with_debug(error.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -692,14 +748,20 @@ impl EmailFailure {
         Self::new(PluginErrorCode::InvalidConfig, public_message)
     }
 
+    fn with_debug(mut self, debug_message: impl Into<String>) -> Self {
+        self.debug_message = Some(debug_message.into());
+        self
+    }
+
     fn into_plugin_error(self) -> PluginError {
-        PluginError {
-            code: self.code,
-            public_message: self.public_message,
-            debug_message: self.debug_message,
-            retry_after_seconds: self.retry_after_seconds,
-            details: None,
+        let mut builder = scryer_plugin_pdk::plugin_error(self.code, self.public_message);
+        if let Some(debug) = self.debug_message {
+            builder = builder.debug(debug);
         }
+        if let Some(seconds) = self.retry_after_seconds {
+            builder = builder.retry_after_seconds(seconds);
+        }
+        builder.build()
     }
 }
 
@@ -1014,5 +1076,57 @@ mod tests {
             media_request: None,
             title_move: None,
         }
+    }
+
+    #[test]
+    fn a_rejected_smtp_login_carries_the_invalid_username_password_code() {
+        let error = smtp_failure(SmtpError::Auth(AuthError::Rejected {
+            code: 535,
+            enhanced: None,
+            message: "5.7.8 bad credentials for synthetic-sender".to_string(),
+        }))
+        .into_plugin_error();
+
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(codes::INVALID_USERNAME_PASSWORD)
+        );
+        assert!(!error.public_message.contains("synthetic-sender"));
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("synthetic-sender"))
+        );
+    }
+
+    #[test]
+    fn smtp_replies_keep_the_server_text_out_of_the_public_message() {
+        let refused = smtp_failure(SmtpError::Protocol(ProtocolError::UnexpectedCode {
+            during: SmtpOp::RcptTo,
+            expected_class: 2,
+            actual: 550,
+            enhanced: None,
+            message: "no such user synthetic@example.test".to_string(),
+        }))
+        .into_plugin_error();
+        assert_eq!(refused.code, PluginErrorCode::InvalidConfig);
+        assert!(!refused.public_message.contains("synthetic@example.test"));
+
+        let deferred = smtp_failure(SmtpError::Protocol(ProtocolError::UnexpectedCode {
+            during: SmtpOp::Data,
+            expected_class: 3,
+            actual: 451,
+            enhanced: None,
+            message: "try later".to_string(),
+        }))
+        .into_plugin_error();
+        assert_eq!(deferred.code, PluginErrorCode::Temporary);
+
+        let garbled = smtp_failure(SmtpError::Protocol(ProtocolError::Malformed(
+            "xyz".to_string(),
+        )))
+        .into_plugin_error();
+        assert_eq!(garbled.code, PluginErrorCode::from(codes::INVALID_RESPONSE));
     }
 }

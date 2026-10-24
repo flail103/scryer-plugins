@@ -97,6 +97,7 @@ pub fn descriptor() -> PluginDescriptor {
         sdk_version: scryer_plugin_sdk::SDK_VERSION.to_string(),
         sdk_constraint: scryer_plugin_sdk::current_sdk_constraint(),
         socket_permissions: Vec::new(),
+        settings: Vec::new(),
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec!["rss".to_string(), "stevenlu".to_string()],
@@ -114,6 +115,7 @@ pub fn descriptor() -> PluginDescriptor {
             brand_url_template: Some(format!("{{{PARAM_URL}}}")),
             coverage: both(),
             auth: ListProviderAuth::None,
+            member_key: None,
             groups: vec![ListProviderGroup {
                 label: "Feeds".to_string(),
                 auth_badge: ListAuthBadge::NoAccountNeedsValue,
@@ -196,9 +198,9 @@ fn feed_url(
         .or(default)
         .ok_or_else(|| missing_param(PARAM_URL))?;
     if host_of(url).is_none() || url.contains(char::is_whitespace) {
-        return Err(invalid_config(
-            "the feed URL must be an absolute http or https address",
-        ));
+        return Err(invalid_config(format!(
+            "list parameter {PARAM_URL} must be an absolute http or https address"
+        )));
     }
     Ok(url.to_string())
 }

@@ -12,11 +12,19 @@
 //! Scryer through [`scryer_plugin_pdk`] rather than the removed core-module
 //! host ABI. The response helpers stop hand-serializing a `PluginResult` — the
 //! world's dispatch owns that envelope now, so they return the typed value.
+//!
+//! Every failure is a typed `PluginResult::Err`: a missing setting or bad
+//! `path_mappings` is `InvalidConfig`, a rejected API key `invalid_api_key`, a
+//! 404 `endpoint_not_found`, 429 `RateLimited`, 5xx `UpstreamUnavailable`, an
+//! unanswered request the PDK's transport reading, and a notification the
+//! plugin cannot turn into a Jellyfin call `Permanent`.
+
+mod redact;
 
 use std::collections::HashSet;
 
 use scryer_plugin_pdk::sdk::command::{PluginNotificationCommand, PluginNotificationCommandResult};
-use scryer_plugin_pdk::{HttpRequest, config, http};
+use scryer_plugin_pdk::{HttpRequest, codes, config, http};
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldType, NotificationCapabilities, NotificationDeliveryMode,
@@ -237,6 +245,7 @@ fn default_descriptor() -> PluginDescriptor {
                 },
             ],
         }),
+        settings: Vec::new(),
     }
 }
 
@@ -263,38 +272,60 @@ fn handle_notification_command(
 ) -> PluginNotificationCommandResult {
     match command {
         PluginNotificationCommand::Send(request) => {
-            PluginNotificationCommandResult::Send(PluginResult::Ok(send_notification(&request)))
+            PluginNotificationCommandResult::Send(send_notification(&request))
         }
         PluginNotificationCommand::Action(_) => {
-            PluginNotificationCommandResult::Action(PluginResult::Err(PluginError {
-                code: PluginErrorCode::Unsupported,
-                public_message: "jellyfin does not implement notification actions".to_string(),
-                debug_message: None,
-                retry_after_seconds: None,
-                details: None,
-            }))
+            PluginNotificationCommandResult::Action(PluginResult::Err(plugin_error(
+                PluginErrorCode::Unsupported,
+                "jellyfin does not implement notification actions",
+                None,
+            )))
         }
     }
 }
 
-fn send_notification(request: &PluginNotificationRequest) -> PluginNotificationResponse {
+fn send_notification(
+    request: &PluginNotificationRequest,
+) -> PluginResult<PluginNotificationResponse> {
     let config = match JellyfinConfig::from_host() {
         Ok(config) => config,
-        Err(error) => return error_response(error),
+        Err(error) => {
+            return PluginResult::Err(plugin_error(PluginErrorCode::InvalidConfig, error, None));
+        }
     };
 
     let plans = match build_request_plans(request, &config) {
         Ok(plans) => plans,
-        Err(error) => return error_response(error),
+        Err(error) => return PluginResult::Err(error),
     };
 
+    // The calls of one send run in order and the first failure ends the send:
+    // there is no per-target merge, so a failure is the send's typed error.
     for plan in &plans {
         if let Err(error) = execute_plan(plan, &config) {
-            return error_response(error);
+            return PluginResult::Err(error);
         }
     }
 
-    success_response()
+    PluginResult::Ok(success_response())
+}
+
+fn plugin_error(
+    code: impl Into<PluginErrorCode>,
+    public_message: impl Into<String>,
+    debug_message: Option<String>,
+) -> PluginError {
+    let builder = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug) => builder.debug(redact::redact_secrets(&debug)).build(),
+        None => builder.build(),
+    }
+}
+
+/// A notification this plugin cannot turn into a Jellyfin call. Resending the
+/// same notification fails the same way.
+fn payload_error(message: impl Into<String>) -> PluginError {
+    plugin_error(PluginErrorCode::Permanent, message, None)
 }
 
 impl JellyfinConfig {
@@ -335,7 +366,7 @@ fn normalize_base_url(value: &str) -> Option<String> {
 fn build_request_plans(
     request: &PluginNotificationRequest,
     config: &JellyfinConfig,
-) -> Result<Vec<JellyfinRequestPlan>, String> {
+) -> Result<Vec<JellyfinRequestPlan>, PluginError> {
     if matches!(request.event_type, SdkNotificationEventType::Test) {
         return Ok(vec![JellyfinRequestPlan::SystemInfo]);
     }
@@ -351,8 +382,14 @@ fn build_request_plans(
         return Ok(Vec::new());
     }
 
-    let mappings = parse_path_mappings(&config.path_mappings)?;
-    let updates = parse_media_updates(request.file.as_ref())?;
+    let mappings = parse_path_mappings(&config.path_mappings).map_err(|error| {
+        plugin_error(
+            PluginErrorCode::InvalidConfig,
+            format!("path_mappings: {error}"),
+            None,
+        )
+    })?;
+    let updates = parse_media_updates(request.file.as_ref()).map_err(payload_error)?;
     let external_ids = parse_external_ids(request.title.as_ref());
     let title_facet = request
         .title
@@ -397,32 +434,34 @@ fn build_request_plans(
                         imdb_id: external_ids.imdb_id,
                     });
                 } else {
-                    return Err(
+                    return Err(payload_error(
                         "found unmapped media updates but no tmdb_id/imdb_id fallback for movie"
                             .to_string(),
-                    );
+                    ));
                 }
             }
             "series" | "anime" | "tv" => {
                 if let Some(tvdb_id) = external_ids.tvdb_id {
                     plans.push(JellyfinRequestPlan::SeriesUpdated { tvdb_id });
                 } else {
-                    return Err(
+                    return Err(payload_error(
                         "found unmapped media updates but no tvdb_id fallback for series/anime"
                             .to_string(),
-                    );
+                    ));
                 }
             }
             other => {
-                return Err(format!(
+                return Err(payload_error(format!(
                     "found unmapped media updates but unsupported or missing title_facet: {other}"
-                ));
+                )));
             }
         }
     }
 
     if plans.is_empty() {
-        return Err("notification did not contain any media updates to send".to_string());
+        return Err(payload_error(
+            "notification did not contain any media updates to send".to_string(),
+        ));
     }
 
     Ok(plans)
@@ -587,7 +626,7 @@ fn trim_trailing_separator(value: &str) -> String {
     value.trim_end_matches(['/', '\\']).to_string()
 }
 
-fn execute_plan(plan: &JellyfinRequestPlan, config: &JellyfinConfig) -> Result<(), String> {
+fn execute_plan(plan: &JellyfinRequestPlan, config: &JellyfinConfig) -> Result<(), PluginError> {
     let request = build_http_request(plan, config)?;
     execute_http(request)
 }
@@ -595,7 +634,7 @@ fn execute_plan(plan: &JellyfinRequestPlan, config: &JellyfinConfig) -> Result<(
 fn build_http_request(
     plan: &JellyfinRequestPlan,
     config: &JellyfinConfig,
-) -> Result<PreparedHttpRequest, String> {
+) -> Result<PreparedHttpRequest, PluginError> {
     match plan {
         JellyfinRequestPlan::SystemInfo => Ok(base_request(
             "GET",
@@ -612,8 +651,13 @@ fn build_http_request(
                     })
                     .collect(),
             };
-            let body = serde_json::to_vec(&payload)
-                .map_err(|error| format!("failed to encode media update payload: {error}"))?;
+            let body = serde_json::to_vec(&payload).map_err(|error| {
+                plugin_error(
+                    PluginErrorCode::Permanent,
+                    "the Jellyfin media update payload could not be encoded",
+                    Some(error.to_string()),
+                )
+            })?;
             Ok(base_request(
                 "POST",
                 &format!("{}/Library/Media/Updated", config.base_url),
@@ -663,7 +707,7 @@ fn base_request(method: &str, url: &str, config: &JellyfinConfig) -> PreparedHtt
         .with_header("User-Agent", "scryer-jellyfin-plugin/0.1")
 }
 
-fn execute_http(prepared: PreparedHttpRequest) -> Result<(), String> {
+fn execute_http(prepared: PreparedHttpRequest) -> Result<(), PluginError> {
     let (request, body) = prepared.into_http_request();
     match http::request::<Vec<u8>>(&request, body) {
         Ok(response) => {
@@ -671,12 +715,66 @@ fn execute_http(prepared: PreparedHttpRequest) -> Result<(), String> {
             if (200..300).contains(&status) {
                 Ok(())
             } else {
-                let text = String::from_utf8_lossy(&response.body()).to_string();
-                Err(format!("HTTP {}: {}", status, text))
+                Err(classify_failure(
+                    status,
+                    retry_after_header(response.headers()),
+                    &response.body(),
+                ))
             }
         }
-        Err(error) => Err(format!("request failed: {error}")),
+        Err(error) => {
+            let mut error = scryer_plugin_pdk::error::plugin_error_from(&error);
+            error.debug_message = error
+                .debug_message
+                .map(|debug| redact::redact_secrets(&debug));
+            Err(error)
+        }
     }
+}
+
+/// A non-success Jellyfin answer. Jellyfin checks only the API key, so a 401
+/// or 403 is a rejected key. The response body goes to the debug log only.
+fn classify_failure(status: u16, retry_after: Option<i64>, body: &[u8]) -> PluginError {
+    let debug = format!("HTTP {status}: {}", String::from_utf8_lossy(body));
+    let builder = match status {
+        401 | 403 => scryer_plugin_pdk::plugin_error(
+            codes::INVALID_API_KEY,
+            "Jellyfin rejected the configured api_key",
+        ),
+        404 => scryer_plugin_pdk::plugin_error(
+            codes::ENDPOINT_NOT_FOUND,
+            "base_url does not answer like a Jellyfin server",
+        ),
+        429 => {
+            let builder = scryer_plugin_pdk::plugin_error(
+                PluginErrorCode::RateLimited,
+                "Jellyfin is rate limiting requests",
+            );
+            match retry_after {
+                Some(seconds) => builder.retry_after_seconds(seconds),
+                None => builder,
+            }
+        }
+        500..=599 => scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "Jellyfin answered with a server error",
+        ),
+        _ => scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::Permanent,
+            "Jellyfin refused the library refresh",
+        ),
+    };
+    builder.debug(redact::redact_secrets(&debug)).build()
+}
+
+/// A `Retry-After` header in delta-seconds, if the response carried one.
+fn retry_after_header(headers: &std::collections::BTreeMap<String, String>) -> Option<i64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (seconds.ceil() as i64).max(1))
 }
 
 fn encode_query_value(value: &str) -> String {
@@ -696,18 +794,6 @@ fn success_response() -> PluginNotificationResponse {
     PluginNotificationResponse {
         success: true,
         error: None,
-        delivery_id: None,
-        provider_status: None,
-        retry_after_seconds: None,
-        warnings: Vec::new(),
-        target_results: Vec::new(),
-    }
-}
-
-fn error_response(error: String) -> PluginNotificationResponse {
-    PluginNotificationResponse {
-        success: false,
-        error: Some(error),
         delivery_id: None,
         provider_status: None,
         retry_after_seconds: None,
@@ -804,6 +890,7 @@ mod tests {
                     mal_ids: Vec::new(),
                     kitsu_ids: Vec::new(),
                     by_source: Default::default(),
+                    by_source_key: Default::default(),
                 },
             }),
             episode: None,
@@ -1104,7 +1191,8 @@ mod tests {
         );
 
         let error = build_request_plans(&request, &config("")).unwrap_err();
-        assert!(error.contains("tmdb_id/imdb_id"));
+        assert_eq!(error.code, PluginErrorCode::Permanent);
+        assert!(error.public_message.contains("tmdb_id/imdb_id"));
     }
 
     #[test]
@@ -1230,5 +1318,53 @@ mod tests {
             "http://jellyfin:8096/Library/Series/Updated?tvdbId=tvdb%3A123"
         );
         assert_eq!(request.body, None);
+    }
+
+    #[test]
+    fn a_rejected_api_key_carries_the_invalid_api_key_code() {
+        for status in [401, 403] {
+            let error = classify_failure(status, None, b"invalid token for synthetic-user");
+            assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
+            assert!(!error.public_message.contains("synthetic-user"));
+            assert_eq!(
+                error.debug_message.as_deref(),
+                Some(format!("HTTP {status}: invalid token for synthetic-user").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn other_jellyfin_answers_map_to_their_codes() {
+        assert_eq!(
+            classify_failure(404, None, b"").code,
+            PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND)
+        );
+        let limited = classify_failure(429, Some(9), b"");
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_seconds, Some(9));
+        assert_eq!(
+            classify_failure(502, None, b"").code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            classify_failure(400, None, b"").code,
+            PluginErrorCode::Permanent
+        );
+    }
+
+    #[test]
+    fn an_invalid_path_mapping_names_the_setting() {
+        let request = request_with_metadata(
+            "import_complete",
+            "movie",
+            serde_json::json!({
+                "media_updates": [
+                    { "path": "/data/movies/Synthetic Film (2024)/Synthetic.Film.mkv", "update_type": "created" }
+                ]
+            }),
+        );
+        let error = build_request_plans(&request, &config("relative => /mnt")).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert!(error.public_message.starts_with("path_mappings: "));
     }
 }

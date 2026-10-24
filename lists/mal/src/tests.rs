@@ -554,7 +554,10 @@ fn errors_map_to_host_failure_classes() {
     );
 
     let missing = list(404, &[], r#"{"error": "not_found", "message": ""}"#);
-    assert_eq!(missing.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        missing.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(missing.public_message.contains("not found"));
 
     let limited = list(429, &[("Retry-After", "30")], "");
@@ -571,9 +574,10 @@ fn errors_map_to_host_failure_classes() {
     assert_eq!(bad_request.code, PluginErrorCode::Permanent);
     assert!(!bad_request.public_message.contains("not found"));
 
-    assert_eq!(list(200, &[], "not json").code, PluginErrorCode::Permanent);
+    let unreadable = PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE);
+    assert_eq!(list(200, &[], "not json").code, unreadable);
     let no_entries = list(200, &[], r#"{"paging": {}}"#);
-    assert_eq!(no_entries.code, PluginErrorCode::Permanent);
+    assert_eq!(no_entries.code, unreadable);
     assert!(
         !no_entries.public_message.contains("not found"),
         "a malformed answer is not an empty or vanished list"
@@ -667,7 +671,7 @@ fn account_errors_and_partial_identities() {
     let no_id = RecordedHttp::new().with(ACCOUNT_URL, 200, r#"{"name": "fixture-member"}"#);
     assert_eq!(
         err(account_of(&no_id, TOKEN)).code,
-        PluginErrorCode::Permanent
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE)
     );
 
     let revoked = RecordedHttp::new().with(ACCOUNT_URL, 401, r#"{"error": "invalid_token"}"#);
@@ -688,4 +692,24 @@ fn account_errors_and_partial_identities() {
         PluginErrorCode::AuthFailed
     );
     assert!(nothing.urls().is_empty());
+}
+
+#[test]
+fn a_revoked_token_is_auth_failed_with_the_status_in_debug_only() {
+    // The host expires the linked account and asks for a reconnect only on
+    // the well-known `auth_failed` code, so a refused token keeps it.
+    let revoked = RecordedHttp::new().with(
+        ACCOUNT_URL,
+        401,
+        r#"{"error": "invalid_token", "message": "fixture token expired"}"#,
+    );
+    let error = err(account_of(&revoked, TOKEN));
+    assert_eq!(error.code, PluginErrorCode::AuthFailed);
+    assert!(!error.public_message.contains("401"));
+    assert!(!error.public_message.contains("fixture token expired"));
+    assert!(!error.public_message.contains(TOKEN));
+    assert_eq!(
+        error.debug_message.as_deref(),
+        Some("MyAnimeList account: HTTP 401")
+    );
 }

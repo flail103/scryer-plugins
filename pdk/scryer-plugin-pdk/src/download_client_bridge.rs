@@ -205,11 +205,15 @@ where
 {
     let request = match serde_json::to_string(&request) {
         Ok(request) => request,
-        Err(error) => return bridge_error(format!("failed to encode command request: {error}")),
+        Err(error) => {
+            return bridge_error(format!("failed to encode command request: {error}"));
+        }
     };
     let raw = match function(request) {
         Ok(raw) => raw,
-        Err(error) => return bridge_error(error.to_string()),
+        // The plugin's own error: a `plugin_error(..)` arrives unchanged and
+        // a bare one is classified like every other dispatch path's.
+        Err(error) => return crate::error::to_plugin_result(Err(error)),
     };
     match serde_json::from_str(&raw) {
         Ok(result) => result,
@@ -217,14 +221,17 @@ where
     }
 }
 
+/// A failure of the bridge itself, never of the download client: the plugin's
+/// own request or response did not round-trip through JSON.
 fn bridge_error<T>(message: String) -> sdk::PluginResult<T> {
-    sdk::PluginResult::Err(sdk::PluginError {
-        code: sdk::PluginErrorCode::Temporary,
-        public_message: "download client command failed".to_string(),
-        debug_message: Some(message),
-        retry_after_seconds: None,
-        details: None,
-    })
+    sdk::PluginResult::Err(
+        crate::error::plugin_error(
+            sdk::PluginErrorCode::Temporary,
+            "the download client plugin could not complete the request",
+        )
+        .debug(message)
+        .build(),
+    )
 }
 
 #[cfg(test)]
@@ -250,6 +257,7 @@ mod tests {
                 size_bytes: None,
                 completed_at: None,
                 parameters: Vec::new(),
+                subtitle_paths: Vec::new(),
             },
         ]))?)
     }
@@ -317,6 +325,8 @@ mod tests {
             removed: None,
             raw_state: None,
             completed_at: None,
+            http: None,
+            added_at: None,
         }
     }
 
@@ -452,6 +462,65 @@ mod tests {
         );
     }
 
+    fn rejecting_mark_imported(_input: String) -> FnResult<String> {
+        crate::error::plugin_error(
+            crate::codes::DOWNLOAD_REJECTED,
+            "the client refused the item",
+        )
+        .err()
+    }
+
+    fn unreachable_status(_input: String) -> FnResult<String> {
+        Err(crate::Error::new(crate::runtime::HostError::Transport))
+    }
+
+    #[test]
+    fn plugin_errors_cross_the_bridge_structured_or_classified() {
+        let functions = LegacyDownloadClientFunctions {
+            describe: unused,
+            add: unused,
+            list_queue: unused,
+            list_history: unused,
+            list_completed: unused,
+            list_recent_completed: None,
+            control: unused,
+            mark_imported: rejecting_mark_imported,
+            mark_imported_non_destructive: None,
+            status: unreachable_status,
+            test_connection: unused,
+        };
+        let request = sdk::PluginDownloadClientMarkImportedRequest {
+            client_item_id: "ABCDEF".to_string(),
+            info_hash: None,
+            title_id: None,
+            title_name: None,
+            category: None,
+            post_import_isolation: Vec::new(),
+            imported_path: None,
+            download_path: None,
+        };
+        let PluginDownloadClientCommandResult::MarkImported(sdk::PluginResult::Err(error)) =
+            bridge_download_client_command(
+                &functions,
+                PluginDownloadClientCommand::MarkImported(request),
+            )
+        else {
+            panic!("expected the plugin's own error");
+        };
+        assert_eq!(
+            error.code,
+            sdk::PluginErrorCode::from(crate::codes::DOWNLOAD_REJECTED)
+        );
+        assert_eq!(error.public_message, "the client refused the item");
+
+        let PluginDownloadClientCommandResult::Status(sdk::PluginResult::Err(error)) =
+            bridge_download_client_command(&functions, PluginDownloadClientCommand::Status)
+        else {
+            panic!("expected a classified error");
+        };
+        assert_eq!(error.code, sdk::PluginErrorCode::UpstreamUnavailable);
+    }
+
     #[test]
     fn unsupported_non_destructive_mark_is_a_safe_no_op() {
         let functions = LegacyDownloadClientFunctions {
@@ -533,6 +602,7 @@ mod tests {
             size_bytes: None,
             completed_at: None,
             parameters: Vec::new(),
+            subtitle_paths: Vec::new(),
         };
         let output = serde_json::to_string(&sdk::PluginResult::Ok(vec![complete])).unwrap();
         let result: sdk::PluginResult<Vec<sdk::PluginCompletedDownload>> =

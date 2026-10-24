@@ -40,11 +40,12 @@
 //! # Why the delivery path is local rather than `notify_common::send_form`
 //!
 //! The shared helper collapses every non-2xx into `error_response("HTTP N:
-//! body", "http_N")`. Pushover's failures are three different lanes in Scryer's
+//! body", "http_N")`. Pushover's failures carry different codes in Scryer's
 //! contract: a 4xx is documented as permanent ("repeating your same request will
 //! not work, no matter how many times you retry it") and names the offending
-//! parameter, a 429 is the account's monthly quota with an `X-Limit-App-Reset`
-//! the core can act on, and a 5xx is explicitly retryable after five seconds.
+//! parameter, a 429 is the account's monthly quota (`quota_exceeded`) with an
+//! `X-Limit-App-Reset` the core can act on, and a 5xx is explicitly retryable
+//! after five seconds (`UpstreamUnavailable`).
 //!
 //! # End-to-end encryption
 //!
@@ -213,6 +214,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(NotificationDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec![],
@@ -805,6 +807,7 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<Line> {
         | NotificationEventType::ListTitleLeft
         | NotificationEventType::ListSyncFailed
         | NotificationEventType::ListUnfollowed
+        | NotificationEventType::FileRestored
         | NotificationEventType::Test => {}
     }
     lines
@@ -1597,13 +1600,10 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
             &response.body(),
             warnings,
         ),
-        Err(error) => {
-            // The host answers a refused or failed egress in-band; that is the
-            // provider being unreachable, not a misconfigured channel.
-            let mut failure = error_response(format!("request failed: {error}"), None);
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        // The send is one request, so a request that got no answer at all is
+        // the send's failure, typed from the host's transport detail
+        // (unreachable, timeout, TLS).
+        Err(error) => PluginResult::Err(request_failure(&error)),
     }
 }
 
@@ -1721,31 +1721,27 @@ fn classify_response(
         // "If you exceed your monthly message limit, you will receive an HTTP
         // 429". Since 1 May 2026 that limit is the whole account's, shared by
         // every application (blog.pushover.net/posts/2026/4/app-limits).
-        429 => {
-            let mut failure = error_response(
-                format!(
-                    "Pushover rejected the message: the account's monthly message limit is exhausted ({detail})"
-                ),
-                Some("http_429".to_string()),
-            );
-            failure.retry_after_seconds = quota_reset_seconds(headers);
-            if let Some(warning) = quota_warning(headers) {
-                warnings.push(warning);
-            }
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        // The 429 is the monthly quota, not a burst limit, so it carries the
+        // quota code and the delay until the quota resets.
+        429 => PluginResult::Err(with_retry_after(
+            plugin_error(
+                codes::QUOTA_EXCEEDED,
+                "Pushover rejected the message: the account's monthly message limit is exhausted"
+                    .to_string(),
+                Some(format!("HTTP {status}: {detail}")),
+            ),
+            quota_reset_seconds(headers),
+        )),
         // "If you receive an HTTP 500 […] you can repeat your same request
         // again, but no sooner than 5 seconds."
-        500..=599 => {
-            let mut failure = error_response(
-                format!("HTTP {status}: {detail}"),
-                Some(format!("http_{status}")),
-            );
-            failure.retry_after_seconds = Some(SERVER_ERROR_RETRY_SECONDS);
-            failure.warnings = warnings;
-            PluginResult::Ok(failure)
-        }
+        500..=599 => PluginResult::Err(with_retry_after(
+            plugin_error(
+                PluginErrorCode::UpstreamUnavailable,
+                "Pushover answered with a server error".to_string(),
+                Some(format!("HTTP {status}: {detail}")),
+            ),
+            Some(SERVER_ERROR_RETRY_SECONDS),
+        )),
         // "If you receive an HTTP 4xx status […] repeating your same request
         // will not work, no matter how many times you retry it." Every 4xx below
         // is therefore a configuration or payload problem, never a delivery to
@@ -1762,8 +1758,8 @@ fn classify_client_error(status: u16, answer: &PushoverBody, detail: &str) -> Pl
     // blamed for.
     if answer.parameter_is_invalid("token") || answer.mentions("application token") {
         return plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!("api_key was rejected by Pushover: {detail}"),
+            codes::INVALID_API_KEY,
+            "api_key was rejected by Pushover".to_string(),
             Some(debug),
         );
     }
@@ -1772,9 +1768,8 @@ fn classify_client_error(status: u16, answer: &PushoverBody, detail: &str) -> Pl
     if answer.parameter_is_invalid("user") || answer.mentions("user identifier") {
         return plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "user_key was rejected by Pushover: {detail}. Check the user or group key, and that the account has at least one active device."
-            ),
+            "user_key was rejected by Pushover. Check the user or group key, and that the account has at least one active device."
+                .to_string(),
             Some(debug),
         );
     }
@@ -1790,7 +1785,7 @@ fn classify_client_error(status: u16, answer: &PushoverBody, detail: &str) -> Pl
         if answer.parameter_is_invalid(parameter) || answer.mentions(parameter) {
             return plugin_error(
                 PluginErrorCode::InvalidConfig,
-                format!("{setting} was rejected by Pushover: {detail}"),
+                format!("{setting} was rejected by Pushover"),
                 Some(debug),
             );
         }
@@ -1806,14 +1801,14 @@ fn classify_client_error(status: u16, answer: &PushoverBody, detail: &str) -> Pl
     {
         return plugin_error(
             PluginErrorCode::Permanent,
-            format!("Pushover rejected the message this plugin built: {detail}"),
+            "Pushover rejected the message this plugin built".to_string(),
             Some(debug),
         );
     }
 
     plugin_error(
         PluginErrorCode::InvalidConfig,
-        format!("Pushover rejected the request (HTTP {status}): {detail}"),
+        "Pushover rejected the request; check the channel settings".to_string(),
         Some(debug),
     )
 }
@@ -1866,18 +1861,31 @@ fn header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a s
         .map(|(_, value)| value.as_str())
 }
 
+/// The same typed error carrying the service's requested delay, if any.
+fn with_retry_after(error: PluginError, seconds: Option<i64>) -> PluginError {
+    let builder = scryer_plugin_pdk::plugin_error(error.code, error.public_message);
+    let builder = match error.debug_message {
+        Some(debug) => builder.debug(redact_secrets(&debug)),
+        None => builder,
+    };
+    match seconds {
+        Some(seconds) => builder.retry_after_seconds(seconds),
+        None => builder,
+    }
+    .build()
+}
+
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let error = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
+        None => error,
     }
+    .build()
 }
 
 /// The world's single `process` entry, dispatching the SDK's notification
@@ -2769,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_token_is_authfailed_on_api_key() {
+    fn an_invalid_token_is_invalid_api_key_on_api_key() {
         let PluginResult::Err(error) = classify(
             400,
             &[],
@@ -2777,12 +2785,19 @@ mod tests {
         ) else {
             panic!("a 4xx is permanent, not a delivery");
         };
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert_eq!(error.code.as_str(), codes::INVALID_API_KEY);
         assert!(error.public_message.contains("api_key"), "{error:?}");
         assert!(
-            error
+            !error
                 .public_message
-                .contains("application token is invalid")
+                .contains("application token is invalid"),
+            "the provider's text stays in the debug detail: {error:?}"
+        );
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("application token is invalid"))
         );
     }
 
@@ -2842,13 +2857,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unattributed_4xx_still_reaches_the_operator_with_pushovers_own_words() {
+    fn an_unattributed_4xx_keeps_pushovers_own_words_in_the_debug_detail() {
         let PluginResult::Err(error) = classify(403, &[], "you are blocked") else {
             panic!("a 4xx is permanent");
         };
         assert_eq!(error.code, PluginErrorCode::InvalidConfig);
         assert!(
-            error.public_message.contains("you are blocked"),
+            !error.public_message.contains("you are blocked"),
             "{error:?}"
         );
         assert_eq!(
@@ -2858,9 +2873,9 @@ mod tests {
     }
 
     #[test]
-    fn a_429_is_a_delivery_failure_carrying_the_quota_reset() {
+    fn a_429_is_quota_exceeded_carrying_the_quota_reset() {
         let reset = now_unix().unwrap() + 3_600;
-        let PluginResult::Ok(response) = classify(
+        let PluginResult::Err(error) = classify(
             429,
             &[
                 ("X-Limit-App-Limit", "10000"),
@@ -2869,22 +2884,15 @@ mod tests {
             ],
             r#"{"status":0,"errors":["message limit reached"],"request":"r"}"#,
         ) else {
-            panic!("a 429 is the provider saying no, not a broken configuration");
+            panic!("a 429 on one message is the send's typed failure");
         };
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_429"));
-        let retry_after = response.retry_after_seconds.expect("retry_after_seconds");
+        assert_eq!(error.code.as_str(), codes::QUOTA_EXCEEDED);
+        assert!(error.public_message.contains("monthly message limit"));
+        assert!(!error.public_message.contains("message limit reached"));
+        let retry_after = error.retry_after_seconds.expect("retry_after_seconds");
         assert!(
             (3_500..=3_600).contains(&retry_after),
             "X-Limit-App-Reset is an absolute timestamp: {retry_after}"
-        );
-        assert!(
-            response
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("0 of 10000")),
-            "{:?}",
-            response.warnings
         );
     }
 
@@ -2922,14 +2930,14 @@ mod tests {
     }
 
     #[test]
-    fn a_5xx_is_a_retryable_delivery_failure() {
-        let PluginResult::Ok(response) = classify(503, &[], "upstream exploded") else {
-            panic!("a 5xx is the provider saying no right now");
+    fn a_5xx_is_upstream_unavailable_with_the_documented_delay() {
+        let PluginResult::Err(error) = classify(503, &[], "upstream exploded") else {
+            panic!("a 5xx on one message is the send's typed failure");
         };
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_503"));
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert!(!error.public_message.contains("upstream exploded"));
         assert_eq!(
-            response.retry_after_seconds,
+            error.retry_after_seconds,
             Some(SERVER_ERROR_RETRY_SECONDS),
             "Pushover documents a five-second floor before repeating a request"
         );

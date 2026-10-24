@@ -39,7 +39,7 @@
 
 use list_provider_common::error::{
     Access, auth_failed, check_status, invalid_config, missing_param, not_found, permanent,
-    plugin_error, unsupported_source,
+    plugin_error, unsupported_source, with_debug,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, json_body};
 use list_provider_common::ids::{
@@ -976,32 +976,38 @@ fn tmdb_status_code(response: &PluginHttpResponse) -> Option<i64> {
 /// The member's own collections are addressed by their account, so they can
 /// never be gone on their own: a 404 there is a failure that must not read as
 /// the collection having been deleted.
+///
+/// A refused token stays `auth_failed` rather than `invalid_api_key`: the host
+/// expires the linked account and asks for a reconnect only on that
+/// well-known code. The status reaches the host log only.
 fn check_member_status(
     response: &PluginHttpResponse,
     what: &str,
     read: MemberRead,
 ) -> Result<(), PluginError> {
-    if response.status == 403 {
-        return Err(auth_failed("TMDb refused the linked account (HTTP 403)"));
-    }
-    if read == MemberRead::Account && matches!(response.status, 404 | 410) {
-        return Err(permanent(format!(
-            "TMDb did not serve the {what} for the linked account (HTTP {})",
-            response.status
-        )));
-    }
-    if response.status == 401 {
-        return Err(
-            if read == MemberRead::ById
-                && tmdb_status_code(response) == Some(TMDB_PRIVATE_RESOURCE_CODE)
-            {
-                not_found(format!("{what} (private, HTTP 401)"))
-            } else {
-                auth_failed("TMDb no longer accepts the linked account")
-            },
-        );
-    }
-    check_status(response, Access::Public, what)
+    let status = response.status;
+    let error = if status == 403 {
+        auth_failed("TMDb refused the linked account")
+    } else if read == MemberRead::Account && matches!(status, 404 | 410) {
+        permanent(format!(
+            "TMDb did not serve the {what} for the linked account"
+        ))
+    } else if status == 401 {
+        if read == MemberRead::ById
+            && tmdb_status_code(response) == Some(TMDB_PRIVATE_RESOURCE_CODE)
+        {
+            not_found(format!("{what} (private)"))
+        } else {
+            auth_failed("TMDb no longer accepts the linked account")
+        }
+    } else {
+        return check_status(response, Access::Public, what);
+    };
+    let debug = match tmdb_status_code(response) {
+        Some(code) => format!("{what}: HTTP {status}, TMDb status_code {code}"),
+        None => format!("{what}: HTTP {status}"),
+    };
+    Err(with_debug(error, debug))
 }
 
 /// What TMDb says a member is called, from whichever read named them.

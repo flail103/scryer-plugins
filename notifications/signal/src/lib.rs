@@ -192,6 +192,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Notification(NotificationDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             // The channel is a signal-cli-rest-api server, and operators name it
@@ -888,6 +889,7 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<(&'static str, String)> 
         | NotificationEventType::ListTitleLeft
         | NotificationEventType::ListSyncFailed
         | NotificationEventType::ListUnfollowed
+        | NotificationEventType::FileRestored
         | NotificationEventType::Test => {}
     }
     lines
@@ -1263,13 +1265,15 @@ enum Outcome {
     /// which *every* request says the same thing can be reported on the typed
     /// lane naming the field.
     Misconfigured(PluginError),
-    /// The provider said no, for now.
+    /// The provider said no, for now. `error` is what a send made of this one
+    /// request reports on the typed lane.
     Rejected {
         status: Option<u16>,
         detail: String,
         provider_status: String,
         retry_after_seconds: Option<i64>,
         warnings: Vec<String>,
+        error: PluginError,
     },
 }
 
@@ -1320,16 +1324,18 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
                 for recipient in batch {
                     match recipient_error_for(&recipient_errors, recipient) {
                         Some(reason) => {
+                            let reason = scrub_identifiers(reason, &settings);
+                            let target = target_label(&settings, recipient);
+                            failures.push(format!("{target}: {reason}"));
                             target_results.push(PluginNotificationTargetResult {
-                                target: recipient.value.clone(),
+                                target,
                                 success: false,
                                 status: Some(format!("http_{status}")),
-                                error: Some(reason.clone()),
+                                error: Some(reason),
                             });
-                            failures.push(format!("{}: {reason}", recipient.value));
                         }
                         None => target_results.push(PluginNotificationTargetResult {
-                            target: recipient.value.clone(),
+                            target: target_label(&settings, recipient),
                             success: true,
                             status: Some(format!("http_{status}")),
                             error: None,
@@ -1343,19 +1349,21 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
                         .iter()
                         .any(|recipient| recipient_matches(recipient, who))
                     {
-                        failures.push(format!("{who}: {reason}"));
+                        failures.push(format!(
+                            "a recipient this channel did not send to: {}",
+                            scrub_identifiers(reason, &settings)
+                        ));
                     }
                 }
             }
             Outcome::Misconfigured(error) => {
                 for recipient in batch {
                     target_results.push(PluginNotificationTargetResult {
-                        target: recipient.value.clone(),
+                        target: target_label(&settings, recipient),
                         success: false,
-                        status: error
-                            .debug_message
-                            .clone()
-                            .or_else(|| Some(format!("{:?}", error.code))),
+                        // The code, never the debug text: target results are
+                        // shown to the operator.
+                        status: Some(error.code.as_str().to_string()),
                         error: Some(error.public_message.clone()),
                     });
                 }
@@ -1368,7 +1376,13 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
                 provider_status,
                 retry_after_seconds: retry_after,
                 warnings: request_warnings,
+                error,
             } => {
+                // One request is the whole send: its failure is the send's
+                // failure and goes on the typed lane with its code.
+                if batches.len() == 1 {
+                    return PluginResult::Err(error);
+                }
                 warnings.extend(request_warnings);
                 if let Some(retry_after) = retry_after {
                     retry_after_seconds =
@@ -1376,7 +1390,7 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
                 }
                 for recipient in batch {
                     target_results.push(PluginNotificationTargetResult {
-                        target: recipient.value.clone(),
+                        target: target_label(&settings, recipient),
                         success: false,
                         status: Some(
                             status
@@ -1435,6 +1449,52 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
     PluginResult::Ok(response)
 }
 
+/// A recipient's place in `receiver_id`, which is all a target result or a
+/// message says about it: phone numbers, usernames and group ids go neither to
+/// the operator-facing text nor to the host log.
+fn target_label(settings: &Settings, recipient: &Recipient) -> String {
+    match settings
+        .recipients
+        .iter()
+        .position(|candidate| candidate == recipient)
+    {
+        Some(index) => format!("recipient {} of {}", index + 1, settings.recipients.len()),
+        None => "recipient".to_string(),
+    }
+}
+
+/// `text` with every configured recipient and the sender number replaced, for
+/// upstream text that may quote them back.
+fn scrub_identifiers(text: &str, settings: &Settings) -> String {
+    let mut identifiers: Vec<(&str, &str)> = settings
+        .recipients
+        .iter()
+        .flat_map(|recipient| {
+            [
+                Some(recipient.value.as_str()),
+                recipient.value.strip_prefix(USERNAME_PREFIX),
+                recipient.value.strip_prefix(GROUP_PREFIX),
+                recipient.value.strip_prefix('+'),
+            ]
+        })
+        .flatten()
+        .map(|value| (value, "<recipient>"))
+        .collect();
+    identifiers.push((settings.sender_number.as_str(), "<sender_number>"));
+    if let Some(bare) = settings.sender_number.strip_prefix('+') {
+        identifiers.push((bare, "<sender_number>"));
+    }
+    // Longest first, so a value is replaced before any shorter value inside it.
+    identifiers.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
+    let mut scrubbed = text.to_string();
+    for (value, placeholder) in identifiers {
+        if !value.is_empty() {
+            scrubbed = scrubbed.replace(value, placeholder);
+        }
+    }
+    scrubbed
+}
+
 /// `SendMessageError` names the failed recipient by `number`, `username` or
 /// `uuid`; only the first two can be matched against what was sent.
 fn recipient_matches(recipient: &Recipient, who: &str) -> bool {
@@ -1475,7 +1535,11 @@ fn post(url: &str, settings: &Settings, body: Vec<u8>, strict: bool) -> Outcome 
             &response.body(),
             settings,
         ),
-        Err(error) => transport_failure(&error.to_string(), settings, strict),
+        Err(error) => transport_failure(
+            &redact_secrets(&error.to_string()),
+            request_failure(&error),
+            strict,
+        ),
     }
 }
 
@@ -1487,36 +1551,29 @@ fn post(url: &str, settings: &Settings, body: Vec<u8>, strict: bool) -> Outcome 
 /// connection test (`strict`), where Sonarr would blame `Host`, and stays on the
 /// delivery lane on a live send: a network blink must not be reported to the
 /// operator as a broken setting. Same posture as the ntfy sibling.
-fn transport_failure(error: &str, settings: &Settings, strict: bool) -> Outcome {
+fn transport_failure(error: &str, typed: PluginError, strict: bool) -> Outcome {
     let lower = error.to_ascii_lowercase();
     if lower.contains("is not allowed") || lower.contains("not permitted") {
         return Outcome::Misconfigured(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "Scryer refused a request to {}: set server_url to that address so it is added to this channel's allowlist. Scryer derives the allowlist from configuration values that are URLs, and the legacy host setting is not one.",
-                settings.base_url
-            ),
+            "Scryer refused the request to the Signal server: set server_url to its address so it is added to this channel's allowlist. Scryer derives the allowlist from configuration values that are URLs, and the legacy host setting is not one."
+                .to_string(),
             Some(error.to_string()),
         ));
     }
-    let detail = format!(
-        "could not reach the signal-cli-rest-api server at {}: {}",
-        settings.base_url,
-        ellipsize(error, MAX_QUOTED_ERROR)
-    );
     if strict {
-        return Outcome::Misconfigured(plugin_error(
-            PluginErrorCode::UpstreamUnavailable,
-            detail,
-            Some(error.to_string()),
-        ));
+        return Outcome::Misconfigured(typed);
     }
     Outcome::Rejected {
         status: None,
-        detail,
+        detail: format!(
+            "could not reach the signal-cli-rest-api server: {}",
+            ellipsize(error, MAX_QUOTED_ERROR)
+        ),
         provider_status: "request_failed".to_string(),
         retry_after_seconds: None,
         warnings: Vec::new(),
+        error: typed,
     }
 }
 
@@ -1546,8 +1603,7 @@ fn probe_about(settings: &Settings) -> Vec<String> {
     let status = response.status_code();
     if !(200..300).contains(&status) {
         return vec![format!(
-            "GET {}/v1/about answered HTTP {status}: check that the server URL points at a signal-cli-rest-api server",
-            settings.base_url
+            "GET /v1/about answered HTTP {status}: check that the server URL points at a signal-cli-rest-api server"
         )];
     }
 
@@ -1610,8 +1666,6 @@ struct SignalBody {
     recipient_errors: Vec<(String, String)>,
     /// `SendMessageError.challenge_tokens` on a 429.
     challenge_tokens: Vec<String>,
-    /// `SendMessageError.account` on a 429.
-    account: Option<String>,
     /// Whether the body parsed as a JSON object at all. A `false` here is the
     /// most useful signal this channel has: signal-cli-rest-api answers JSON on
     /// every documented status, so anything else means something that is not it
@@ -1675,10 +1729,6 @@ fn parse_signal_body(body: &[u8]) -> SignalBody {
                     .collect()
             })
             .unwrap_or_default(),
-        account: map
-            .get("account")
-            .and_then(Value::as_str)
-            .map(str::to_string),
         is_json: true,
         raw,
     }
@@ -1738,7 +1788,7 @@ fn classify_response(
     settings: &Settings,
 ) -> Outcome {
     let answer = parse_signal_body(body);
-    let detail = answer.detail(status);
+    let detail = scrub_identifiers(&answer.detail(status), settings);
     let debug = format!("HTTP {status}: {detail}");
     let mut warnings = Vec::new();
 
@@ -1766,10 +1816,8 @@ fn classify_response(
     {
         return Outcome::Misconfigured(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "the server at {} speaks HTTPS but was addressed over HTTP: use an https:// server_url (or enable use_ssl with the legacy settings)",
-                settings.base_url
-            ),
+            "the Signal server speaks HTTPS but was addressed over HTTP: use an https:// server_url (or enable use_ssl with the legacy settings)"
+                .to_string(),
             Some(debug),
         ));
     }
@@ -1780,11 +1828,9 @@ fn classify_response(
     // send the operator to the wrong field.
     if !answer.is_json && !(500..600).contains(&status) && status != 429 {
         return Outcome::Misconfigured(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "the server at {} did not answer like signal-cli-rest-api (HTTP {status}): {detail}. Check the server URL and anything proxying it.",
-                settings.base_url
-            ),
+            codes::ENDPOINT_NOT_FOUND,
+            "server_url did not answer like signal-cli-rest-api; check the server URL and anything proxying it"
+                .to_string(),
             Some(debug),
         ));
     }
@@ -1799,16 +1845,14 @@ fn classify_response(
         400 if error_text.contains("invalid group id") => Outcome::Misconfigured(plugin_error(
             PluginErrorCode::InvalidConfig,
             format!(
-                "the server rejected a recipient group id: {detail}. A group recipient is the id shown by the server's group listing, prefixed with \"{GROUP_PREFIX}\"."
+                "recipients: the server rejected a group id. A group recipient is the id shown by the server's group listing, prefixed with \"{GROUP_PREFIX}\"."
             ),
             Some(debug),
         )),
         400 if error_text.contains("invalid account") => Outcome::Misconfigured(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "the server does not know the sender number {}: {detail}. Register or link that number with signal-cli first.",
-                settings.sender_number
-            ),
+            "sender_number: the server does not know this number. Register or link it with signal-cli first."
+                .to_string(),
             Some(debug),
         )),
         // Bucketing exists so these never happen; if one does, this plugin built
@@ -1818,67 +1862,81 @@ fn classify_response(
         {
             Outcome::Misconfigured(plugin_error(
                 PluginErrorCode::Permanent,
-                format!("the request this plugin built mixed recipient kinds: {detail}"),
+                "the request this plugin built mixed recipient kinds".to_string(),
                 Some(debug),
             ))
         }
         // Sonarr's default property for a 400 is `Host` (`SignalProxy.cs:93`).
         400 => Outcome::Misconfigured(plugin_error(
             PluginErrorCode::InvalidConfig,
-            format!(
-                "the signal-cli-rest-api server at {} rejected the request: {detail}",
-                settings.base_url
-            ),
+            "the signal-cli-rest-api server rejected the request; check the channel settings"
+                .to_string(),
             Some(debug),
         )),
         // "invalid username or password" (`SignalProxy.cs:107-110`). 403 is the
         // same credential from the other side. signal-cli-rest-api has no
         // authentication of its own, so this is always the proxy in front of it.
         401 | 403 => Outcome::Misconfigured(plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!(
-                "auth_username/auth_password were rejected (HTTP {status}): {detail}. signal-cli-rest-api has no authentication of its own, so these credentials belong to whatever proxies it."
-            ),
+            codes::INVALID_USERNAME_PASSWORD,
+            "auth_username/auth_password were rejected. signal-cli-rest-api has no authentication of its own, so these credentials belong to whatever proxies it."
+                .to_string(),
             Some(debug),
         )),
         404 => Outcome::Misconfigured(plugin_error(
-            PluginErrorCode::InvalidConfig,
-            format!(
-                "{}/v2/send does not exist (HTTP 404): {detail}. Check the server URL, including any path prefix.",
-                settings.base_url
-            ),
+            codes::ENDPOINT_NOT_FOUND,
+            "server_url has no signal-cli-rest-api send endpoint. Check the server URL, including any path prefix."
+                .to_string(),
             Some(debug),
         )),
         // Signal rate-limited the account. The server hands back the challenge
         // tokens to replay with a solved captcha; Sonarr has no branch for this
         // at all, so its operators only ever see "unable to send".
         429 => {
+            let mut error_debug = debug.clone();
             if !answer.challenge_tokens.is_empty() {
-                warnings.push(format!(
-                    "Signal is rate limiting {}. Solve a captcha at https://signalcaptchas.org/challenge/generate.html and POST it with challenge token(s) {} to {}/v1/accounts/{}/rate-limit-challenge.",
-                    answer.account.as_deref().unwrap_or(&settings.sender_number),
+                // The tokens are what the operator replays; the account number
+                // and the server address are already in their own settings and
+                // stay out of the text.
+                let challenge = format!(
+                    "Signal is rate limiting the sending account. Solve a captcha at https://signalcaptchas.org/challenge/generate.html and POST it with challenge token(s) {} to the server's /v1/accounts/<sender_number>/rate-limit-challenge.",
                     answer.challenge_tokens.join(", "),
-                    settings.base_url,
-                    answer.account.as_deref().unwrap_or(&settings.sender_number),
-                ));
+                );
+                error_debug = format!("{debug}; {challenge}");
+                warnings.push(challenge);
             }
+            let retry_after_seconds = retry_after(headers);
             Outcome::Rejected {
                 status: Some(429),
                 detail: format!("HTTP 429: {detail}"),
                 provider_status: "http_429".to_string(),
-                retry_after_seconds: retry_after(headers),
+                retry_after_seconds,
                 warnings,
+                error: http_failure(
+                    429,
+                    retry_after_seconds,
+                    Credential::UsernamePassword,
+                    error_debug,
+                ),
             }
         }
         // The provider saying "not now": the delivery lane, not the
         // configuration lane.
-        _ => Outcome::Rejected {
-            status: Some(status),
-            detail: format!("HTTP {status}: {detail}"),
-            provider_status: format!("http_{status}"),
-            retry_after_seconds: retry_after(headers),
-            warnings,
-        },
+        _ => {
+            let retry_after_seconds = retry_after(headers);
+            Outcome::Rejected {
+                status: Some(status),
+                detail: format!("HTTP {status}: {detail}"),
+                provider_status: format!("http_{status}"),
+                retry_after_seconds,
+                warnings,
+                error: http_failure(
+                    status,
+                    retry_after_seconds,
+                    Credential::UsernamePassword,
+                    debug,
+                ),
+            }
+        }
     }
 }
 
@@ -1892,17 +1950,16 @@ fn retry_after(headers: &BTreeMap<String, String>) -> Option<i64> {
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let error = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug_message) => error.debug(redact_secrets(&debug_message)),
+        None => error,
     }
+    .build()
 }
 
 /// The world's single `process` entry, dispatching the SDK's notification
@@ -2627,6 +2684,15 @@ mod tests {
         classify_response(status, &headers(&[]), body.as_bytes(), &settings())
     }
 
+    /// What the host transport reports when the request got no HTTP answer.
+    fn unreachable() -> PluginError {
+        plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "the Signal server could not be reached".to_string(),
+            Some("connection refused".to_string()),
+        )
+    }
+
     fn misconfiguration(outcome: Outcome) -> PluginError {
         match outcome {
             Outcome::Misconfigured(error) => error,
@@ -2716,16 +2782,27 @@ mod tests {
             r#"{"error":"Invalid account (Invalid account)"}"#,
         ));
         assert_eq!(error.code, PluginErrorCode::InvalidConfig);
-        assert!(error.public_message.contains("+15550001111"));
-        assert!(error.public_message.contains("sender number"));
+        assert!(error.public_message.contains("sender_number"));
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("Invalid account"))
+        );
     }
 
     #[test]
-    fn any_other_400_names_the_server() {
+    fn any_other_400_keeps_the_servers_words_in_the_debug_detail() {
         let error = misconfiguration(classify(400, r#"{"error":"Couldn't process request"}"#));
         assert_eq!(error.code, PluginErrorCode::InvalidConfig);
-        assert!(error.public_message.contains("http://signal.test:8080"));
-        assert!(error.public_message.contains("Couldn't process request"));
+        assert!(!error.public_message.contains("http://signal.test:8080"));
+        assert!(!error.public_message.contains("Couldn't process request"));
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("Couldn't process request"))
+        );
     }
 
     #[test]
@@ -2742,7 +2819,7 @@ mod tests {
     fn a_401_or_403_names_the_proxy_credentials() {
         for status in [401, 403] {
             let error = misconfiguration(classify(status, r#"{"error":"unauthorized"}"#));
-            assert_eq!(error.code, PluginErrorCode::AuthFailed);
+            assert_eq!(error.code.as_str(), codes::INVALID_USERNAME_PASSWORD);
             assert!(error.public_message.contains("auth_username"));
             assert!(
                 error
@@ -2754,16 +2831,16 @@ mod tests {
     }
 
     #[test]
-    fn a_404_names_the_server_url() {
+    fn a_404_is_endpoint_not_found_naming_the_server_url() {
         let error = misconfiguration(classify(404, r#"{"error":"not found"}"#));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
-        assert!(error.public_message.contains("/v2/send"));
+        assert_eq!(error.code.as_str(), codes::ENDPOINT_NOT_FOUND);
+        assert!(error.public_message.contains("server_url"));
     }
 
     #[test]
     fn a_non_json_failure_blames_the_url_rather_than_a_signal_setting() {
         let error = misconfiguration(classify(407, "<html>Proxy Authentication Required</html>"));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code.as_str(), codes::ENDPOINT_NOT_FOUND);
         assert!(error.public_message.contains("did not answer like"));
     }
 
@@ -2774,6 +2851,7 @@ mod tests {
             provider_status,
             retry_after_seconds,
             warnings,
+            error,
             ..
         } = classify_response(
             429,
@@ -2789,13 +2867,24 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("abc123"));
         assert!(warnings[0].contains("rate-limit-challenge"));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(120));
+        assert!(!error.public_message.contains("abc123"));
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .is_some_and(|debug| debug.contains("rate-limit-challenge")),
+            "a single-request send still carries the challenge to the host log"
+        );
     }
 
     #[test]
-    fn a_server_error_stays_on_the_delivery_lane() {
+    fn a_server_error_is_a_rejection_carrying_upstream_unavailable() {
         let Outcome::Rejected {
             status,
             provider_status,
+            error,
             ..
         } = classify(503, "upstream exploded")
         else {
@@ -2803,6 +2892,8 @@ mod tests {
         };
         assert_eq!(status, Some(503));
         assert_eq!(provider_status, "http_503");
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert!(!error.public_message.contains("upstream exploded"));
     }
 
     #[test]
@@ -2810,7 +2901,7 @@ mod tests {
         for strict in [true, false] {
             let error = misconfiguration(transport_failure(
                 "HTTP request to http://signal.test:8080/v2/send is not allowed",
-                &settings(),
+                unreachable(),
                 strict,
             ));
             assert_eq!(error.code, PluginErrorCode::InvalidConfig);
@@ -2820,9 +2911,9 @@ mod tests {
 
     #[test]
     fn an_unreachable_server_is_upstream_unavailable_on_a_test() {
-        let error = misconfiguration(transport_failure("connection refused", &settings(), true));
+        let error = misconfiguration(transport_failure("connection refused", unreachable(), true));
         assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
-        assert!(error.public_message.contains("http://signal.test:8080"));
+        assert!(!error.public_message.contains("http://signal.test:8080"));
     }
 
     #[test]
@@ -2831,14 +2922,20 @@ mod tests {
             status,
             provider_status,
             detail,
+            error,
             ..
-        } = transport_failure("connection refused", &settings(), false)
+        } = transport_failure("connection refused", unreachable(), false)
         else {
-            panic!("a live send must not report a network blink as a broken setting");
+            panic!("a live send keeps the per-request delivery failure");
         };
         assert_eq!(status, None);
         assert_eq!(provider_status, "request_failed");
-        assert!(detail.contains("http://signal.test:8080"));
+        assert!(detail.contains("connection refused"));
+        assert_eq!(
+            error.code,
+            PluginErrorCode::UpstreamUnavailable,
+            "a send made of this one request reports it typed"
+        );
     }
 
     #[test]
@@ -2918,5 +3015,69 @@ mod tests {
         assert_eq!(format_bytes(1024), "1 KB");
         assert_eq!(format_bytes(1_536), "1.5 KB");
         assert_eq!(format_bytes(2_147_483_648), "2 GB");
+    }
+
+    // -----------------------------------------------------------------
+    // Recipient identifiers stay out of operator text and the host log
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_target_is_labelled_by_its_position_not_its_identifier() {
+        let mut settings = settings();
+        settings.recipients.push(number("+15550003333"));
+        assert_eq!(
+            target_label(&settings, &settings.recipients[1]),
+            "recipient 2 of 2"
+        );
+        assert_eq!(
+            target_label(&settings, &number("+15550009999")),
+            "recipient"
+        );
+    }
+
+    #[test]
+    fn upstream_text_quoting_a_recipient_or_the_sender_is_scrubbed() {
+        let mut settings = settings();
+        settings.recipients.push(Recipient {
+            value: "group.ckRzaEd4VmRzNnJa".to_string(),
+            kind: RecipientKind::Group,
+        });
+        let scrubbed = scrub_identifiers(
+            "failed to send to +15550002222 and 15550002222 in ckRzaEd4VmRzNnJa from +15550001111",
+            &settings,
+        );
+        assert_eq!(
+            scrubbed,
+            "failed to send to <recipient> and <recipient> in <recipient> from <sender_number>"
+        );
+    }
+
+    #[test]
+    fn a_rejection_quoting_a_recipient_keeps_it_out_of_every_message() {
+        let Outcome::Rejected { detail, error, .. } =
+            classify(503, r#"{"error":"could not deliver to +15550002222"}"#)
+        else {
+            panic!("a 5xx is the provider saying not now");
+        };
+        assert!(!detail.contains("+15550002222"), "{detail}");
+        let debug = error.debug_message.unwrap_or_default();
+        assert!(!debug.contains("15550002222"), "{debug}");
+        assert!(debug.contains("<recipient>"), "{debug}");
+    }
+
+    #[test]
+    fn a_rate_limit_challenge_names_neither_the_account_nor_the_server() {
+        let Outcome::Rejected { warnings, error, .. } = classify_response(
+            429,
+            &headers(&[]),
+            br#"{"error":"Rate limit exceeded","challenge_tokens":["abc123"],"account":"+15550001111"}"#,
+            &settings(),
+        ) else {
+            panic!("a rate limit is the provider saying not now");
+        };
+        for text in warnings.iter().chain(error.debug_message.iter()) {
+            assert!(!text.contains("15550001111"), "{text}");
+            assert!(!text.contains("signal.test"), "{text}");
+        }
     }
 }

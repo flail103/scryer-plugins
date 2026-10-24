@@ -98,3 +98,47 @@ fn session_versions_and_handshake_work_through_the_component() {
         ));
     }
 }
+
+/// Transmission answers wrong RPC credentials with 401; the operator must see
+/// that the username or password was refused, not a retried generic failure.
+#[test]
+fn rejected_rpc_credentials_report_their_code_through_the_component() {
+    use scryer_plugin_conformance::download_client::{call_download_client, instantiate};
+    use scryer_plugin_conformance::{
+        ConfigSource, HttpReply, HttpRoute, HttpScript, Script, StateSource,
+    };
+    use scryer_plugin_sdk::command::{
+        PluginDownloadClientCommand as Command, PluginDownloadClientCommandResult as Result,
+    };
+    use scryer_plugin_sdk::{PluginErrorCode, PluginResult};
+
+    let suite = DownloadClientConformance::new(env!("CARGO_MANIFEST_DIR"), "transmission")
+        .wasm("transmission_download_client.wasm");
+    let script = Script {
+        config: ConfigSource::Resolved(
+            [
+                ("host".into(), "transmission.test.invalid".into()),
+                ("username".into(), "synthetic-user".into()),
+                ("password".into(), "synthetic-password".into()),
+            ]
+            .into(),
+        ),
+        state: StateSource::Stored(Default::default()),
+        http: HttpScript::Routed(vec![HttpRoute::any(HttpReply::new(
+            401,
+            b"<h1>401: Unauthorized</h1>".to_vec(),
+        ))]),
+        ..Default::default()
+    };
+    let (mut store, plugin) = instantiate(&suite.wasm_path(), script);
+    let result = call_download_client(&mut store, &plugin, Command::TestConnection);
+    let Result::TestConnection(PluginResult::Err(error)) = result else {
+        panic!("rejected credentials must be a typed plugin error: {result:?}");
+    };
+    assert_eq!(
+        error.code,
+        PluginErrorCode::from("invalid_username_password"),
+        "{error:?}"
+    );
+    assert!(!error.public_message.contains("synthetic-password"));
+}

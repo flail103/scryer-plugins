@@ -192,5 +192,41 @@ fn bad_urls_and_failures_map_to_host_classes() {
     assert!(status(404, "").public_message.contains("not found"));
     assert_eq!(status(429, "").retry_after_seconds, Some(90));
     assert_eq!(status(503, "").code, PluginErrorCode::UpstreamUnavailable);
-    assert_eq!(status(200, "<rss/>").code, PluginErrorCode::Permanent);
+    assert_eq!(
+        status(200, "<rss/>").code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE)
+    );
+}
+
+#[test]
+fn a_refused_feed_reads_as_private_without_leaking_the_address() {
+    for refused in [401, 403] {
+        let http = RecordedHttp::new().with(RSS_URL, refused, "denied for fixture-user");
+        let error = block_on(fetch(&http, &request(SOURCE_RSS, Some(RSS_URL), None))).unwrap_err();
+        // The host's list classes read `item_not_found` as a list that is gone
+        // or private.
+        assert_eq!(
+            error.code,
+            PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND),
+            "{refused}"
+        );
+        assert!(error.public_message.contains("not found"), "{refused}");
+        assert!(!error.public_message.contains("example.test"), "{refused}");
+        assert!(!error.public_message.contains("fixture-user"), "{refused}");
+        assert_eq!(
+            error.debug_message.as_deref(),
+            Some(format!("feed: HTTP {refused}").as_str())
+        );
+    }
+}
+
+#[test]
+fn an_invalid_feed_url_names_the_parameter() {
+    let error = block_on(fetch(
+        &RecordedHttp::new(),
+        &request(SOURCE_RSS, Some("ftp://feeds.example.test/x"), None),
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+    assert!(error.public_message.contains(PARAM_URL));
 }

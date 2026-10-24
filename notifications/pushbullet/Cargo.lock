@@ -1057,7 +1057,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "notify-common"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "scryer-plugin-pdk",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "pushbullet-notification"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "notify-common",
  "scryer-plugin-conformance",
@@ -1370,7 +1370,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scryer-plugin-conformance"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "base64 0.23.1",
  "postcard",
@@ -1382,7 +1382,9 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-pdk"
-version = "0.7.0"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd05e4ac0d93f86458afce9cb834791f0f27e2a4a8b16d900cd637e42769a48f"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1395,9 +1397,9 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-sdk"
-version = "3.12.0"
+version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b885a61a72e9776886c5e56ad454d2d5df4b1fa8b317ba333d383dd1f4858b8"
+checksum = "a045c679044705d66fa330cc0e59ba1d12dcab84e354c6f37705efdf7444b3f2"
 dependencies = [
  "base64 0.22.1",
  "schemars",

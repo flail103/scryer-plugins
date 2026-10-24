@@ -196,6 +196,7 @@ fn build_descriptor() -> PluginDescriptor {
             },
             config_fields: config_fields(),
         }),
+        settings: Vec::new(),
     }
 }
 
@@ -683,6 +684,7 @@ fn event_label(req: &PluginNotificationRequest) -> String {
         NotificationEventType::TitleAdded => pick(episodic, "Series Added", "Added"),
         NotificationEventType::TitleDeleted => pick(episodic, "Series Deleted", "Deleted"),
         NotificationEventType::TitleMoved => pick(episodic, "Series Moved", "Moved"),
+        NotificationEventType::FileRestored => "File Restored".to_string(),
         NotificationEventType::ListTitleAdded
         | NotificationEventType::ListRequestSubmitted
         | NotificationEventType::ListItemHeld
@@ -777,6 +779,7 @@ fn color(req: &PluginNotificationRequest) -> u32 {
         NotificationEventType::ImportComplete
         | NotificationEventType::TitleAdded
         | NotificationEventType::HealthRestored
+        | NotificationEventType::FileRestored
         | NotificationEventType::PostProcessingCompleted
         | NotificationEventType::SubtitleDownloaded
         | NotificationEventType::MediaRequestApproved => COLOR_SUCCESS,
@@ -1271,7 +1274,8 @@ fn sonarr_event_type(req: &PluginNotificationRequest) -> Option<&'static str> {
         | NotificationEventType::MediaRequestCanceled
         | NotificationEventType::TitleMoved => None,
         // Not in `supported_events`, so the host never routes them here.
-        NotificationEventType::ListTitleAdded
+        NotificationEventType::FileRestored
+        | NotificationEventType::ListTitleAdded
         | NotificationEventType::ListRequestSubmitted
         | NotificationEventType::ListItemHeld
         | NotificationEventType::ListTitleLeft
@@ -2054,14 +2058,9 @@ fn send_notification(req: &PluginNotificationRequest) -> PluginResult<PluginNoti
             &settings,
             warnings,
         ),
-        Err(error) => {
-            // The host answers a refused or failed egress in-band; that is a
-            // delivery failure, not a channel misconfiguration.
-            let mut failure = error_response(format!("request failed: {error}"), None);
-            failure.warnings = warnings;
-            failure.target_results = vec![target_result(&settings, false, None, None)];
-            PluginResult::Ok(failure)
-        }
+        // A refused egress, DNS, connection or TLS failure, or a timeout: the
+        // PDK classifies it from the host's own error.
+        Err(error) => PluginResult::Err(request_failure(&error)),
     }
 }
 
@@ -2201,82 +2200,61 @@ fn classify_response(
         // Notifiarr answers `200` with `{"result":"error", …}` when the
         // integration itself refused the payload. Sonarr never looks at the
         // body, so it reports these as delivered.
-        let mut failure = error_response(
-            format!("Notifiarr accepted the request but did not deliver it: {detail}"),
-            Some("notifiarr_error".to_string()),
-        );
-        failure.warnings = warnings;
-        failure.target_results = vec![target_result(
-            settings,
-            false,
-            Some("notifiarr_error".to_string()),
-            Some(detail),
-        )];
-        return PluginResult::Ok(failure);
+        return PluginResult::Err(plugin_error(
+            PluginErrorCode::Permanent,
+            "Notifiarr accepted the request but did not deliver it".to_string(),
+            Some(debug),
+        ));
     }
 
     // Notifiarr is fronted by Cloudflare, which answers with an HTML page and
     // borrows Notifiarr's status codes — including `400`
     // (`Notifiarr/notifiarr:pkg/website/website.go:53-60`). Blaming `api_key`
-    // for that would send the operator to the wrong setting.
+    // for that would send the operator to the wrong setting: the answer came
+    // from something in front of Notifiarr, so it is the provider saying "not
+    // now".
     if !answer.is_json && !(500..600).contains(&status) && status != 429 && status != 401 {
-        let mut failure = error_response(
-            format!(
-                "notifiarr.com answered HTTP {status} with a non-JSON body, so the answer came from something in front of Notifiarr (usually Cloudflare) rather than from the API: {detail}"
-            ),
-            Some(format!("http_{status}")),
-        );
-        failure.retry_after_seconds = retry_after;
-        failure.warnings = warnings;
-        failure.target_results = vec![target_result(
-            settings,
-            false,
-            Some(format!("http_{status}")),
-            Some(detail),
-        )];
-        return PluginResult::Ok(failure);
+        let builder = scryer_plugin_pdk::plugin_error(
+            PluginErrorCode::UpstreamUnavailable,
+            "something in front of Notifiarr (usually Cloudflare) answered instead of the API",
+        )
+        .debug(redact_secrets(&debug));
+        return PluginResult::Err(match retry_after {
+            Some(seconds) => builder.retry_after_seconds(seconds).build(),
+            None => builder.build(),
+        });
     }
 
     match status {
         // `NotifiarrProxy.cs:178-180`. Notifiarr's own client treats 401 and 403
         // alike (`website.go:316`).
-        401 | 403 => PluginResult::Err(plugin_error(
-            PluginErrorCode::AuthFailed,
-            format!("api_key was rejected by Notifiarr (HTTP {status}): {detail}"),
-            Some(debug),
-        )),
+        401 | 403 => PluginResult::Err(rejected_credential(Credential::ApiKey, debug)),
         // Sonarr logs a 400 and reports success, on the grounds that one
         // misconfigured event should not stop the others
         // (`NotifiarrProxy.cs:181-185`). That leniency is what made every
-        // delivery from the June port look like a success. Scryer reports it.
+        // delivery from the June port look like a success. Scryer reports it:
+        // the integration is off or unassigned on notifiarr.com.
         400 => {
             let hint = match settings.integration {
                 Integration::Passthrough => {
-                    "Enable the Passthrough integration on notifiarr.com and check that channel_id names a channel it may post to."
+                    "Notifiarr rejected the notification; enable the Passthrough integration on notifiarr.com and check that channel_id names a channel it may post to"
                 }
                 Integration::Sonarr => {
-                    "Enable the Sonarr integration on notifiarr.com and assign it a channel."
+                    "Notifiarr rejected the notification; enable the Sonarr integration on notifiarr.com and assign it a channel"
                 }
             };
-            let mut failure = error_response(
-                format!("Notifiarr rejected the notification (HTTP 400): {detail}. {hint}"),
-                Some("http_400".to_string()),
-            );
-            failure.warnings = warnings;
-            failure.target_results = vec![target_result(
-                settings,
-                false,
-                Some("http_400".to_string()),
-                Some(detail),
-            )];
-            PluginResult::Ok(failure)
+            PluginResult::Err(plugin_error(
+                PluginErrorCode::InvalidConfig,
+                hint.to_string(),
+                Some(debug),
+            ))
         }
         // Every notification route this plugin uses has existed for the life of
         // the API, so a 404 is the integration name, not a bad moment.
         404 => PluginResult::Err(plugin_error(
-            PluginErrorCode::InvalidConfig,
+            codes::ENDPOINT_NOT_FOUND,
             format!(
-                "Notifiarr has no '{}' integration endpoint (HTTP 404): {detail}",
+                "Notifiarr has no '{}' integration endpoint",
                 settings.integration.label()
             ),
             Some(debug),
@@ -2284,45 +2262,25 @@ fn classify_response(
         // Notifiarr rate-limits per account tier — 12,000/day and 500/hour for a
         // free account, 24,000/day and 1,000/hour for a patron
         // (notifiarr.wiki/pages/faq/faq/). Sonarr has no 429 arm at all.
-        429 => {
-            let mut failure = error_response(
-                format!(
-                    "Notifiarr rate-limited this channel (HTTP 429): {detail}. Free accounts allow 500 notifications an hour."
-                ),
-                Some("http_429".to_string()),
-            );
-            failure.retry_after_seconds = retry_after;
-            failure.warnings = warnings;
-            failure.target_results = vec![target_result(
-                settings,
-                false,
-                Some("http_429".to_string()),
-                Some(detail),
-            )];
-            PluginResult::Ok(failure)
-        }
         // `NotifiarrProxy.cs:186-196`: 502/503/504 are Notifiarr being down,
         // 520-524 are Cloudflare's own five-hundreds. Both are the provider
-        // saying "not now" — the delivery lane.
+        // saying "not now" (`UpstreamUnavailable`), keeping any `Retry-After`.
         _ => {
             let reason = match status {
                 502..=504 => "Notifiarr is unavailable",
                 520..=524 => "Cloudflare could not reach Notifiarr",
                 _ => "Notifiarr returned an unexpected status",
             };
-            let mut failure = error_response(
-                format!("{reason} (HTTP {status}): {detail}"),
-                Some(format!("http_{status}")),
+            let mut error = http_failure(
+                status,
+                retry_after,
+                Credential::ApiKey,
+                format!("{reason}: {debug}"),
             );
-            failure.retry_after_seconds = retry_after;
-            failure.warnings = warnings;
-            failure.target_results = vec![target_result(
-                settings,
-                false,
-                Some(format!("http_{status}")),
-                Some(detail),
-            )];
-            PluginResult::Ok(failure)
+            if (500..600).contains(&status) {
+                error.retry_after_seconds = retry_after;
+            }
+            PluginResult::Err(error)
         }
     }
 }
@@ -2358,16 +2316,14 @@ fn target_result(
 }
 
 fn plugin_error(
-    code: PluginErrorCode,
+    code: impl Into<PluginErrorCode>,
     public_message: String,
     debug_message: Option<String>,
 ) -> PluginError {
-    PluginError {
-        code,
-        public_message,
-        debug_message,
-        retry_after_seconds: None,
-        details: None,
+    let builder = scryer_plugin_pdk::plugin_error(code, public_message);
+    match debug_message {
+        Some(debug) => builder.debug(redact_secrets(&debug)).build(),
+        None => builder.build(),
     }
 }
 
@@ -3326,67 +3282,80 @@ mod tests {
     /// Notifiarr answers 200 with `result: error` when the integration itself
     /// refuses. Sonarr never reads the body and reports these as delivered.
     #[test]
-    fn a_two_hundred_carrying_an_error_result_is_a_delivery_failure() {
-        let response = ok(classify(
+    fn a_two_hundred_carrying_an_error_result_is_a_permanent_failure() {
+        let error = err(classify(
             200,
             r#"{"result":"error","details":{"response":"channel not found"}}"#,
         ));
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("notifiarr_error"));
+        assert_eq!(error.code, PluginErrorCode::Permanent);
+        assert!(!error.public_message.contains("channel not found"));
         assert!(
-            response
-                .error
+            error
+                .debug_message
                 .as_deref()
                 .unwrap()
                 .contains("channel not found"),
-            "{response:?}"
+            "{error:?}"
         );
     }
 
     /// `NotifiarrProxy.cs:178-180`.
     #[test]
-    fn a_401_names_the_api_key_setting() {
+    fn a_401_is_an_invalid_api_key() {
         let error = err(classify(
             401,
             r#"{"result":"error","message":"invalid api key"}"#,
         ));
-        assert_eq!(error.code, PluginErrorCode::AuthFailed);
-        assert!(error.public_message.contains("api_key"), "{error:?}");
+        assert_eq!(error.code, PluginErrorCode::from(codes::INVALID_API_KEY));
         assert!(
-            error.public_message.contains("invalid api key"),
+            !error.public_message.contains("invalid api key"),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("invalid api key"),
             "{error:?}"
         );
 
         assert_eq!(
             err(classify(403, r#"{"result":"error"}"#)).code,
-            PluginErrorCode::AuthFailed
+            PluginErrorCode::from(codes::INVALID_API_KEY)
         );
     }
 
     /// Sonarr swallows a 400 (`NotifiarrProxy.cs:181-185`) and the June port
-    /// turned it into `success: true`. It is a failed delivery.
+    /// turned it into `success: true`. It is an integration that is off or
+    /// unassigned on notifiarr.com.
     #[test]
-    fn a_400_is_a_reported_delivery_failure_carrying_notifiarrs_own_text() {
-        let response = ok(classify(
+    fn a_400_is_invalid_config_pointing_at_the_integration() {
+        let error = err(classify(
             400,
             r#"{"result":"error","details":{"response":"passthrough integration not enabled"}}"#,
         ));
-        assert!(!response.success);
-        assert_eq!(response.provider_status.as_deref(), Some("http_400"));
-        let error = response.error.unwrap();
+        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
         assert!(
-            error.contains("passthrough integration not enabled"),
-            "{error}"
+            error
+                .public_message
+                .contains("Passthrough integration on notifiarr.com"),
+            "{error:?}"
         );
+        assert!(error.public_message.contains("channel_id"), "{error:?}");
         assert!(
-            error.contains("Passthrough integration on notifiarr.com"),
-            "{error}"
+            error
+                .debug_message
+                .as_deref()
+                .unwrap()
+                .contains("passthrough integration not enabled"),
+            "{error:?}"
         );
     }
 
     #[test]
     fn a_400_on_the_sonarr_integration_points_at_the_sonarr_integration() {
-        let response = ok(classify_response(
+        let error = err(classify_response(
             400,
             &BTreeMap::new(),
             br#"{"result":"error","details":{"response":"no"}}"#,
@@ -3394,38 +3363,47 @@ mod tests {
             Vec::new(),
         ));
         assert!(
-            response
-                .error
-                .as_deref()
-                .unwrap()
+            error
+                .public_message
                 .contains("Sonarr integration on notifiarr.com"),
-            "{response:?}"
+            "{error:?}"
         );
-        assert_eq!(response.target_results[0].target, "notifiarr:sonarr");
     }
 
     /// `NotifiarrProxy.cs:186-196` — Notifiarr down, then Cloudflare's own
     /// five-hundreds.
     #[test]
-    fn service_and_cloudflare_failures_stay_on_the_delivery_lane() {
+    fn service_and_cloudflare_failures_are_upstream_unavailable() {
         for status in [502, 503, 504] {
-            let response = ok(classify(status, r#"{"result":"error"}"#));
-            assert!(!response.success);
+            let error = err(classify(status, r#"{"result":"error"}"#));
+            assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
             assert!(
-                response.error.as_deref().unwrap().contains("unavailable"),
-                "{status}: {response:?}"
+                error
+                    .debug_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("unavailable"),
+                "{status}: {error:?}"
             );
         }
         for status in [520, 521, 522, 523, 524] {
-            let response = ok(classify(status, r#"{"result":"error"}"#));
-            assert!(!response.success);
+            let headers = BTreeMap::from([("Retry-After".to_string(), "15".to_string())]);
+            let error = err(classify_response(
+                status,
+                &headers,
+                br#"{"result":"error"}"#,
+                &Settings::passthrough(),
+                Vec::new(),
+            ));
+            assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+            assert_eq!(error.retry_after_seconds, Some(15));
             assert!(
-                response.error.as_deref().unwrap().contains("Cloudflare"),
-                "{status}: {response:?}"
-            );
-            assert_eq!(
-                response.provider_status.as_deref(),
-                Some(format!("http_{status}").as_str())
+                error
+                    .debug_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("Cloudflare"),
+                "{status}: {error:?}"
             );
         }
     }
@@ -3434,40 +3412,37 @@ mod tests {
     /// client special-cases exactly this (`website.go:53-60`).
     #[test]
     fn a_cloudflare_html_page_is_blamed_on_the_edge_not_on_the_api_key() {
-        let response = ok(classify(
+        let error = err(classify(
             400,
             "<html><title>Attention Required!</title></html>",
         ));
-        assert!(!response.success);
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
         assert!(
-            response
-                .error
-                .as_deref()
-                .unwrap()
+            error
+                .public_message
                 .contains("something in front of Notifiarr"),
-            "{response:?}"
+            "{error:?}"
         );
     }
 
     #[test]
-    fn a_429_reports_the_retry_after_the_core_can_act_on() {
+    fn a_429_is_rate_limited_with_the_retry_after_the_core_can_act_on() {
         let headers = BTreeMap::from([("Retry-After".to_string(), "90".to_string())]);
-        let response = ok(classify_response(
+        let error = err(classify_response(
             429,
             &headers,
             br#"{"result":"error","details":{"response":"rate limited"}}"#,
             &Settings::passthrough(),
             Vec::new(),
         ));
-        assert!(!response.success);
-        assert_eq!(response.retry_after_seconds, Some(90));
-        assert_eq!(response.provider_status.as_deref(), Some("http_429"));
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(90));
     }
 
     #[test]
-    fn a_404_names_the_integration_setting() {
+    fn a_404_is_an_endpoint_not_found_naming_the_integration() {
         let error = err(classify(404, r#"{"result":"error"}"#));
-        assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+        assert_eq!(error.code, PluginErrorCode::from(codes::ENDPOINT_NOT_FOUND));
         assert!(error.public_message.contains("passthrough"), "{error:?}");
     }
 

@@ -474,7 +474,10 @@ fn errors_map_to_host_failure_classes() {
         assert_no_secrets(&rejected);
     }
     let missing = person(404, &[], r#"{"status_code": 34}"#);
-    assert_eq!(missing.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        missing.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(missing.public_message.contains("not found"));
     let limited = person(429, &[("Retry-After", "30")], "");
     assert_eq!(
@@ -487,7 +490,7 @@ fn errors_map_to_host_failure_classes() {
     );
     assert_eq!(
         person(200, &[], "not json").code,
-        PluginErrorCode::Permanent
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::INVALID_RESPONSE)
     );
 
     let http = RecordedHttp::new();
@@ -1018,7 +1021,10 @@ fn a_rejected_member_token_is_an_expired_account() {
         401,
         r#"{"status_code": 39, "status_message": "This resource is private."}"#,
     );
-    assert_eq!(private.code, PluginErrorCode::Permanent);
+    assert_eq!(
+        private.code,
+        PluginErrorCode::from(scryer_plugin_pdk::error::codes::ITEM_NOT_FOUND)
+    );
     assert!(private.public_message.contains("not found"));
     let missing = own_list(404, r#"{"status_code": 34}"#);
     assert!(missing.public_message.contains("not found"));
@@ -1045,7 +1051,7 @@ fn a_rejected_member_token_is_an_expired_account() {
 
     let limited = watchlist(429, &[("Retry-After", "12")], "");
     assert_eq!(
-        (limited.code, limited.retry_after_seconds),
+        (limited.code.clone(), limited.retry_after_seconds),
         (PluginErrorCode::RateLimited, Some(12))
     );
     assert_eq!(
@@ -1380,4 +1386,25 @@ fn an_unreadable_first_list_leaves_the_account_unnamed_by_it() {
         assert!(linked.display_name.is_none() && linked.avatar_url.is_none());
         assert_eq!(linked.owned_lists.len(), 1);
     }
+}
+
+#[test]
+fn a_rejected_member_token_is_auth_failed_with_tmdbs_reason_in_debug_only() {
+    // `auth_failed`, not `invalid_api_key`: the host expires the linked
+    // account and asks for a reconnect only on this well-known code.
+    let http = RecordedHttp::new().with(
+        &v3("/person/4400?append_to_response=combined_credits"),
+        401,
+        r#"{"status_code": 7, "status_message": "Invalid API key: fixture"}"#,
+    );
+    let rejected = err(fetch(
+        &http,
+        request("person", &[("person_id", "4400")], None),
+    ));
+    assert_eq!(rejected.code, PluginErrorCode::AuthFailed);
+    assert!(!rejected.public_message.contains("401"));
+    assert!(!rejected.public_message.contains("Invalid API key"));
+    let debug = rejected.debug_message.as_deref().unwrap();
+    assert!(debug.ends_with("HTTP 401, TMDb status_code 7"), "{debug}");
+    assert_no_secrets(&rejected);
 }
