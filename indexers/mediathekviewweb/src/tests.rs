@@ -147,10 +147,7 @@ fn ids(results: &[PluginSearchResult]) -> Vec<String> {
         .collect()
 }
 
-fn resources_of<'a>(
-    result: &'a PluginSearchResult,
-    role: HttpResourceRole,
-) -> Vec<&'a PluginHttpResource> {
+fn resources_of(result: &PluginSearchResult, role: HttpResourceRole) -> Vec<&PluginHttpResource> {
     result
         .http
         .as_ref()
