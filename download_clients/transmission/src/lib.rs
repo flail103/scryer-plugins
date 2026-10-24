@@ -1135,10 +1135,10 @@ fn rpc_result_error(method: &str, result: &str, body: &str) -> PluginError {
 }
 
 fn looks_like_html(body: &str) -> bool {
-    let start = body.trim_start();
-    let start = &start[..start.len().min(64)];
-    let start = start.to_ascii_lowercase();
-    start.starts_with("<!doctype html") || start.starts_with("<html")
+    // Bytes, not `str`: byte 64 can fall inside a multibyte character.
+    let start = body.trim_start().as_bytes();
+    let start = start[..start.len().min(64)].to_ascii_lowercase();
+    start.starts_with(b"<!doctype html") || start.starts_with(b"<html")
 }
 
 /// The host runs plugin HTTP with `redirect::Policy::none()`
@@ -1187,6 +1187,7 @@ fn classify_http_status(
             .retry_after_seconds(
                 retry_after
                     .and_then(|value| value.trim().parse::<i64>().ok())
+                    .filter(|seconds| *seconds >= 0)
                     .unwrap_or(60),
             )
             .build(),
@@ -2823,6 +2824,13 @@ mod tests {
                 .retry_after_seconds,
             Some(15)
         );
+        assert_eq!(
+            classify_http_status(429, None, Some("-1"), "")
+                .unwrap()
+                .retry_after_seconds,
+            Some(60),
+            "a negative delay is malformed and falls back to the default"
+        );
 
         // Sonarr's 403 names the RPC whitelist, which is the actual fix.
         assert!(
@@ -2848,6 +2856,9 @@ mod tests {
         assert!(!other.public_message.contains("no such torrent"));
         assert!(looks_like_html("<!DOCTYPE html><html>"));
         assert!(!looks_like_html("{\"result\":\"success\"}"));
+        // Byte 64 lands inside a three-byte character.
+        let multibyte = format!("{}\u{3000}tail", "x".repeat(63));
+        assert!(!looks_like_html(&multibyte));
     }
 
     #[test]

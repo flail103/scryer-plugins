@@ -785,9 +785,11 @@ pub fn redact_secrets(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(separator) = rest.find("://") {
+        // Past the whole delimiter: it may be multibyte punctuation such as `：`.
         let scheme_start = rest[..separator]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-            .map_or(0, |index| index + 1);
+            .char_indices()
+            .rfind(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |(index, c)| index + c.len_utf8());
         if scheme_start == separator {
             // `://` with no scheme in front of it is not a URL.
             out.push_str(&rest[..separator + 3]);
@@ -968,6 +970,14 @@ mod tests {
         assert_eq!(
             redact_secrets("GET https://operator:hunter2@example.invalid/api failed"),
             "GET https://<redacted>@example.invalid/api failed"
+        );
+    }
+
+    #[test]
+    fn a_url_after_multibyte_punctuation_is_still_redacted() {
+        assert_eq!(
+            redact_secrets("Request failed：https://example.invalid/?token=secret"),
+            "Request failed：https://example.invalid/?token=<redacted>"
         );
     }
 

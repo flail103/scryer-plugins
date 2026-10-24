@@ -50,8 +50,6 @@ struct RTorrentTorrent {
     finished_time: i64,
     /// `d.is_private=`; `None` when the rTorrent build did not return the column.
     is_private: Option<bool>,
-    /// `d.timestamp.started=`; `0` until the torrent has been started.
-    started_time: i64,
 }
 
 impl RTorrentTorrent {
@@ -648,10 +646,6 @@ fn list_torrents(config: &RTorrentConfig) -> Result<Vec<RTorrentTorrent>, Error>
             XmlValue::String("d.timestamp.finished=".to_string()),
             // Appended last so older rTorrent builds that omit it keep parsing.
             XmlValue::String("d.is_private=".to_string()),
-            // When the torrent was started in this session; rTorrent 0.9's
-            // nearest thing to an add time (`d.creation_date` is the
-            // metainfo's own creation date, not the add).
-            XmlValue::String("d.timestamp.started=".to_string()),
         ],
     )?;
     parse_torrents(&response)
@@ -774,7 +768,6 @@ fn parse_torrents(xml: &str) -> Result<Vec<RTorrentTorrent>, Error> {
             is_finished: parse_i64(values[11]) != 0,
             finished_time: parse_i64(values[12]),
             is_private: values.get(13).map(|value| parse_i64(*value) != 0),
-            started_time: values.get(14).map(|value| parse_i64(*value)).unwrap_or(0),
         });
     }
     Ok(out)
@@ -841,7 +834,9 @@ fn torrent_to_item(torrent: RTorrentTorrent) -> PluginDownloadItem {
             torrent.is_active, torrent.is_finished
         )),
         completed_at: (torrent.finished_time > 0).then(|| torrent.finished_time.to_string()),
-        added_at: (torrent.started_time > 0).then(|| torrent.started_time.to_string()),
+        // rTorrent keeps no add time: `d.timestamp.started` is when the
+        // torrent was last started and `d.creation_date` is the metainfo's own.
+        added_at: None,
         http: None,
     }
 }

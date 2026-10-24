@@ -289,7 +289,10 @@ impl HttpStatusError {
     pub fn new(status: u16, retry_after: Option<&str>) -> Self {
         Self {
             status,
-            retry_after_seconds: retry_after.and_then(|value| value.trim().parse::<i64>().ok()),
+            // Delta-seconds cannot be negative; a malformed `-1` is no delay at all.
+            retry_after_seconds: retry_after
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .filter(|seconds| *seconds >= 0),
         }
     }
 }
@@ -529,9 +532,11 @@ pub fn redact_secrets(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(separator) = rest.find("://") {
+        // Past the whole delimiter: it may be multibyte punctuation such as `：`.
         let scheme_start = rest[..separator]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-            .map_or(0, |index| index + 1);
+            .char_indices()
+            .rfind(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |(index, c)| index + c.len_utf8());
         if scheme_start == separator {
             // `://` with no scheme in front of it is not a URL.
             out.push_str(&rest[..separator + 3]);
@@ -740,6 +745,10 @@ mod tests {
 
         let error =
             classify(check_http_status(429, Some("Wed, 21 Oct 2026 07:28:00 GMT")).unwrap_err());
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, None);
+
+        let error = classify(check_http_status(429, Some("-1")).unwrap_err());
         assert_eq!(error.code, PluginErrorCode::RateLimited);
         assert_eq!(error.retry_after_seconds, None);
     }
@@ -966,6 +975,14 @@ mod tests {
         assert_eq!(
             redact_secrets("GET https://operator:hunter2@example.invalid/api failed"),
             "GET https://<redacted>@example.invalid/api failed"
+        );
+    }
+
+    #[test]
+    fn a_url_after_multibyte_punctuation_is_still_redacted() {
+        assert_eq!(
+            redact_secrets("Request failed：https://example.invalid/?token=secret"),
+            "Request failed：https://example.invalid/?token=<redacted>"
         );
     }
 

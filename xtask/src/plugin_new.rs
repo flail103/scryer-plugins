@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     PluginKindArg, PluginNewArgs, SdkDependency, TaskContext, current_sdk_dependency, ok,
-    package_version, repo_cargo_command_in, run_checked,
+    read_manifest_document, repo_cargo_command_in, run_checked,
 };
 
 const NOTIFICATION_LIB_RS_TEMPLATE: &str =
@@ -61,10 +61,6 @@ const SUBTITLE_WIT_PACKAGES: [&str; 3] = ["host-v1.0.0", "runtime-v1.0.0", "subt
 const COMPONENT_MIN_SCRYER_VERSION: &str = "0.21.21";
 
 const WIT_BINDGEN_VERSION: &str = "0.61";
-/// The PDK manifest whose version a scaffold depends on. Plugins take the PDK
-/// from crates.io like any third-party plugin; the in-tree manifest only says
-/// which published release is current.
-const PDK_MANIFEST: &str = "pdk/scryer-plugin-pdk/Cargo.toml";
 const CONFORMANCE_PATH_FROM_PLUGIN: &str = "../../pdk/scryer-plugin-conformance";
 
 pub(crate) fn run_plugin_new(ctx: &TaskContext, args: PluginNewArgs) -> Result<()> {
@@ -93,7 +89,7 @@ fn scaffold_plugin(
             plugin_dir.join("Cargo.toml"),
             spec.render_manifest(
                 &current_sdk_dependency(ctx)?,
-                &current_pdk_version(repo_root)?,
+                &current_pdk_version(repo_root, spec.kind)?,
             ),
         )?;
         fs::write(plugin_dir.join("src/lib.rs"), spec.render_lib_rs()?)?;
@@ -114,11 +110,22 @@ fn scaffold_plugin(
     Ok(plugin_dir)
 }
 
-/// The published PDK release a scaffold depends on, read from the PDK manifest.
-fn current_pdk_version(repo_root: &Path) -> Result<String> {
-    let manifest = repo_root.join(PDK_MANIFEST);
-    package_version(&manifest)
-        .with_context(|| format!("failed to read the PDK version from {}", manifest.display()))
+/// The published PDK release a scaffold depends on: the one the family's
+/// reference plugin takes from crates.io. Plugins take the PDK from crates.io
+/// like any third-party plugin, and the in-tree PDK manifest runs ahead of
+/// crates.io while a PDK release is pending.
+fn current_pdk_version(repo_root: &Path, kind: PluginKindArg) -> Result<String> {
+    let manifest = repo_root.join(kind.reference_plugin()).join("Cargo.toml");
+    let document = read_manifest_document(&manifest)?;
+    document["dependencies"]["scryer-plugin-pdk"]
+        .as_str()
+        .map(|version| version.trim().to_string())
+        .with_context(|| {
+            format!(
+                "{} must depend on a published scryer-plugin-pdk version",
+                manifest.display()
+            )
+        })
 }
 
 /// Check the canonical contracts before generating references to them.
@@ -708,14 +715,22 @@ mod tests {
         )
         .expect("write xtask manifest");
 
-        // The scaffold takes its PDK version from the PDK manifest.
-        fs::create_dir_all(ctx.repo_root.join("pdk/scryer-plugin-pdk")).expect("create pdk dir");
-        fs::write(
-            ctx.repo_root.join(PDK_MANIFEST),
-            include_str!("../../pdk/scryer-plugin-pdk/Cargo.toml"),
-        )
-        .expect("write pdk manifest");
-        let pdk_version = current_pdk_version(&ctx.repo_root).expect("read pdk version");
+        // The scaffold takes its PDK version from the family's reference
+        // plugin, so the temp repo carries the real manifests.
+        for (reference, manifest) in [
+            (
+                PluginKindArg::Notification.reference_plugin(),
+                include_str!("../../notifications/gotify/Cargo.toml"),
+            ),
+            (
+                PluginKindArg::Subtitle.reference_plugin(),
+                include_str!("../../subtitles/opensubtitles/Cargo.toml"),
+            ),
+        ] {
+            fs::create_dir_all(ctx.repo_root.join(reference)).expect("create reference dir");
+            fs::write(ctx.repo_root.join(reference).join("Cargo.toml"), manifest)
+                .expect("write reference manifest");
+        }
 
         // Only the PDK supplies contracts; no sibling plugin is needed.
         for (kind, packages) in [
@@ -739,6 +754,8 @@ mod tests {
             let plugin_name = format!("Scaffold Test {seed}");
             let plugin_dir =
                 scaffold_plugin(&ctx, &ctx.repo_root, kind, &plugin_name).expect("scaffold plugin");
+            let pdk_version =
+                current_pdk_version(&ctx.repo_root, kind).expect("read reference pdk version");
 
             let cargo_toml = plugin_dir.join("Cargo.toml");
             let lib_rs = plugin_dir.join("src/lib.rs");

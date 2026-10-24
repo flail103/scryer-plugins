@@ -60,6 +60,8 @@ fn build_descriptor() -> PluginDescriptor {
             capabilities: NotificationCapabilities::default(),
             config_fields: vec![],
         }),
+        // Installation-wide settings, shared by every instance of the plugin.
+        settings: vec![],
     }
 }
 
