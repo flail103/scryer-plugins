@@ -24,7 +24,10 @@ use scryer_plugin_conformance::subtitle::{SubtitleConformance, call_subtitle, in
 use scryer_plugin_conformance::{HttpReply, HttpRoute};
 use scryer_plugin_sdk::PluginErrorCode;
 use scryer_plugin_sdk::command::{PluginSubtitleCommand, PluginSubtitleCommandResult};
-use scryer_plugin_sdk::{PluginResult, SubtitlePluginSearchRequest, SubtitleQueryMediaKind};
+use scryer_plugin_sdk::{
+    IndexerSearchIncompleteReason, IndexerSearchPluginError, PluginErrorDetails, PluginResult,
+    SubtitlePluginSearchRequest, SubtitleQueryMediaKind,
+};
 
 const BASE_URL: &str = "https://amenzb.test";
 const API_ENDPOINT: &str = "https://amenzb.test/api";
@@ -149,6 +152,53 @@ fn a_rejected_api_key_is_reported_as_invalid_api_key() {
         "{error:?}"
     );
     assert!(!error.public_message.contains(TEST_API_KEY), "{error:?}");
+}
+
+/// An upstream throttle reaches Scryer as the shared engine's typed deferral,
+/// with the upstream's `Retry-After` as the delay, instead of an empty result
+/// set the host would answer by searching again at once. A `Retry-After`
+/// longer than the plugin's retry budget is not waited out in the call, so the
+/// API is asked exactly once.
+#[test]
+fn an_upstream_throttle_is_a_typed_deferral_with_its_retry_after() {
+    let suite = suite();
+    let script = suite.script_with_routes(vec![HttpRoute::contains(
+        API_ENDPOINT,
+        HttpReply::new(429, Vec::new()).with_header("retry-after", "60"),
+    )]);
+    let (mut store, plugin) = instantiate(&suite.wasm_path(), script);
+
+    let result = call_subtitle(
+        &mut store,
+        &plugin,
+        PluginSubtitleCommand::Search(search_request()),
+    );
+    let PluginSubtitleCommandResult::Search(PluginResult::Err(error)) = result else {
+        panic!("a throttled search must be a typed search error: {result:?}");
+    };
+    assert_eq!(error.code, PluginErrorCode::RateLimited, "{error:?}");
+    assert_eq!(error.retry_after_seconds, Some(60), "{error:?}");
+    assert!(
+        matches!(
+            error.details,
+            Some(PluginErrorDetails::IndexerSearch(
+                IndexerSearchPluginError::Deferred {
+                    reason: IndexerSearchIncompleteReason::RateLimited,
+                    retry_after_seconds: Some(60),
+                }
+            ))
+        ),
+        "{error:?}"
+    );
+
+    let api_calls = store
+        .data()
+        .script
+        .urls
+        .iter()
+        .filter(|url| url.starts_with(&format!("{API_ENDPOINT}?")))
+        .count();
+    assert_eq!(api_calls, 1, "{:?}", store.data().script.urls);
 }
 
 fn query_pairs(url: &str) -> Vec<(String, String)> {
