@@ -1502,6 +1502,7 @@ async fn execute_rss_search(
     let mut last_limits = ApiLimits::default();
     let mut completed_page = false;
     let mut ceiling_search_types: Vec<&'static str> = Vec::new();
+    let mut limit_search_types: Vec<&'static str> = Vec::new();
     let mut out_of_time_search_types: Vec<&'static str> = Vec::new();
 
     for &search_type in &search_types {
@@ -1649,6 +1650,7 @@ async fn execute_rss_search(
                 reached_marker
             );
             last_limits = limits;
+            let oldest_published_at = rss_page_oldest_published_at(&page_results);
             for result in page_results {
                 if seen_identities.insert(PluginRssCatchUp::identity_of(&result).to_string()) {
                     all_results.push(result);
@@ -1657,6 +1659,15 @@ async fn execute_rss_search(
             completed_page = true;
 
             if catch_up.is_none() || reached_marker || page_count < page_size {
+                break;
+            }
+            if rss_catch_up_limit_ends_paging(
+                req.limit,
+                all_results.len(),
+                oldest_published_at,
+                rss_now_epoch_seconds(),
+            ) {
+                limit_search_types.push(search_type);
                 break;
             }
             if page + 1 == max_pages {
@@ -1682,6 +1693,22 @@ async fn execute_rss_search(
             format!(
                 "Newznab RSS catch-up stopped before the operation deadline without reaching the last-seen release for t={}",
                 out_of_time_search_types.join(",")
+            ),
+        ));
+    }
+
+    if !limit_search_types.is_empty() {
+        return Err(incomplete_newznab_search_error(
+            newznab_search_response(all_results, &last_limits),
+            IndexerSearchIncompleteReason::PageCeilingReached,
+            None,
+            completed_page,
+            None,
+            format!(
+                "Newznab RSS catch-up reached the requested {}-result limit on releases older than {}h before the last-seen release for t={}",
+                req.limit,
+                RSS_CATCH_UP_LIMIT_MIN_AGE_SECONDS / 3_600,
+                limit_search_types.join(",")
             ),
         ));
     }
@@ -1811,6 +1838,44 @@ fn offset_page_params(additional_params: &str, offset: usize) -> String {
     } else {
         format!("{additional_params}&offset={offset}")
     }
+}
+
+/// How old the oldest release on a catch-up page must be before the request's
+/// result limit may end the walk short of the marker.
+const RSS_CATCH_UP_LIMIT_MIN_AGE_SECONDS: i64 = 24 * 60 * 60;
+
+/// The oldest readable publish time on one RSS page, in Unix seconds.
+fn rss_page_oldest_published_at(page: &[SearchResult]) -> Option<i64> {
+    page.iter()
+        .filter_map(|result| result.published_at.as_deref())
+        .filter_map(parse_publish_epoch_seconds)
+        .min()
+}
+
+/// The host's wall clock in Unix seconds, read through the installed runtime.
+fn rss_now_epoch_seconds() -> i64 {
+    i64::try_from(component::wall_now_ms() / 1_000).unwrap_or(i64::MAX)
+}
+
+/// Whether a catch-up walk that has not reached its marker stops at the
+/// request's result limit.
+///
+/// A limit of zero sets no limit. Reaching the limit ends the walk only once
+/// the page just read reaches back more than a day: a backlog that is still
+/// all recent keeps paging toward the marker, a short page or the configured
+/// ceiling, so a burst of new releases is not cut short. A page with no
+/// readable publish time does not end the walk.
+fn rss_catch_up_limit_ends_paging(
+    limit: usize,
+    collected: usize,
+    oldest_published_at: Option<i64>,
+    now_epoch_seconds: i64,
+) -> bool {
+    limit > 0
+        && collected >= limit
+        && oldest_published_at.is_some_and(|oldest| {
+            oldest < now_epoch_seconds.saturating_sub(RSS_CATCH_UP_LIMIT_MIN_AGE_SECONDS)
+        })
 }
 
 /// Whether the operation deadline leaves room to read one more catch-up page.
@@ -8583,6 +8648,8 @@ mod tests {
             requests: Vec<(String, Option<usize>)>,
             /// Every requested URL, capability probes included, in order.
             urls: Vec<String>,
+            /// The wall clock the scripted host reports, in Unix milliseconds.
+            wall_now_ms: u64,
         }
 
         thread_local! {
@@ -8670,7 +8737,10 @@ mod tests {
             }
 
             fn wall_now_ms(&self) -> u64 {
-                0
+                SCRIPT.with(|script| {
+                    let script = script.borrow();
+                    if script.active { script.wall_now_ms } else { 0 }
+                })
             }
 
             fn config_get(&self, _key: &str) -> Option<String> {
@@ -8926,6 +8996,117 @@ mod tests {
 
             assert_eq!(requests(), tv_offsets(&[0, PAGE_SIZE]));
             assert_eq!(response.results.len(), PAGE_SIZE + 1);
+        }
+
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+
+        fn set_wall_clock(now_ms: u64) {
+            SCRIPT.with(|script| script.borrow_mut().wall_now_ms = now_ms);
+        }
+
+        fn limited_request(limit: usize, catch_up: PluginRssCatchUp) -> SearchRequest {
+            SearchRequest {
+                limit,
+                ..rss_request(&["5000"], Some(catch_up))
+            }
+        }
+
+        fn never_served_marker() -> PluginRssCatchUp {
+            marker(DISTANT_PAST, Some("guid-never-served".to_string()))
+        }
+
+        fn assert_page_ceiling(error: &Error, expected_results: usize) {
+            match indexer_search_details(error) {
+                IndexerSearchPluginError::PartialResults {
+                    response, reason, ..
+                } => {
+                    assert_eq!(reason, IndexerSearchIncompleteReason::PageCeilingReached);
+                    assert_eq!(response.results.len(), expected_results);
+                }
+                other => panic!("expected partial results, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn the_limit_on_day_old_releases_stops_catch_up_and_reports_the_gap() {
+            install_script();
+            serve_full_pages("tvsearch", 6);
+            set_wall_clock(NEWEST_PUBLISHED_AT * 1_000 + 48 * HOUR_MS);
+            let request = limited_request(PAGE_SIZE + PAGE_SIZE / 2, never_served_marker());
+
+            let error = run(&config(10), &request).expect_err("the limit ends the walk early");
+
+            assert_eq!(requests(), tv_offsets(&[0, PAGE_SIZE]));
+            assert_page_ceiling(&error, 2 * PAGE_SIZE);
+        }
+
+        #[test]
+        fn the_limit_on_recent_releases_keeps_paging() {
+            install_script();
+            serve_full_pages("tvsearch", 3);
+            serve_page("tvsearch", 3 * PAGE_SIZE, &[3 * PAGE_SIZE]);
+            set_wall_clock(NEWEST_PUBLISHED_AT * 1_000 + HOUR_MS);
+            let request = limited_request(PAGE_SIZE + PAGE_SIZE / 2, never_served_marker());
+
+            let response = run(&config(10), &request).expect("a short page completes the run");
+
+            assert_eq!(
+                requests(),
+                tv_offsets(&[0, PAGE_SIZE, 2 * PAGE_SIZE, 3 * PAGE_SIZE])
+            );
+            assert_eq!(response.results.len(), 3 * PAGE_SIZE + 1);
+        }
+
+        #[test]
+        fn no_limit_pages_to_the_marker() {
+            install_script();
+            serve_full_pages("tvsearch", 6);
+            set_wall_clock(NEWEST_PUBLISHED_AT * 1_000 + 48 * HOUR_MS);
+            let request = limited_request(0, marker(DISTANT_PAST, Some(guid("tvsearch", 7))));
+
+            let response = run(&config(10), &request).expect("caught-up run completes");
+
+            assert_eq!(requests(), tv_offsets(&[0, PAGE_SIZE, 2 * PAGE_SIZE]));
+            assert_eq!(response.results.len(), 3 * PAGE_SIZE);
+        }
+
+        #[test]
+        fn a_limit_above_the_feed_ends_on_the_short_page_without_a_gap() {
+            install_script();
+            serve_full_pages("tvsearch", 2);
+            serve_page("tvsearch", 2 * PAGE_SIZE, &[2 * PAGE_SIZE]);
+            set_wall_clock(NEWEST_PUBLISHED_AT * 1_000 + 48 * HOUR_MS);
+            let request = limited_request(100 * PAGE_SIZE, never_served_marker());
+
+            let response = run(&config(10), &request).expect("a short page completes the run");
+
+            assert_eq!(requests(), tv_offsets(&[0, PAGE_SIZE, 2 * PAGE_SIZE]));
+            assert_eq!(response.results.len(), 2 * PAGE_SIZE + 1);
+        }
+
+        #[test]
+        fn the_limit_counts_results_across_search_types() {
+            install_script();
+            serve_full_pages("movie", 6);
+            serve_full_pages("tvsearch", 6);
+            set_wall_clock(NEWEST_PUBLISHED_AT * 1_000 + 48 * HOUR_MS);
+            let request = SearchRequest {
+                limit: PAGE_SIZE + PAGE_SIZE / 2,
+                ..rss_request(&["2000", "5000"], Some(never_served_marker()))
+            };
+
+            let error = run(&config(10), &request).expect_err("the limit ends both walks");
+
+            assert_eq!(
+                requests(),
+                vec![
+                    ("movie".to_string(), Some(0)),
+                    ("movie".to_string(), Some(PAGE_SIZE)),
+                    ("tvsearch".to_string(), Some(0)),
+                ],
+                "each feed keeps its newest page; the shared limit stops further pages"
+            );
+            assert_page_ceiling(&error, 3 * PAGE_SIZE);
         }
 
         #[test]

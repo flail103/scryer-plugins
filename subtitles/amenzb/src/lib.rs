@@ -14,8 +14,9 @@ use scryer_plugin_pdk::runtime::{self, PluginHttpRequest};
 use scryer_plugin_pdk::{Error, PluginSubtitleCommand, PluginSubtitleCommandResult, var};
 use scryer_plugin_pdk::{codes, plugin_error as pdk_error};
 use scryer_plugin_sdk::{
-    ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource, PluginDescriptor,
-    PluginError, PluginErrorCode, PluginResult, ProviderDescriptor, SDK_VERSION,
+    ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource,
+    IndexerSearchIncompleteReason, IndexerSearchPluginError, PluginDescriptor, PluginError,
+    PluginErrorCode, PluginErrorDetails, PluginResult, ProviderDescriptor, SDK_VERSION,
     SubtitleCapabilities, SubtitleDescriptor, SubtitleMatchHint, SubtitleMatchHintKind,
     SubtitlePluginCandidate, SubtitlePluginDownloadRequest, SubtitlePluginDownloadResponse,
     SubtitlePluginSearchRequest, SubtitlePluginSearchResponse,
@@ -66,10 +67,7 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
             PluginSubtitleCommandResult::ValidateConfig(PluginResult::Ok(validate_config()))
         }
         PluginSubtitleCommand::Search(request) => {
-            PluginSubtitleCommandResult::Search(match search(&request).await {
-                Ok(response) => PluginResult::Ok(response),
-                Err(error) => PluginResult::Err(plugin_error(error)),
-            })
+            PluginSubtitleCommandResult::Search(search_outcome(search(&request).await))
         }
         PluginSubtitleCommand::Download(request) => {
             PluginSubtitleCommandResult::Download(match download(&request).await {
@@ -129,24 +127,65 @@ fn validate_config() -> SubtitlePluginValidateConfigResponse {
 
 async fn search(
     request: &SubtitlePluginSearchRequest,
-) -> Result<SubtitlePluginSearchResponse, AmenzbError> {
+) -> Result<Vec<SubtitlePluginCandidate>, AmenzbError> {
     let config = AmenzbConfig::from_host().map_err(AmenzbError::Message)?;
-    match subtitle_search_impl(&config, request).await {
-        Ok(results) => Ok(SubtitlePluginSearchResponse { results }),
-        // A rate limit still yields an empty result set rather than a failure,
-        // exactly as it did before the move: the host treats "no subtitles right
-        // now" as a normal outcome and re-queries later.
-        Err(AmenzbError::RateLimited(_)) => Ok(SubtitlePluginSearchResponse::default()),
-        // An used-up request allowance is the same "not right now" for search;
-        // the engine reports it as `quota_exceeded` where it used to say
-        // `RateLimited`.
-        Err(AmenzbError::Plugin(error))
-            if error.code == PluginErrorCode::from(codes::QUOTA_EXCEEDED) =>
-        {
-            Ok(SubtitlePluginSearchResponse::default())
+    subtitle_search_impl(&config, request).await
+}
+
+/// What a search answers across the component boundary.
+///
+/// A pacing failure that carries a retry delay or typed details (the engine's
+/// deadline deferral, an upstream 429 with its `Deferred` detail) is returned
+/// unchanged, so the host can cool this provider down for the delay instead of
+/// calling it again at once. Only an unstructured "not right now" (the local
+/// hit budget, a 429 the engine could not describe further) still answers with
+/// no candidates.
+fn search_outcome(
+    outcome: Result<Vec<SubtitlePluginCandidate>, AmenzbError>,
+) -> PluginResult<SubtitlePluginSearchResponse> {
+    match outcome {
+        Ok(results) => PluginResult::Ok(SubtitlePluginSearchResponse { results }),
+        Err(AmenzbError::RateLimited(_)) => {
+            PluginResult::Ok(SubtitlePluginSearchResponse::default())
         }
-        Err(error) => Err(error),
+        // A used-up request allowance with no pacing structure is the same
+        // "not right now"; the engine reports it as `quota_exceeded`.
+        Err(AmenzbError::Plugin(error))
+            if error.code == PluginErrorCode::from(codes::QUOTA_EXCEEDED)
+                && !carries_pacing(&error) =>
+        {
+            PluginResult::Ok(SubtitlePluginSearchResponse::default())
+        }
+        Err(error) => PluginResult::Err(plugin_error(error)),
     }
+}
+
+/// Whether a classified error tells the host when to try again.
+fn carries_pacing(error: &PluginError) -> bool {
+    error.details.is_some() || error.retry_after_seconds.is_some()
+}
+
+/// An upstream 429 this plugin saw itself, in the shape the shared engine
+/// reports one: `RateLimited`, with the `Deferred` detail the host turns into
+/// a cooldown, and the upstream's `Retry-After` when it sent one.
+fn upstream_rate_limited(retry_after_seconds: Option<u64>) -> AmenzbError {
+    let retry_after_seconds =
+        retry_after_seconds.map(|seconds| i64::try_from(seconds).unwrap_or(i64::MAX));
+    let builder = pdk_error(PluginErrorCode::RateLimited, "ameNZB rate limit reached")
+        .debug("ameNZB answered HTTP 429")
+        .details(PluginErrorDetails::IndexerSearch(
+            IndexerSearchPluginError::Deferred {
+                reason: IndexerSearchIncompleteReason::RateLimited,
+                retry_after_seconds,
+            },
+        ));
+    AmenzbError::Plugin(
+        match retry_after_seconds {
+            Some(seconds) => builder.retry_after_seconds(seconds),
+            None => builder,
+        }
+        .build(),
+    )
 }
 
 async fn download(
@@ -368,14 +407,22 @@ async fn subtitle_search_impl(
         };
         detail_fetches += 1;
         let url = format!("{}/release/{release_id}", config.site_url());
+        // A throttle or deferral part-way through the detail pages keeps the
+        // candidates already found; with none found yet it is the answer.
         let page = match http_get_follow(&url, "text/html, */*", &behavior).await {
             Ok(page) => page,
             Err(AmenzbError::RateLimited(_)) => return Ok(results),
+            Err(AmenzbError::Plugin(error)) if carries_pacing(&error) && !results.is_empty() => {
+                return Ok(results);
+            }
             Err(error) => return Err(error),
         };
         if page.status >= 400 {
             if page.status == 429 {
-                return Err(AmenzbError::RateLimited(None));
+                if !results.is_empty() {
+                    return Ok(results);
+                }
+                return Err(upstream_rate_limited(retry_after_seconds(&page)));
             }
             continue;
         }
@@ -993,7 +1040,14 @@ async fn http_get_with_retry(
                 && attempt < behavior.retry_max_attempts.max(1)
                 && total_wait + delay <= behavior.retry_total_budget
             {
-                runtime::sleep(duration_ms(delay)).await;
+                // The host ends the invocation at its deadline, so a wait that
+                // cannot finish before it is not taken: the call ends with the
+                // PDK's typed deferral and its delay instead of a timeout.
+                if let Err(wait) = runtime::sleep_until_deadline(duration_ms(delay)).await {
+                    return Err(AmenzbError::from_search_error(
+                        runtime::deadline_deferred_error(wait),
+                    ));
+                }
                 total_wait += delay;
                 attempt += 1;
                 continue;
@@ -1597,24 +1651,20 @@ impl AmenzbError {
         // `None` a string match could only ever produce.
         if let Some(structured) = error.downcast_ref::<StructuredPluginError>() {
             let plugin_error = structured.plugin_error();
-            if plugin_error.code == PluginErrorCode::RateLimited {
-                return Self::RateLimited(
-                    plugin_error
-                        .retry_after_seconds
-                        .and_then(|seconds| u64::try_from(seconds).ok()),
-                );
+            // A bare rate limit with nothing to say about when to retry keeps
+            // the old "no candidates right now" answer.
+            if plugin_error.code == PluginErrorCode::RateLimited && !carries_pacing(plugin_error) {
+                return Self::RateLimited(None);
             }
-            // Everything else the engine classified (a rejected API key, a
-            // disabled account, an exhausted quota, an unreadable answer)
-            // reaches the operator with the engine's own code and sentence.
+            // Everything else the engine classified (a pacing deferral with its
+            // delay and details, a rejected API key, a disabled account, an
+            // exhausted quota, an unreadable answer) reaches the host with the
+            // engine's own code, sentence, delay and details.
             return Self::Plugin(plugin_error.clone());
         }
 
-        let message = error.to_string();
-        if is_hit_budget_exhausted_error(&error)
-            || message.contains("429")
-            || message.to_ascii_lowercase().contains("rate limit")
-        {
+        // The engine's own classifier for its local hit budget.
+        if is_hit_budget_exhausted_error(&error) {
             Self::RateLimited(None)
         } else {
             Self::Plugin(plugin_error_from(&error))
@@ -2350,6 +2400,156 @@ mod tests {
         let reset = advance_hit_budget_state(&budget, prior_hour, 3_600).expect("new hour resets");
         assert_eq!(reset.0.hourly_count, 1);
         assert_eq!(reset.0.daily_count, 2);
+    }
+
+    fn deferred_details(
+        error: &PluginError,
+    ) -> Option<(IndexerSearchIncompleteReason, Option<i64>)> {
+        match &error.details {
+            Some(PluginErrorDetails::IndexerSearch(IndexerSearchPluginError::Deferred {
+                reason,
+                retry_after_seconds,
+            })) => Some((*reason, *retry_after_seconds)),
+            _ => None,
+        }
+    }
+
+    fn search_error(outcome: PluginResult<SubtitlePluginSearchResponse>) -> PluginError {
+        match outcome {
+            PluginResult::Err(error) => error,
+            PluginResult::Ok(response) => {
+                panic!("expected a typed search error, got {response:?}")
+            }
+        }
+    }
+
+    fn assert_no_candidates(outcome: PluginResult<SubtitlePluginSearchResponse>) {
+        match outcome {
+            PluginResult::Ok(response) => assert!(response.results.is_empty(), "{response:?}"),
+            PluginResult::Err(error) => panic!("expected an empty search, got {error:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_deadline_deferral_reaches_the_component_boundary_intact() {
+        let deferral = runtime::deadline_deferred_error(runtime::DeadlineExceeded {
+            retry_after_ms: 29_001,
+        });
+
+        let error = search_error(search_outcome(Err(AmenzbError::from_search_error(
+            deferral,
+        ))));
+
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert_eq!(error.retry_after_seconds, Some(30));
+        assert_eq!(
+            deferred_details(&error),
+            Some((IndexerSearchIncompleteReason::RateLimited, Some(30)))
+        );
+    }
+
+    #[test]
+    fn local_retry_wait_past_the_deadline_defers_instead_of_sleeping() {
+        // No host runtime is installed under `cargo test`, so the operation
+        // deadline reads as already expired and any wait must defer.
+        let wait = block_on(runtime::sleep_until_deadline(30_000))
+            .expect_err("an expired deadline admits no wait");
+
+        let error = plugin_error(AmenzbError::from_search_error(
+            runtime::deadline_deferred_error(wait),
+        ));
+
+        assert_eq!(error.code, PluginErrorCode::UpstreamUnavailable);
+        assert_eq!(error.retry_after_seconds, Some(30));
+        assert_eq!(
+            deferred_details(&error),
+            Some((IndexerSearchIncompleteReason::RateLimited, Some(30)))
+        );
+    }
+
+    #[test]
+    fn engine_rate_limit_with_deferred_details_is_passed_through() {
+        let engine_error = pdk_error(PluginErrorCode::RateLimited, "synthetic throttle")
+            .retry_after_seconds(60)
+            .details(PluginErrorDetails::IndexerSearch(
+                IndexerSearchPluginError::Deferred {
+                    reason: IndexerSearchIncompleteReason::RateLimited,
+                    retry_after_seconds: Some(60),
+                },
+            ))
+            .into_error();
+
+        let error = search_error(search_outcome(Err(AmenzbError::from_search_error(
+            engine_error,
+        ))));
+
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.public_message, "synthetic throttle");
+        assert_eq!(error.retry_after_seconds, Some(60));
+        assert_eq!(
+            deferred_details(&error),
+            Some((IndexerSearchIncompleteReason::RateLimited, Some(60)))
+        );
+    }
+
+    #[test]
+    fn detail_page_429_reports_a_typed_deferral() {
+        let error = search_error(search_outcome(Err(upstream_rate_limited(Some(45)))));
+
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(45));
+        assert_eq!(
+            deferred_details(&error),
+            Some((IndexerSearchIncompleteReason::RateLimited, Some(45)))
+        );
+
+        let without_header = search_error(search_outcome(Err(upstream_rate_limited(None))));
+        assert_eq!(without_header.retry_after_seconds, None);
+        assert_eq!(
+            deferred_details(&without_header),
+            Some((IndexerSearchIncompleteReason::RateLimited, None))
+        );
+    }
+
+    #[test]
+    fn unstructured_pacing_still_answers_with_no_candidates() {
+        let bare_rate_limit =
+            pdk_error(PluginErrorCode::RateLimited, "synthetic throttle").into_error();
+        assert_no_candidates(search_outcome(Err(AmenzbError::from_search_error(
+            bare_rate_limit,
+        ))));
+
+        let bare_quota = pdk_error(codes::QUOTA_EXCEEDED, "synthetic allowance").into_error();
+        assert_no_candidates(search_outcome(Err(AmenzbError::from_search_error(
+            bare_quota,
+        ))));
+
+        assert_no_candidates(search_outcome(Err(AmenzbError::RateLimited(None))));
+    }
+
+    #[test]
+    fn plain_errors_map_as_before() {
+        let message = search_error(search_outcome(Err(AmenzbError::Message(
+            "synthetic local fault".to_string(),
+        ))));
+        assert_eq!(message.code, PluginErrorCode::Permanent);
+        assert_eq!(message.public_message, REQUEST_FAILED);
+        assert_eq!(
+            message.debug_message.as_deref(),
+            Some("synthetic local fault")
+        );
+        assert_eq!(message.retry_after_seconds, None);
+        assert!(message.details.is_none());
+
+        let unclassified = Error::msg("synthetic engine fault");
+        let expected = plugin_error_from(&Error::msg("synthetic engine fault"));
+        let mapped = search_error(search_outcome(Err(AmenzbError::from_search_error(
+            unclassified,
+        ))));
+        assert_eq!(mapped.code, expected.code);
+        assert_eq!(mapped.public_message, expected.public_message);
+        assert_eq!(mapped.retry_after_seconds, None);
+        assert!(mapped.details.is_none());
     }
 
     #[test]
