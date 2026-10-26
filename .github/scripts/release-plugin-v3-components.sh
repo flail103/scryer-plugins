@@ -25,8 +25,8 @@ set -euo pipefail
 # belongs to the account owning the tagger email, so with VERIFY=true a
 # verified tag whose tagger is that email was signed by the bot. Such a tag
 # may only release AUTOMATED_RELEASE_PLUGIN_IDS, and only as a stable patch
-# bump on the latest release line of that plugin; a bot-signed trigger may
-# list nothing else. Human-signed tags are not affected.
+# bump on a line a human already released; a bot-signed trigger may list
+# nothing else. Human-signed tags are not affected.
 AUTOMATED_RELEASE_PLUGIN_IDS=(cardigann-engine)
 
 release_plugin_components() {
@@ -136,7 +136,8 @@ release_plugin_components() {
       local tagger
       tagger="$(_release_plugin_components_verify_tag "${repository}" "${tag}" "${tag_object}")" || return 1
       if [[ "${trigger_by_bot}" == true ]] || _release_plugin_components_is_bot "${tagger}" "${bot_email}"; then
-        _release_plugin_components_automated_release_allowed "${plugin_id}" "${version}" "${tag}" "${prefix}" || return 1
+        _release_plugin_components_automated_release_allowed \
+          "${plugin_id}" "${version}" "${tag}" "${prefix}" "${repository}" "${bot_email}" || return 1
       fi
     fi
     output+=("${plugin_id}"$'\t'"${version}"$'\t'"${sha}")
@@ -222,12 +223,16 @@ _release_plugin_components_is_bot() {
 
 # A bot-signed component must be an allowed plugin's stable patch release on
 # a line that already has an earlier release: never a first release, a new
-# minor or a new major. Whether it was newer than everything published is
+# minor or a new major. That earlier release must be a GitHub-verified tag
+# signed by someone other than the bot, with a published GitHub release, so a
+# tag the bot (or anyone) pushes without releasing it cannot open a line. Bot
+# patches still chain: each one sits above the human release that opened its
+# line. Whether it was newer than everything published is
 # checked when the tags are created (xtask release-publish-tags --resume);
 # this check stays true after later releases, so catalog-only republication
 # of an older automated patch still passes.
 _release_plugin_components_automated_release_allowed() {
-  local plugin_id="$1" version="$2" tag="$3" prefix="$4"
+  local plugin_id="$1" version="$2" tag="$3" prefix="$4" repository="$5" bot_email="$6"
   local allowed=false candidate
   for candidate in "${AUTOMATED_RELEASE_PLUGIN_IDS[@]}"; do
     [[ "${plugin_id}" == "${candidate}" ]] && allowed=true
@@ -241,15 +246,19 @@ _release_plugin_components_automated_release_allowed() {
     return 1
   fi
   local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
-  local other other_version
+  local other other_version tagger draft
   while IFS= read -r other; do
     other_version="${other#"${prefix}/${plugin_id}/v"}"
     [[ "${other_version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || continue
-    if [[ "${BASH_REMATCH[1]}" == "${major}" && "${BASH_REMATCH[2]}" == "${minor}" ]] && (( BASH_REMATCH[3] < patch )); then
-      return 0
+    if [[ "${BASH_REMATCH[1]}" != "${major}" || "${BASH_REMATCH[2]}" != "${minor}" ]] || (( BASH_REMATCH[3] >= patch )); then
+      continue
     fi
+    tagger="$(_release_plugin_components_verify_tag "${repository}" "${other}" 2>/dev/null)" || continue
+    ! _release_plugin_components_is_bot "${tagger}" "${bot_email}" || continue
+    draft="$(gh release view "${other}" --repo "${repository}" --json isDraft --jq .isDraft 2>/dev/null)" || continue
+    [[ "${draft}" == false ]] && return 0
   done < <(git tag --list "${prefix}/${plugin_id}/v*")
-  printf 'Automated release %s must be a patch bump on an already released %s.%s line\n' "${tag}" "${major}" "${minor}" >&2
+  printf 'Automated release %s must be a patch bump on a %s.%s line opened by a verified, human-signed, published release\n' "${tag}" "${major}" "${minor}" >&2
   return 1
 }
 

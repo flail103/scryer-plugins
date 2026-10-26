@@ -20,6 +20,11 @@ gh() {
     printf '%s\t%s\n' "$verified" "$tagger"
     return 0
   fi
+  if [[ "$1 $2" == "release view" ]]; then
+    if [[ " $UNRELEASED " == *" $3 "* ]]; then return 1; fi
+    if [[ " $DRAFTS " == *" $3 "* ]]; then printf 'true\n'; else printf 'false\n'; fi
+    return 0
+  fi
   return 1
 }
 source "$SCRIPT"
@@ -72,11 +77,12 @@ class ComponentTests(unittest.TestCase):
         return name
 
     def run_components(self, trigger, *, release_sha=None, verify="true", unverified="", bot_tags="",
-                       bot_email="bot@example.test"):
+                       bot_email="bot@example.test", unreleased="", drafts=""):
         result = subprocess.run(
             ["bash", "-c", MOCK, "components", trigger, release_sha or self.head, "example/plugins", verify],
             cwd=self.repo, capture_output=True, text=True, timeout=30,
             env={**os.environ, "SCRIPT": str(SCRIPT), "UNVERIFIED": unverified, "BOT_TAGS": bot_tags,
+                 "UNRELEASED": unreleased, "DRAFTS": drafts,
                  "SCRYER_AUTOMATED_RELEASE_BOT_EMAIL": bot_email},
         )
         calls = (self.repo / "calls").read_text() if (self.repo / "calls").exists() else ""
@@ -273,7 +279,43 @@ class ComponentTests(unittest.TestCase):
         trigger, bot_tags = self.bot_trigger(self.cardigann_release("0.4.2"), name="plugins-v3/release/first")
         result, _ = self.run_components(trigger, bot_tags=bot_tags)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("patch bump on an already released 0.4 line", result.stderr)
+        self.assertIn("patch bump on a 0.4 line opened by a verified, human-signed, published release", result.stderr)
+
+    def test_the_bot_may_not_open_a_line_with_an_unproven_predecessor(self):
+        cases = [
+            ("lightweight", lambda tag: git(self.repo, "tag", tag, self.legacy), {}),
+            ("unverified", lambda tag: self.cardigann_release("0.4.1", at=self.legacy),
+             {"unverified": "PREDECESSOR"}),
+            ("bot-signed", lambda tag: self.cardigann_release("0.4.1", at=self.legacy), {"bot": True}),
+            ("never released", lambda tag: self.cardigann_release("0.4.1", at=self.legacy),
+             {"unreleased": "plugins-v3/cardigann-engine/v0.4.1"}),
+            ("draft release", lambda tag: self.cardigann_release("0.4.1", at=self.legacy),
+             {"drafts": "plugins-v3/cardigann-engine/v0.4.1"}),
+        ]
+        for index, (label, make, options) in enumerate(cases):
+            with self.subTest(predecessor=label):
+                predecessor = "plugins-v3/cardigann-engine/v0.4.1"
+                make(predecessor)
+                tag = self.cardigann_release("0.4.2")
+                trigger, bot_tags = self.bot_trigger(tag, name=f"plugins-v3/release/unproven-{index}")
+                kwargs = {key: value for key, value in options.items() if key in ("unreleased", "drafts")}
+                if options.get("unverified"):
+                    kwargs["unverified"] = self.object_of(predecessor)
+                if options.get("bot"):
+                    bot_tags += " " + self.object_of(predecessor)
+                result, _ = self.run_components(trigger, bot_tags=bot_tags, **kwargs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("opened by a verified, human-signed, published release", result.stderr)
+                self.assertEqual(result.stdout, "")
+                git(self.repo, "tag", "-d", tag, trigger, predecessor)
+
+    def test_bot_patches_chain_from_the_human_release_that_opened_the_line(self):
+        self.cardigann_release("0.4.1", at=self.legacy)
+        earlier = self.cardigann_release("0.4.2", at=self.legacy)
+        trigger, bot_tags = self.bot_trigger(self.cardigann_release("0.4.3"))
+        result, _ = self.run_components(trigger, bot_tags=f"{bot_tags} {self.object_of(earlier)}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"cardigann-engine\t0.4.3\t{self.head}\n")
 
     def test_an_automated_patch_stays_valid_after_later_releases(self):
         # Catalog-only republication re-verifies older component tags.
