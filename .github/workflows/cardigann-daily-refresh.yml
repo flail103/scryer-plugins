@@ -17,9 +17,11 @@ name: cardigann-daily-refresh
 #    trigger a run, while a new definitions/vN still counts as a move.
 # 2. `refresh`, only when something moved: the layout guard fails the run
 #    (red, nothing committed, merged or released) when a definitions/vN newer
-#    than the tracked one appears and is not listed in the record's reviewed
-#    acknowledged_version_dirs, the tracked directory disappears, or the
-#    tracked schema.json blob differs from the recorded one. Then the sync.
+#    than the tracked one (v12) appears and is not listed in the record's
+#    reviewed acknowledged_version_dirs, a source directory the corpus draws
+#    from (v11 or v12) disappears, or either source's schema.json blob differs
+#    from the recorded one. Then the sync, which takes each definition from the
+#    highest source directory that has it, as Prowlarr's v12 reader does.
 # 3. A sync whose regenerated corpus is byte-identical (upstream moved only
 #    definitions the gate excludes, or files the corpus does not bake) also
 #    ends green with nothing committed. The record is deliberately not
@@ -145,19 +147,23 @@ jobs:
             echo "definitions/ at ${UPSTREAM_COMMIT} is ${observed}, not the ${UPSTREAM_DEFINITIONS_TREE} the short circuit saw" >&2
             exit 1
           fi
-          tracked="$(jq -r '.tracked_version' "$CARDIGANN_RECORD")"
-          echo "TRACKED_VERSION=$tracked" >> "$GITHUB_ENV"
-          tracked_tree="$(jq -r --arg dir "$tracked" '.tree[] | select(.path == $dir and .type == "tree") | .sha' "$UPSTREAM_LISTINGS/definitions.json")"
-          tracked_args=()
-          if [ -n "$tracked_tree" ]; then
-            gh api "repos/${UPSTREAM_REPOSITORY}/git/trees/${tracked_tree}" > "$UPSTREAM_LISTINGS/tracked.json"
-            tracked_args=(--tracked-tree "$UPSTREAM_LISTINGS/tracked.json")
-          fi
+          source_dirs="$(jq -r '[.source_versions[].dir] | join(" ")' "$CARDIGANN_RECORD")"
+          echo "SOURCE_VERSION_DIRS=$source_dirs" >> "$GITHUB_ENV"
+          # One listing per source directory that exists upstream; the guard
+          # reports any that does not.
+          version_args=()
+          for dir in $source_dirs; do
+            tree="$(jq -r --arg dir "$dir" '.tree[] | select(.path == $dir and .type == "tree") | .sha' "$UPSTREAM_LISTINGS/definitions.json")"
+            if [ -n "$tree" ]; then
+              gh api "repos/${UPSTREAM_REPOSITORY}/git/trees/${tree}" > "$UPSTREAM_LISTINGS/${dir}.json"
+              version_args+=(--version-tree "${dir}=$UPSTREAM_LISTINGS/${dir}.json")
+            fi
+          done
           cd rule_packs/refresh
           go run . cardigann-guard \
             --record "$GITHUB_WORKSPACE/$CARDIGANN_RECORD" \
             --definitions-tree "$UPSTREAM_LISTINGS/definitions.json" \
-            "${tracked_args[@]}"
+            "${version_args[@]}"
 
       - name: Run helper unit tests
         working-directory: rule_packs/refresh
@@ -180,7 +186,11 @@ jobs:
           upstream="$RUNNER_TEMP/prowlarr-indexers"
           git init -q "$upstream"
           git -C "$upstream" remote add origin "https://github.com/${UPSTREAM_REPOSITORY}.git"
-          git -C "$upstream" sparse-checkout set "definitions/${TRACKED_VERSION}"
+          sparse=()
+          for dir in $SOURCE_VERSION_DIRS; do
+            sparse+=("definitions/${dir}")
+          done
+          git -C "$upstream" sparse-checkout set "${sparse[@]}"
           git -C "$upstream" fetch -q --depth 1 --filter=blob:none origin "$UPSTREAM_COMMIT"
           git -C "$upstream" checkout -q --detach FETCH_HEAD
           test "$(git -C "$upstream" rev-parse HEAD)" = "$UPSTREAM_COMMIT"
@@ -201,7 +211,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo run --locked -- cardigann sync-definitions \
-            --source "$RUNNER_TEMP/prowlarr-indexers/definitions/${TRACKED_VERSION}" \
+            --source "$RUNNER_TEMP/prowlarr-indexers/definitions" \
             --report "$RUNNER_TEMP/cardigann-sync-report.json"
 
       - name: Stop when the baked corpus is byte-identical
@@ -258,11 +268,16 @@ jobs:
           PY
           UPSTREAM_LISTINGS="$RUNNER_TEMP/cardigann-upstream"
           cd rule_packs/refresh
+          # The guard passed, so every source directory has a listing.
+          version_args=()
+          for dir in $SOURCE_VERSION_DIRS; do
+            version_args+=(--version-tree "${dir}=$UPSTREAM_LISTINGS/${dir}.json")
+          done
           go run . cardigann-record \
             --record "$GITHUB_WORKSPACE/$CARDIGANN_RECORD" \
             --commit "$UPSTREAM_COMMIT" \
             --definitions-tree "$UPSTREAM_LISTINGS/definitions.json" \
-            --tracked-tree "$UPSTREAM_LISTINGS/tracked.json"
+            "${version_args[@]}"
 
       - name: Re-check the crate against the refreshed corpus
         if: ${{ steps.changed.outputs.changed == 'true' }}
@@ -288,16 +303,20 @@ jobs:
 
           report = json.load(open(os.environ["RUNNER_TEMP"] + "/cardigann-sync-report.json"))
           commit = os.environ["UPSTREAM_COMMIT"]
-          tracked = os.environ["TRACKED_VERSION"]
           excluded = report["excluded"]
+          sources = " and ".join(f"`{version}`" for version in report["source_versions"])
+          by_version = ", ".join(
+              f"{count} from `{version}`" for version, count in report["accepted_by_version"].items()
+          )
 
           print("Generated-only refresh of the bundled Cardigann definition corpus from")
-          print(f"[Prowlarr/Indexers@{commit[:12]}](https://github.com/Prowlarr/Indexers/tree/{commit}/definitions/{tracked}).")
+          print(f"[Prowlarr/Indexers@{commit[:12]}](https://github.com/Prowlarr/Indexers/tree/{commit}/definitions),")
+          print(f"taking each definition from the highest of {sources} that has it.")
           print()
           print(f"- Crate version: `{os.environ['PREVIOUS_VERSION']}` -> `{os.environ['BUMPED_VERSION']}`")
           print(f"- Upstream `definitions/` tree: `{os.environ['UPSTREAM_DEFINITIONS_TREE']}`")
           print(f"- Candidates: {report['candidates']}")
-          print(f"- Baked: {report['accepted']}")
+          print(f"- Baked: {report['accepted']} ({by_version})")
           print(f"- Excluded: {len(excluded)}")
           print()
           if excluded:
@@ -306,18 +325,18 @@ jobs:
               print("These did not parse, validate, or reach a first HTTP request under this")
               print("engine, so they were left out rather than shipped broken.")
               print()
-              print("| Definition | Reason |")
-              print("| --- | --- |")
+              print("| Definition | Source | Reason |")
+              print("| --- | --- | --- |")
               # Stay well inside GitHub's 65536-character body limit.
               budget = 55000
               for index, item in enumerate(excluded):
                   reason = item["reason"].replace("|", "\\|").replace("\n", " ")
                   if len(reason) > 300:
                       reason = reason[:297] + "..."
-                  row = f"| `{item['file']}` | {reason} |"
+                  row = f"| `{item['file']}` | `{item['source_version']}` | {reason} |"
                   budget -= len(row) + 1
                   if budget < 0:
-                      print(f"| ... | {len(excluded) - index} more; see the workflow run log |")
+                      print(f"| ... | | {len(excluded) - index} more; see the workflow run log |")
                       break
                   print(row)
           else:

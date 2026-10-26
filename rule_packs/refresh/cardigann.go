@@ -36,21 +36,34 @@ const (
 
 // cardigannUpstreamRecord is the committed identity of the upstream the baked
 // corpus was last generated from. The bot rewrites the observed fields on each
-// sync; TrackedVersion and AcknowledgedVersionDirs are carried forward
-// verbatim and only change in a reviewed human commit.
+// sync (Commit, DefinitionsTree and each source's Tree); TrackedVersion,
+// each source's Dir and SchemaBlob, and AcknowledgedVersionDirs are carried
+// forward verbatim and only change in a reviewed human commit.
 type cardigannUpstreamRecord struct {
 	Repository string `json:"repository"`
 	// Commit and DefinitionsTree are empty until the first recorded sync.
 	Commit          string `json:"commit"`
 	DefinitionsTree string `json:"definitions_tree"`
-	// TrackedVersion is the definitions/<vN> directory the engine bakes.
-	TrackedVersion     string `json:"tracked_version"`
-	TrackedVersionTree string `json:"tracked_version_tree"`
-	SchemaBlob         string `json:"schema_blob"`
+	// TrackedVersion is the newest definitions/<vN> the engine reads, the
+	// Cardigann schema version it implements.
+	TrackedVersion string `json:"tracked_version"`
+	// SourceVersions are the definitions/<vN> directories the corpus draws
+	// from, oldest first and ending at TrackedVersion. Upstream keeps each
+	// definition only in the lowest schema version it validates against, so
+	// the corpus takes each one from the highest of these that has it.
+	SourceVersions []cardigannSourceVersion `json:"source_versions"`
 	// AcknowledgedVersionDirs lists newer definitions/<vN> directories a
 	// maintainer has reviewed and chosen not to adopt yet; any other newer
 	// directory fails the refresh.
 	AcknowledgedVersionDirs []string `json:"acknowledged_version_dirs"`
+}
+
+// cardigannSourceVersion is one definitions/<vN> the corpus draws from.
+type cardigannSourceVersion struct {
+	Dir string `json:"dir"`
+	// Tree is empty until the first recorded sync.
+	Tree       string `json:"tree"`
+	SchemaBlob string `json:"schema_blob"`
 }
 
 // gitTreeListing is the subset of GitHub's `GET /repos/{o}/{r}/git/trees/{sha}`
@@ -83,21 +96,53 @@ func readCardigannRecord(path string) (cardigannUpstreamRecord, error) {
 	if err := decoder.Decode(&record); err != nil {
 		return record, fmt.Errorf("%s: %w", path, err)
 	}
-	if record.Repository != cardigannUpstream {
-		return record, fmt.Errorf("%s: repository is %q, want %q", path, record.Repository, cardigannUpstream)
-	}
-	if _, err := versionNumber(record.TrackedVersion); err != nil {
-		return record, fmt.Errorf("%s: tracked_version: %w", path, err)
-	}
-	if !gitObjectPattern.MatchString(record.SchemaBlob) {
-		return record, fmt.Errorf("%s: schema_blob must be a 40-hex git object id", path)
-	}
-	for _, dir := range record.AcknowledgedVersionDirs {
-		if _, err := versionNumber(dir); err != nil {
-			return record, fmt.Errorf("%s: acknowledged_version_dirs: %w", path, err)
-		}
+	if err := validateCardigannRecord(record); err != nil {
+		return record, fmt.Errorf("%s: %w", path, err)
 	}
 	return record, nil
+}
+
+func validateCardigannRecord(record cardigannUpstreamRecord) error {
+	if record.Repository != cardigannUpstream {
+		return fmt.Errorf("repository is %q, want %q", record.Repository, cardigannUpstream)
+	}
+	tracked, err := versionNumber(record.TrackedVersion)
+	if err != nil {
+		return fmt.Errorf("tracked_version: %w", err)
+	}
+	if len(record.SourceVersions) == 0 {
+		return errors.New("source_versions must list the definitions directories the corpus draws from")
+	}
+	previous := 0
+	for _, source := range record.SourceVersions {
+		number, err := versionNumber(source.Dir)
+		if err != nil {
+			return fmt.Errorf("source_versions: %w", err)
+		}
+		if number <= previous {
+			return errors.New("source_versions must be distinct and ordered oldest first")
+		}
+		previous = number
+		if !gitObjectPattern.MatchString(source.SchemaBlob) {
+			return fmt.Errorf("source_versions %s: schema_blob must be a 40-hex git object id", source.Dir)
+		}
+		if source.Tree != "" && !gitObjectPattern.MatchString(source.Tree) {
+			return fmt.Errorf("source_versions %s: tree must be empty or a 40-hex git object id", source.Dir)
+		}
+	}
+	if previous != tracked {
+		return fmt.Errorf("source_versions must end at tracked_version %s", record.TrackedVersion)
+	}
+	for _, dir := range record.AcknowledgedVersionDirs {
+		number, err := versionNumber(dir)
+		if err != nil {
+			return fmt.Errorf("acknowledged_version_dirs: %w", err)
+		}
+		if number <= tracked {
+			return fmt.Errorf("acknowledged_version_dirs: %s is not newer than tracked_version %s", dir, record.TrackedVersion)
+		}
+	}
+	return nil
 }
 
 func versionNumber(dir string) (int, error) {
@@ -106,16 +151,6 @@ func versionNumber(dir string) (int, error) {
 		return 0, fmt.Errorf("%q is not a definitions version directory (vN)", dir)
 	}
 	return strconv.Atoi(match[1])
-}
-
-// readOptionalTreeListing reads a listing, or returns an empty one for an
-// empty path: the workflow passes none when the tracked directory is absent,
-// which the guard then reports.
-func readOptionalTreeListing(path string) (gitTreeListing, error) {
-	if path == "" {
-		return gitTreeListing{}, nil
-	}
-	return readTreeListing(path)
 }
 
 func readTreeListing(path string) (gitTreeListing, error) {
@@ -136,67 +171,116 @@ func readTreeListing(path string) (gitTreeListing, error) {
 	return listing, nil
 }
 
+// versionTreeFlags collects repeated `--version-tree vN=listing.json` flags.
+// The workflow passes one for each source directory that exists upstream; a
+// missing one is then reported by the guard.
+type versionTreeFlags map[string]string
+
+func (f versionTreeFlags) String() string { return "" }
+
+func (f versionTreeFlags) Set(value string) error {
+	dir, path, ok := strings.Cut(value, "=")
+	if !ok || path == "" {
+		return fmt.Errorf("--version-tree %q: want vN=path", value)
+	}
+	if _, err := versionNumber(dir); err != nil {
+		return fmt.Errorf("--version-tree: %w", err)
+	}
+	if _, seen := f[dir]; seen {
+		return fmt.Errorf("--version-tree %s passed twice", dir)
+	}
+	f[dir] = path
+	return nil
+}
+
+func (f versionTreeFlags) read() (map[string]gitTreeListing, error) {
+	listings := make(map[string]gitTreeListing, len(f))
+	for dir, path := range f {
+		listing, err := readTreeListing(path)
+		if err != nil {
+			return nil, err
+		}
+		listings[dir] = listing
+	}
+	return listings, nil
+}
+
 // upstreamObservation is what the guard derived from the upstream listings,
 // in the form the record stores.
 type upstreamObservation struct {
-	DefinitionsTree    string
-	TrackedVersionTree string
-	SchemaBlob         string
+	DefinitionsTree string
+	// Sources mirrors the record's SourceVersions with the observed trees.
+	Sources []cardigannSourceVersion
 }
 
 // checkCardigannUpstream refuses an upstream whose definition layout moved
 // since the recorded sync: a definitions/<vN> newer than the tracked version
-// that nobody acknowledged, the tracked version directory disappearing, an
-// unexpected entry in definitions/, or a changed tracked schema. Every
-// problem found is reported, each naming exactly what moved.
-func checkCardigannUpstream(record cardigannUpstreamRecord, definitions, tracked gitTreeListing) (upstreamObservation, error) {
+// that nobody acknowledged, a source version directory disappearing, an
+// unexpected entry in definitions/, or a changed schema.json in any source
+// directory. Every problem found is reported, each naming exactly what moved.
+// versions holds the listing of each source directory that exists upstream.
+func checkCardigannUpstream(record cardigannUpstreamRecord, definitions gitTreeListing, versions map[string]gitTreeListing) (upstreamObservation, error) {
 	observation := upstreamObservation{DefinitionsTree: definitions.SHA}
-	trackedNumber, err := versionNumber(record.TrackedVersion)
-	if err != nil {
+	if err := validateCardigannRecord(record); err != nil {
 		return observation, err
 	}
+	trackedNumber, _ := versionNumber(record.TrackedVersion)
 	acknowledged := make(map[string]struct{}, len(record.AcknowledgedVersionDirs))
 	for _, dir := range record.AcknowledgedVersionDirs {
 		acknowledged[dir] = struct{}{}
 	}
 
 	var problems []string
-	trackedTree := ""
+	upstreamTrees := map[string]string{}
 	for _, entry := range definitions.Tree {
 		number, err := versionNumber(entry.Path)
 		if err != nil || entry.Type != "tree" {
 			problems = append(problems, fmt.Sprintf("unexpected %s definitions/%s appeared upstream (%s)", entry.Type, entry.Path, entry.SHA))
 			continue
 		}
-		switch {
-		case number == trackedNumber:
-			trackedTree = entry.SHA
-		case number > trackedNumber:
+		upstreamTrees[entry.Path] = entry.SHA
+		if number > trackedNumber {
 			if _, ok := acknowledged[entry.Path]; !ok {
-				problems = append(problems, fmt.Sprintf("newer definitions version definitions/%s exists upstream (tree %s); the engine tracks definitions/%s", entry.Path, entry.SHA, record.TrackedVersion))
+				problems = append(problems, fmt.Sprintf("newer definitions version definitions/%s exists upstream (tree %s); the engine reads up to definitions/%s", entry.Path, entry.SHA, record.TrackedVersion))
 			}
 		}
 	}
-	if trackedTree == "" {
-		problems = append(problems, fmt.Sprintf("tracked definitions/%s no longer exists upstream", record.TrackedVersion))
-	} else {
-		observation.TrackedVersionTree = trackedTree
-		if tracked.SHA != trackedTree {
-			return observation, fmt.Errorf("the definitions/%s listing is tree %s, but definitions/ names %s", record.TrackedVersion, tracked.SHA, trackedTree)
+
+	sourceDirs := map[string]struct{}{}
+	for _, source := range record.SourceVersions {
+		sourceDirs[source.Dir] = struct{}{}
+		observed := cardigannSourceVersion{Dir: source.Dir, SchemaBlob: source.SchemaBlob}
+		tree, ok := upstreamTrees[source.Dir]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("definitions/%s, a source of the baked corpus, no longer exists upstream", source.Dir))
+			observation.Sources = append(observation.Sources, observed)
+			continue
+		}
+		observed.Tree = tree
+		listing, ok := versions[source.Dir]
+		if !ok {
+			return observation, fmt.Errorf("definitions/%s exists upstream (tree %s), but no listing of it was passed", source.Dir, tree)
+		}
+		if listing.SHA != tree {
+			return observation, fmt.Errorf("the definitions/%s listing is tree %s, but definitions/ names %s", source.Dir, listing.SHA, tree)
 		}
 		schema := ""
-		for _, entry := range tracked.Tree {
+		for _, entry := range listing.Tree {
 			if entry.Path == cardigannSchemaFile && entry.Type == "blob" {
 				schema = entry.SHA
 			}
 		}
 		switch {
 		case schema == "":
-			problems = append(problems, fmt.Sprintf("definitions/%s/%s no longer exists upstream", record.TrackedVersion, cardigannSchemaFile))
-		case schema != record.SchemaBlob:
-			problems = append(problems, fmt.Sprintf("definitions/%s/%s changed upstream: blob %s, recorded %s", record.TrackedVersion, cardigannSchemaFile, schema, record.SchemaBlob))
-		default:
-			observation.SchemaBlob = schema
+			problems = append(problems, fmt.Sprintf("definitions/%s/%s no longer exists upstream", source.Dir, cardigannSchemaFile))
+		case schema != source.SchemaBlob:
+			problems = append(problems, fmt.Sprintf("definitions/%s/%s changed upstream: blob %s, recorded %s", source.Dir, cardigannSchemaFile, schema, source.SchemaBlob))
+		}
+		observation.Sources = append(observation.Sources, observed)
+	}
+	for dir := range versions {
+		if _, ok := sourceDirs[dir]; !ok {
+			return observation, fmt.Errorf("a listing was passed for definitions/%s, which is not a source of the baked corpus", dir)
 		}
 	}
 	if len(problems) > 0 {
@@ -210,7 +294,8 @@ func cardigannGuardCommand(args []string) error {
 	fs := flag.NewFlagSet("cardigann-guard", flag.ContinueOnError)
 	recordPath := fs.String("record", "", "committed upstream record")
 	definitionsPath := fs.String("definitions-tree", "", "git/trees listing of upstream definitions/")
-	trackedPath := fs.String("tracked-tree", "", "git/trees listing of the tracked definitions/<vN>, if it exists")
+	versionTrees := versionTreeFlags{}
+	fs.Var(versionTrees, "version-tree", "vN=git/trees listing of a source definitions/<vN> that exists upstream (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -225,28 +310,27 @@ func cardigannGuardCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	tracked, err := readOptionalTreeListing(*trackedPath)
+	versions, err := versionTrees.read()
 	if err != nil {
 		return err
 	}
-	_, err = checkCardigannUpstream(record, definitions, tracked)
+	_, err = checkCardigannUpstream(record, definitions, versions)
 	return err
 }
 
 // updatedCardigannRecord re-runs the guard and returns the record for a
 // sync from commit, carrying the reviewed fields forward unchanged.
-func updatedCardigannRecord(record cardigannUpstreamRecord, commit string, definitions, tracked gitTreeListing) (cardigannUpstreamRecord, error) {
+func updatedCardigannRecord(record cardigannUpstreamRecord, commit string, definitions gitTreeListing, versions map[string]gitTreeListing) (cardigannUpstreamRecord, error) {
 	if !gitObjectPattern.MatchString(commit) {
 		return record, fmt.Errorf("upstream commit %q is not a 40-hex sha", commit)
 	}
-	observation, err := checkCardigannUpstream(record, definitions, tracked)
+	observation, err := checkCardigannUpstream(record, definitions, versions)
 	if err != nil {
 		return record, err
 	}
 	record.Commit = commit
 	record.DefinitionsTree = observation.DefinitionsTree
-	record.TrackedVersionTree = observation.TrackedVersionTree
-	record.SchemaBlob = observation.SchemaBlob
+	record.SourceVersions = observation.Sources
 	if record.AcknowledgedVersionDirs == nil {
 		record.AcknowledgedVersionDirs = []string{}
 	}
@@ -258,7 +342,8 @@ func cardigannRecordCommand(args []string) error {
 	recordPath := fs.String("record", "", "committed upstream record to rewrite")
 	commit := fs.String("commit", "", "upstream commit the corpus was synced from")
 	definitionsPath := fs.String("definitions-tree", "", "git/trees listing of upstream definitions/")
-	trackedPath := fs.String("tracked-tree", "", "git/trees listing of the tracked definitions/<vN>, if it exists")
+	versionTrees := versionTreeFlags{}
+	fs.Var(versionTrees, "version-tree", "vN=git/trees listing of a source definitions/<vN> (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -270,11 +355,11 @@ func cardigannRecordCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	tracked, err := readTreeListing(*trackedPath)
+	versions, err := versionTrees.read()
 	if err != nil {
 		return err
 	}
-	updated, err := updatedCardigannRecord(record, *commit, definitions, tracked)
+	updated, err := updatedCardigannRecord(record, *commit, definitions, versions)
 	if err != nil {
 		return err
 	}
@@ -283,6 +368,16 @@ func cardigannRecordCommand(args []string) error {
 		return err
 	}
 	return os.WriteFile(*recordPath, append(data, '\n'), 0o644)
+}
+
+// reviewedCardigannFields are the record fields only a reviewed human commit
+// may change.
+func reviewedCardigannFields(record cardigannUpstreamRecord) string {
+	parts := []string{record.Repository, record.TrackedVersion, strings.Join(record.AcknowledgedVersionDirs, ",")}
+	for _, source := range record.SourceVersions {
+		parts = append(parts, source.Dir+"="+source.SchemaBlob)
+	}
+	return strings.Join(parts, "|")
 }
 
 // verifyCardigannDiff holds a refresh to one coherent patch release: the
@@ -357,9 +452,8 @@ func verifyCardigannDiff(base string, changed []string, show func(rev, path stri
 	if err := json.Unmarshal(headRecordData, &headRecord); err != nil {
 		return fmt.Errorf("%s in the working tree: %w", cardigannRecord, err)
 	}
-	if headRecord.Repository != baseRecord.Repository || headRecord.TrackedVersion != baseRecord.TrackedVersion ||
-		strings.Join(headRecord.AcknowledgedVersionDirs, ",") != strings.Join(baseRecord.AcknowledgedVersionDirs, ",") {
-		return fmt.Errorf("%s: a refresh may not change repository, tracked_version or acknowledged_version_dirs", cardigannRecord)
+	if reviewedCardigannFields(headRecord) != reviewedCardigannFields(baseRecord) {
+		return fmt.Errorf("%s: a refresh may not change repository, tracked_version, acknowledged_version_dirs, or the source_versions directories and schema blobs", cardigannRecord)
 	}
 	return nil
 }

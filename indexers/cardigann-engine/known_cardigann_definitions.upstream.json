@@ -2,8 +2,18 @@
   "repository": "Prowlarr/Indexers",
   "commit": "",
   "definitions_tree": "",
-  "tracked_version": "v11",
-  "tracked_version_tree": "",
-  "schema_blob": "006abbb38cdaa382a469f8346b67ccb3943a8153",
+  "tracked_version": "v12",
+  "source_versions": [
+    {
+      "dir": "v11",
+      "tree": "",
+      "schema_blob": "006abbb38cdaa382a469f8346b67ccb3943a8153"
+    },
+    {
+      "dir": "v12",
+      "tree": "",
+      "schema_blob": "6c64121ccd9803b057b8ab15890edde2f33f9e6a"
+    }
+  ],
   "acknowledged_version_dirs": []
 }
