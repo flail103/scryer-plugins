@@ -132,6 +132,12 @@ jobs:
           SCRYER_AUTOMATED_RELEASE_BOT_EMAIL: ${{ vars.RULE_PACK_REFRESH_BOT_EMAIL }}
         run: |
           set -euo pipefail
+          # Without the bot email a bot-signed tag would pass as a human one, so
+          # refuse to plan rather than drop the automated-release limits.
+          test -n "${SCRYER_AUTOMATED_RELEASE_BOT_EMAIL}" || {
+            echo "vars.RULE_PACK_REFRESH_BOT_EMAIL must be set so bot-signed tags stay limited" >&2
+            exit 1
+          }
           # A `plugins-v3/release/catalog-<suffix>-from-<sha>` trigger republishes the
           # central catalog from component releases that already exist; it rebuilds and
           # re-signs nothing, so every build and provenance job gates itself off below.
