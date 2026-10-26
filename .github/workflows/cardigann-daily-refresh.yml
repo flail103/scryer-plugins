@@ -2,11 +2,13 @@ name: cardigann-daily-refresh
 
 # Refreshes the Advanced indexers plugin's (cardigann-engine) baked definition
 # corpus from upstream Prowlarr/Indexers once a day, the same way the TRaSH and
-# SeaDex rule packs refresh: a signed bot commit on an auto-merging pull
-# request, held to a generated-only diff. Once that pull request merges,
-# rule-pack-publish releases the patch it bumps (gated separately by
-# CARDIGANN_AUTO_RELEASE_ENABLED). This replaces the former weekly
-# cardigann-definitions sync.
+# SeaDex rule packs refresh: a signed bot commit on a pull request held to a
+# generated-only diff. Unlike the rule packs, the pull request is never queued
+# to auto-merge: definitions decide where tracker credentials are sent, and
+# nothing here checks those destinations, so a maintainer reviews each one.
+# Once it is merged, rule-pack-publish releases the patch it bumps (gated
+# separately by CARDIGANN_AUTO_RELEASE_ENABLED). This replaces the former
+# weekly cardigann-definitions sync.
 #
 # Order of checks, cheapest first:
 # 1. `upstream` (no checkout, no toolchain): if the git tree of upstream
@@ -25,8 +27,8 @@ name: cardigann-daily-refresh
 # 3. A sync whose regenerated corpus is byte-identical (upstream moved only
 #    definitions the gate excludes, or files the corpus does not bake) also
 #    ends green with nothing committed. The record is deliberately not
-#    advanced in that case: a record-only commit would land an auto-merged
-#    pull request that ships nothing, and any change under the crate directory
+#    advanced in that case: a record-only commit would open a pull request
+#    that ships nothing, and any change under the crate directory
 #    marks cardigann-engine changed for `release-changed`. The cost is that
 #    later runs re-sync until a baked definition changes, which upstream does
 #    most days.
@@ -342,6 +344,10 @@ jobs:
           else:
               print("Every candidate definition cleared the gate.")
           print()
+          print("This pull request does not auto-merge. Review the definition changes before")
+          print("merging, above all login, search and download URLs and any request that")
+          print("carries credentials: a definition decides where tracker credentials are sent.")
+          print()
           print("Merging releases this patch through the rule-pack-publish workflow when")
           print("CARDIGANN_AUTO_RELEASE_ENABLED is on; otherwise it waits for a normal release.")
           PY
@@ -362,6 +368,7 @@ jobs:
             indexers/cardigann-engine/known_cardigann_definitions.upstream.json
             indexers/cardigann-engine/Cargo.toml
             indexers/cardigann-engine/Cargo.lock
+          auto-merge: "false"
           token: ${{ secrets.RULE_PACK_REFRESH_TOKEN }}
           signing-key: ${{ secrets.RULE_PACK_REFRESH_SIGNING_KEY }}
           allowed-signers: ${{ vars.RULE_PACK_REFRESH_ALLOWED_SIGNERS }}

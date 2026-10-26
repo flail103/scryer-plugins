@@ -2,7 +2,7 @@ name: rule-pack-refresh-pr
 description: >-
   Commit generated refresh artifacts (rule packs, or the Cardigann definition
   corpus) with an SSH-signed commit, push the refresh branch, and open or
-  update the auto-merging pull request. Signing material lives only in
+  update the refresh pull request, auto-merging it unless told not to. Signing material lives only in
   RUNNER_TEMP for the duration of the job.
 
 inputs:
@@ -41,6 +41,12 @@ inputs:
     description: Pre-rendered PR body; defaults to the rule-pack body
     required: false
     default: ""
+  auto-merge:
+    description: >-
+      "true" queues the pull request to squash-merge once checks pass; "false"
+      leaves it open for a maintainer to review and merge
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -58,6 +64,7 @@ runs:
         ALLOWED_SIGNERS: ${{ inputs.allowed-signers }}
         BOT_EMAIL: ${{ inputs.bot-email }}
         TITLE: ${{ inputs.title }}
+        AUTO_MERGE: ${{ inputs.auto-merge }}
         BODY_FILE: ${{ inputs.body-file }}
       run: |
         set -euo pipefail
@@ -102,7 +109,11 @@ runs:
         else
           gh pr edit "$pr" --title "$title" --body-file "$body"
         fi
-        gh pr merge "$pr" --auto --squash
+        case "$AUTO_MERGE" in
+          true) gh pr merge "$pr" --auto --squash ;;
+          false) ;;
+          *) echo "auto-merge must be true or false, not '$AUTO_MERGE'" >&2; exit 1 ;;
+        esac
 
     - name: Remove temporary signing material
       if: ${{ always() }}
