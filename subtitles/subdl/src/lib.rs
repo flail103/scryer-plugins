@@ -357,6 +357,9 @@ fn public_message(code: &PluginErrorCode) -> &'static str {
         code if *code == PluginErrorCode::from(codes::QUOTA_EXCEEDED) => {
             "The Subdl daily download limit is used up."
         }
+        code if *code == PluginErrorCode::from(codes::ITEM_NOT_FOUND) => {
+            "The Subdl subtitle file no longer exists."
+        }
         code if *code == PluginErrorCode::from(codes::INVALID_RESPONSE) => {
             "Subdl returned a response Scryer could not read."
         }
@@ -848,14 +851,11 @@ fn http_get_download(url: &str) -> Result<DownloadArtifact, Failure> {
         .map_err(|error| transport_failure("Subdl download request failed", &error))?;
 
     let body_text = response_body_text(&response);
-    if is_download_rate_limited(response.status_code(), body_text.as_str()) {
-        return Err(download_failure(
-            response.status_code(),
-            retry_after_seconds(&response),
-        ));
-    }
-
-    map_http_status("Subdl download", &response)?;
+    download_status_failure(
+        response.status_code(),
+        body_text.as_str(),
+        retry_after_seconds(&response),
+    )?;
     Ok(DownloadArtifact {
         bytes: response.body(),
         content_type: response_header(&response, "content-type")
@@ -863,6 +863,29 @@ fn http_get_download(url: &str) -> Result<DownloadArtifact, Failure> {
         filename: response_header(&response, "content-disposition")
             .and_then(|value| content_disposition_filename(value.as_str())),
     })
+}
+
+/// The subtitle download's answer status, as the download's failure.
+///
+/// A 404 or 410 means Subdl no longer has the file the search offered, so it
+/// is `item_not_found` and the host stops asking for it. The daily limit and
+/// every other error status keep the classification they always had.
+fn download_status_failure(
+    status: u16,
+    body_text: &str,
+    retry_after_seconds: Option<i64>,
+) -> Result<(), Failure> {
+    if is_download_rate_limited(status, body_text) {
+        return Err(download_failure(status, retry_after_seconds));
+    }
+    if matches!(status, 404 | 410) {
+        return Err(Failure::new(
+            FailureKind::Provider,
+            format!("Subdl download returned HTTP {status}: {body_text}"),
+        )
+        .with_code(codes::ITEM_NOT_FOUND));
+    }
+    map_http_status_details("Subdl download", status, body_text, retry_after_seconds)
 }
 
 fn transport_failure(label: &str, error: &scryer_plugin_pdk::Error) -> Failure {
@@ -2135,11 +2158,41 @@ mod tests {
         body_text: &str,
         retry_after_seconds: Option<i64>,
     ) -> Failure {
-        if is_download_rate_limited(status, body_text) {
-            download_failure(status, retry_after_seconds)
-        } else {
-            map_http_status_details("Subdl download", status, body_text, retry_after_seconds)
-                .expect_err("failure")
+        download_status_failure(status, body_text, retry_after_seconds).expect_err("failure")
+    }
+
+    #[test]
+    fn a_download_subdl_no_longer_has_is_item_not_found() {
+        for status in [404, 410] {
+            let error = http_download_failure_for_test(status, "fixture upstream text", None)
+                .into_plugin_error();
+            assert_eq!(
+                error.code,
+                PluginErrorCode::from(scryer_plugin_pdk::codes::ITEM_NOT_FOUND)
+            );
+            assert!(!error.public_message.contains("fixture upstream text"));
+            let debug = error.debug_message.as_deref().unwrap();
+            assert!(debug.contains(&format!("HTTP {status}")));
+            assert!(debug.contains("fixture upstream text"));
         }
+    }
+
+    #[test]
+    fn other_download_failures_are_not_item_not_found() {
+        for status in [401, 403, 429, 500, 503] {
+            let error = http_download_failure_for_test(status, "busy", None).into_plugin_error();
+            assert_ne!(
+                error.code,
+                PluginErrorCode::from(scryer_plugin_pdk::codes::ITEM_NOT_FOUND),
+                "HTTP {status}"
+            );
+        }
+        assert_eq!(
+            http_download_failure_for_test(500, "busy", None)
+                .into_plugin_error()
+                .code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert!(download_status_failure(200, "", None).is_ok());
     }
 }

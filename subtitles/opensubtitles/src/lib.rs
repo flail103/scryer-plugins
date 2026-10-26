@@ -357,7 +357,7 @@ fn download(
     };
     match download_subtitle_impl(&config, request) {
         Ok(response) => PluginResult::Ok(response),
-        Err(error) => PluginResult::Err(classify_error(error)),
+        Err(error) => PluginResult::Err(error),
     }
 }
 
@@ -1207,12 +1207,19 @@ fn append_translation_filter_params(
 fn download_subtitle_impl(
     config: &OpenSubtitlesConfig,
     request: &SubtitlePluginDownloadRequest,
-) -> Result<SubtitlePluginDownloadResponse, String> {
+) -> Result<SubtitlePluginDownloadResponse, PluginError> {
     let file_id = request
         .provider_file_id
         .trim()
         .parse::<i64>()
-        .map_err(|error| format!("invalid OpenSubtitles file id: {error}"))?;
+        .map_err(|error| classify_error(format!("invalid OpenSubtitles file id: {error}")))?;
+    download_subtitle_file(config, file_id)
+}
+
+fn download_subtitle_file(
+    config: &OpenSubtitlesConfig,
+    file_id: i64,
+) -> Result<SubtitlePluginDownloadResponse, PluginError> {
     let response = send_request_json(
         config,
         "POST",
@@ -1223,21 +1230,24 @@ fn download_subtitle_impl(
                 file_id,
                 sub_format: "srt",
             })
-            .map_err(|error| format!("failed to encode download request: {error}"))?,
+            .map_err(|error| {
+                classify_error(format!("failed to encode download request: {error}"))
+            })?,
         ),
-    )?;
+    )
+    .map_err(classify_error)?;
     if response.status_code() >= 400 {
-        return Err(http_error(config, "download", &response));
+        return Err(download_http_error(config, "download", &response));
     }
 
     let download: DownloadResponse = serde_json::from_slice(&response.body())
-        .map_err(|error| format!("OpenSubtitles download parse error: {error}"))?;
+        .map_err(|error| classify_error(format!("OpenSubtitles download parse error: {error}")))?;
 
     let content_request = HttpRequest::new(&download.link).with_method("GET");
     let content = http::request::<Vec<u8>>(&content_request, None)
-        .map_err(|error| format!("OpenSubtitles subtitle fetch failed: {error}"))?;
+        .map_err(|error| classify_error(format!("OpenSubtitles subtitle fetch failed: {error}")))?;
     if content.status_code() >= 400 {
-        return Err(http_error(config, "subtitle fetch", &content));
+        return Err(download_http_error(config, "subtitle fetch", &content));
     }
 
     let content = normalize_line_endings(content.body());
@@ -1570,6 +1580,60 @@ fn validation_status(error: &str) -> SubtitlePluginValidateConfigResponse {
             retry_after_seconds: None,
         }
     }
+}
+
+/// A failed step of a download: the `download` link request or the fetch of
+/// the link it answered.
+fn download_http_error(
+    config: &OpenSubtitlesConfig,
+    action: &str,
+    response: &HttpResponse,
+) -> PluginError {
+    let body = String::from_utf8_lossy(&response.body()).trim().to_string();
+    download_http_failure(
+        action,
+        response.status_code(),
+        &body,
+        retry_after_seconds(response),
+        current_token(config).is_some(),
+        &current_api_host(),
+    )
+}
+
+/// The typed failure for a download step's error status.
+///
+/// A 404 means OpenSubtitles no longer has the file the search offered, so
+/// it is `item_not_found` and the host stops asking for it. A 410 keeps its
+/// own meaning here: the time-limited link expired, which the next download
+/// call replaces with a fresh one. Every other status keeps the
+/// classification it always had.
+fn download_http_failure(
+    action: &str,
+    status: u16,
+    body: &str,
+    retry_after: Option<u64>,
+    bearer_present: bool,
+    api_host: &str,
+) -> PluginError {
+    if status == 404 {
+        return plugin_error(
+            codes::ITEM_NOT_FOUND,
+            "The OpenSubtitles subtitle file no longer exists.",
+        )
+        .debug(format_args!(
+            "OpenSubtitles {action} returned HTTP {status}: {}",
+            compact_error_body(body)
+        ))
+        .build();
+    }
+    classify_error(describe_http_failure(
+        action,
+        status,
+        body,
+        retry_after,
+        bearer_present,
+        api_host,
+    ))
 }
 
 fn http_error(config: &OpenSubtitlesConfig, action: &str, response: &HttpResponse) -> String {
@@ -2042,7 +2106,7 @@ mod tests {
         config_auth_fingerprint, descriptor, encode_query, from_opensubtitles_language,
         is_real_forced, to_opensubtitles_language, validate_username,
     };
-    use super::{classify_error, describe_http_failure};
+    use super::{classify_error, describe_http_failure, download_http_failure};
     use scryer_plugin_pdk::codes;
     use scryer_plugin_sdk::{
         ConfigFieldValueSource, PluginHostBindingId, ProviderDescriptor, SubtitleMatchHintKind,
@@ -2213,6 +2277,51 @@ mod tests {
         assert_eq!(
             login_api_key.code,
             PluginErrorCode::from(codes::INVALID_API_KEY)
+        );
+    }
+
+    fn download_verdict(action: &str, status: u16, body: &str) -> PluginError {
+        download_http_failure(action, status, body, Some(120), true, "api.fixture.invalid")
+    }
+
+    #[test]
+    fn a_download_opensubtitles_no_longer_has_is_item_not_found() {
+        for action in ["download", "subtitle fetch"] {
+            let error = download_verdict(action, 404, r#"{"message":"fixture upstream text"}"#);
+            assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+            assert!(!error.public_message.contains("fixture upstream text"));
+            let debug = error.debug_message.as_deref().unwrap();
+            assert!(debug.contains("HTTP 404"));
+            assert!(debug.contains("fixture upstream text"));
+        }
+    }
+
+    #[test]
+    fn other_download_failures_are_not_item_not_found() {
+        for status in [401, 403, 406, 410, 429, 500, 503] {
+            for action in ["download", "subtitle fetch"] {
+                let error = download_verdict(action, status, "busy");
+                assert_ne!(
+                    error.code,
+                    PluginErrorCode::from(codes::ITEM_NOT_FOUND),
+                    "{action} HTTP {status}"
+                );
+                assert_eq!(
+                    error.code,
+                    verdict(action, status, "busy").code,
+                    "{action} HTTP {status} keeps its old code"
+                );
+            }
+        }
+        assert_eq!(
+            download_verdict("download", 500, "busy").code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        // An expired link is not a missing file: the next download call asks
+        // for a fresh one.
+        assert_eq!(
+            download_verdict("subtitle fetch", 410, "").code,
+            PluginErrorCode::Temporary
         );
     }
 

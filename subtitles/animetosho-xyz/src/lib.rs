@@ -233,7 +233,7 @@ fn download(
     };
     match download_subtitle_impl(&config, &reference) {
         Ok(response) => PluginResult::Ok(response),
-        Err(error) => PluginResult::Err(classify_error(error)),
+        Err(error) => PluginResult::Err(error),
     }
 }
 
@@ -572,21 +572,28 @@ fn candidate_for_link(
 fn download_subtitle_impl(
     config: &AnimeToshoConfig,
     reference: &AnimeToshoDownloadRef,
-) -> Result<SubtitlePluginDownloadResponse, String> {
+) -> Result<SubtitlePluginDownloadResponse, PluginError> {
     let url = migrate_animetosho_url(&reference.url);
     let site_prefix = format!("{}/download/", config.site_url.trim_end_matches('/'));
     let storage_prefix = format!("{STORAGE_BASE_URL}/releases/");
     if !url.starts_with(&site_prefix) && !url.starts_with(&storage_prefix) {
-        return Err("invalid AnimeTosho subtitle download URL".to_string());
+        return Err(classify_error(
+            "invalid AnimeTosho subtitle download URL".to_string(),
+        ));
     }
 
-    let response = http_get_follow(&url, "application/octet-stream, */*")?;
-    if response.status_code() >= 400 {
-        return Err(http_error("AnimeTosho subtitle", &response));
-    }
+    let response =
+        http_get_follow(&url, "application/octet-stream, */*").map_err(classify_error)?;
+    check_download_status(
+        response.status_code(),
+        retry_after_seconds(&response),
+        String::from_utf8_lossy(&response.body()).trim(),
+    )?;
     let bytes = response.body();
     if !bytes.starts_with(XZ_MAGIC) {
-        return Err("AnimeTosho subtitle is not an XZ stream".to_string());
+        return Err(classify_error(
+            "AnimeTosho subtitle is not an XZ stream".to_string(),
+        ));
     }
 
     Ok(SubtitlePluginDownloadResponse {
@@ -600,6 +607,37 @@ fn download_subtitle_impl(
             .map(ToString::to_string)
             .or_else(|| Some("application/x-xz".to_string())),
     })
+}
+
+/// The subtitle download's answer status, as the download's failure.
+///
+/// A 404 means AnimeTosho no longer has the attachment the search offered, so
+/// it is `item_not_found` and the host stops asking for it. Every other error
+/// status, 410 included, keeps the classification it always had.
+fn check_download_status(
+    status: u16,
+    retry_after: Option<u64>,
+    body: &str,
+) -> Result<(), PluginError> {
+    if status == 404 {
+        return Err(plugin_error(
+            codes::ITEM_NOT_FOUND,
+            "The AnimeTosho subtitle file no longer exists.",
+        )
+        .debug(format_args!(
+            "AnimeTosho subtitle download returned HTTP {status}: {body}"
+        ))
+        .build());
+    }
+    if status >= 400 {
+        return Err(classify_error(describe_http_failure(
+            "AnimeTosho subtitle",
+            status,
+            retry_after,
+            body,
+        )));
+    }
+    Ok(())
 }
 
 fn get_json<T: for<'de> Deserialize<'de>>(
@@ -1001,6 +1039,38 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_download_animetosho_no_longer_has_is_item_not_found() {
+        let status = 404;
+        let error = check_download_status(status, None, "fixture upstream text").unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+        assert!(!error.public_message.contains("fixture upstream text"));
+        let debug = error.debug_message.as_deref().unwrap();
+        assert!(debug.contains(&format!("HTTP {status}")));
+        assert!(debug.contains("fixture upstream text"));
+    }
+
+    #[test]
+    fn other_download_failures_are_not_item_not_found() {
+        for status in [401, 403, 410, 429, 500, 503] {
+            let error = check_download_status(status, None, "busy").unwrap_err();
+            assert_ne!(
+                error.code,
+                PluginErrorCode::from(codes::ITEM_NOT_FOUND),
+                "HTTP {status}"
+            );
+        }
+        assert_eq!(
+            check_download_status(500, None, "busy").unwrap_err().code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            check_download_status(410, None, "busy").unwrap_err().code,
+            PluginErrorCode::Temporary
+        );
+        assert!(check_download_status(200, None, "").is_ok());
+    }
 
     #[test]
     fn http_failures_carry_their_codes_without_upstream_text() {
