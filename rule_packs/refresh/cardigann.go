@@ -290,6 +290,9 @@ func cardigannRecordCommand(args []string) error {
 // version line in Cargo.toml and the crate's own entry in Cargo.lock, both
 // moving to the next patch of the base version. It also refuses any change to
 // the record's reviewed fields.
+//
+// Like the path check, it compares base with the working tree: the refresh runs
+// it before committing, and publication runs it on a clean merge checkout.
 func verifyCardigannDiff(base string, changed []string, show func(rev, path string) ([]byte, error)) error {
 	changedSet := pathSet(changed...)
 	for _, required := range []string{cardigannRecord, cardigannManifest, cardigannLockfile} {
@@ -305,7 +308,7 @@ func verifyCardigannDiff(base string, changed []string, show func(rev, path stri
 	read := func(rev, path string) ([]byte, error) {
 		data, err := show(rev, path)
 		if err != nil {
-			return nil, fmt.Errorf("read %s at %s: %w", path, rev, err)
+			return nil, fmt.Errorf("read %s at %q: %w", path, rev, err)
 		}
 		return data, nil
 	}
@@ -313,7 +316,7 @@ func verifyCardigannDiff(base string, changed []string, show func(rev, path stri
 	if err != nil {
 		return err
 	}
-	headManifest, err := read("HEAD", cardigannManifest)
+	headManifest, err := read(workingTree, cardigannManifest)
 	if err != nil {
 		return err
 	}
@@ -328,7 +331,7 @@ func verifyCardigannDiff(base string, changed []string, show func(rev, path stri
 	if err != nil {
 		return err
 	}
-	headLock, err := read("HEAD", cardigannLockfile)
+	headLock, err := read(workingTree, cardigannLockfile)
 	if err != nil {
 		return err
 	}
@@ -343,7 +346,7 @@ func verifyCardigannDiff(base string, changed []string, show func(rev, path stri
 	if err != nil {
 		return err
 	}
-	headRecordData, err := read("HEAD", cardigannRecord)
+	headRecordData, err := read(workingTree, cardigannRecord)
 	if err != nil {
 		return err
 	}
@@ -352,7 +355,7 @@ func verifyCardigannDiff(base string, changed []string, show func(rev, path stri
 		return fmt.Errorf("%s at %s: %w", cardigannRecord, base, err)
 	}
 	if err := json.Unmarshal(headRecordData, &headRecord); err != nil {
-		return fmt.Errorf("%s at HEAD: %w", cardigannRecord, err)
+		return fmt.Errorf("%s in the working tree: %w", cardigannRecord, err)
 	}
 	if headRecord.Repository != baseRecord.Repository || headRecord.TrackedVersion != baseRecord.TrackedVersion ||
 		strings.Join(headRecord.AcknowledgedVersionDirs, ",") != strings.Join(baseRecord.AcknowledgedVersionDirs, ",") {
@@ -360,6 +363,10 @@ func verifyCardigannDiff(base string, changed []string, show func(rev, path stri
 	}
 	return nil
 }
+
+// workingTree is the revision verifyCardigannDiff passes to read the files as
+// they are on disk.
+const workingTree = ""
 
 var versionValuePattern = regexp.MustCompile(`^version = "([^"]+)"$`)
 

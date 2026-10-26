@@ -77,7 +77,16 @@ var profiles = map[string]packProfile{
 	},
 }
 
+// gitShow reads path at rev, or from the working tree when rev is
+// workingTree; path is relative to the repository root either way.
 func gitShow(rev, path string) ([]byte, error) {
+	if rev == workingTree {
+		root, err := gitOutput("rev-parse", "--show-toplevel")
+		if err != nil {
+			return nil, err
+		}
+		return os.ReadFile(filepath.Join(strings.TrimSpace(string(root)), filepath.FromSlash(path)))
+	}
 	command := exec.Command("git", "show", rev+":"+path)
 	var stderr strings.Builder
 	command.Stderr = &stderr

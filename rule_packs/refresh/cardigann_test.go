@@ -269,8 +269,8 @@ func (f fakeRevisions) show(rev, path string) ([]byte, error) {
 
 func cardigannRevisions(headManifest, headLock, headRecord string) fakeRevisions {
 	return fakeRevisions{
-		"base": {cardigannManifest: testManifest, cardigannLockfile: testLock, cardigannRecord: testRecordJSON},
-		"HEAD": {cardigannManifest: headManifest, cardigannLockfile: headLock, cardigannRecord: headRecord},
+		"base":      {cardigannManifest: testManifest, cardigannLockfile: testLock, cardigannRecord: testRecordJSON},
+		workingTree: {cardigannManifest: headManifest, cardigannLockfile: headLock, cardigannRecord: headRecord},
 	}
 }
 
@@ -350,5 +350,19 @@ func TestCardigannProfileAllowsOnlyItsRefreshOutputs(t *testing.T) {
 	}
 	if _, err := lookupRulePackProfile("cardigann"); err == nil {
 		t.Fatal("cardigann accepted as a rule-pack profile")
+	}
+}
+
+func TestGitShowReadsTheWorkingTreeFromTheRepositoryRoot(t *testing.T) {
+	want, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := gitShow(workingTree, "rule_packs/refresh/go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatal("working-tree read differs from the file on disk")
 	}
 }
