@@ -8931,7 +8931,7 @@ fn run_cardigann_sync_definitions(
         ));
     }
     if report.risk.flagged.is_empty() {
-        ok("no baked definition gained an origin or moved a secret");
+        ok("no baked definition holding a secret gained an origin or moved a secret");
     } else {
         warn(format!(
             "needs review, gained an origin or moved a secret: {}",

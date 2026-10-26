@@ -1,10 +1,13 @@
 //! What a corpus refresh changes about where definitions send data.
 //!
 //! A definition cannot run code: templates and filters are pure. What a
-//! changed definition can do is send requests somewhere new, or carry an
-//! operator's secret somewhere it did not go before. The refresh workflow
-//! merges a refresh on its own only when no definition that was already baked
-//! does either; anything this module flags waits for a maintainer.
+//! changed definition can do is carry an operator's secret somewhere it did
+//! not go before, either by rendering it into a new place or by sending
+//! requests to a new origin while it holds one. The refresh workflow merges a
+//! refresh on its own only when no definition that was already baked does
+//! either; anything this module flags waits for a maintainer. A definition
+//! that references no secret, such as a public tracker adding mirrors, may
+//! gain origins without review: it has nothing of the operator's to send.
 //!
 //! Like [`crate::gate`], this is test-only and reached through
 //! `xtask cardigann sync-definitions`.
@@ -169,7 +172,9 @@ fn config_references(text: &str) -> impl Iterator<Item = &str> {
         .filter_map(move |(start, marker)| {
             let rest = &text[start + marker.len()..];
             let end = rest
-                .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .find(|character: char| {
+                    !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+                })
                 .unwrap_or(rest.len());
             (end > 0).then(|| &rest[..end])
         })
@@ -179,7 +184,8 @@ fn config_references(text: &str) -> impl Iterator<Item = &str> {
 #[derive(Debug, Serialize)]
 pub struct Flagged {
     pub id: String,
-    /// Origins the definition can now reach that it could not before.
+    /// Origins the definition can now reach that it could not before, listed
+    /// only when it references a secret setting.
     pub new_origins: Vec<String>,
     /// `setting at location` for each secret rendered somewhere new.
     pub new_secret_placements: Vec<String>,
@@ -199,8 +205,12 @@ pub struct RiskReport {
     pub removed: Vec<String>,
     /// Ids whose YAML changed.
     pub changed: Vec<String>,
-    /// Changed definitions that gained an origin, moved a secret, or
-    /// weakened a password setting. Empty means the refresh may merge itself.
+    /// Changed definitions that reference no secret and gained origins. They
+    /// are not flagged.
+    pub secretless_new_origins: Vec<String>,
+    /// Changed definitions that gained an origin while holding a secret,
+    /// moved a secret, or weakened a password setting. Empty means the refresh
+    /// may merge itself.
     pub flagged: Vec<Flagged>,
 }
 
@@ -235,6 +245,7 @@ pub fn compare(
             .cloned()
             .collect(),
         changed: Vec::new(),
+        secretless_new_origins: Vec::new(),
         flagged: Vec::new(),
     };
     for (id, source) in current {
@@ -245,14 +256,22 @@ pub fn compare(
             continue;
         }
         report.changed.push(id.clone());
-        if let Some(flagged) = compare_one(id, before, source) {
-            report.flagged.push(flagged);
+        match compare_one(id, before, source) {
+            Outcome::Clean => {}
+            Outcome::SecretlessNewOrigins => report.secretless_new_origins.push(id.clone()),
+            Outcome::Flagged(flagged) => report.flagged.push(flagged),
         }
     }
     Ok(report)
 }
 
-fn compare_one(id: &str, before: &str, after: &str) -> Option<Flagged> {
+enum Outcome {
+    Clean,
+    SecretlessNewOrigins,
+    Flagged(Flagged),
+}
+
+fn compare_one(id: &str, before: &str, after: &str) -> Outcome {
     let mut flagged = Flagged {
         id: id.to_string(),
         new_origins: Vec::new(),
@@ -264,11 +283,11 @@ fn compare_one(id: &str, before: &str, after: &str) -> Option<Flagged> {
         (Ok(before), Ok(after)) => (before, after),
         (Err(error), _) => {
             flagged.unresolved = Some(format!("previous definition: {error}"));
-            return Some(flagged);
+            return Outcome::Flagged(flagged);
         }
         (_, Err(error)) => {
             flagged.unresolved = Some(error);
-            return Some(flagged);
+            return Outcome::Flagged(flagged);
         }
     };
     match (&before.origins, &after.origins) {
@@ -292,11 +311,22 @@ fn compare_one(id: &str, before: &str, after: &str) -> Option<Flagged> {
         .difference(&after.password_settings)
         .cloned()
         .collect();
+    // Either version referencing a secret counts: a definition that drops
+    // its last secret in the same change is still reviewed.
+    let holds_secret = !before.secret_placements.is_empty() || !after.secret_placements.is_empty();
+    let secretless_new_origins = !holds_secret && !flagged.new_origins.is_empty();
+    if secretless_new_origins {
+        flagged.new_origins.clear();
+    }
     let clean = flagged.new_origins.is_empty()
         && flagged.new_secret_placements.is_empty()
         && flagged.weakened_settings.is_empty()
         && flagged.unresolved.is_none();
-    (!clean).then_some(flagged)
+    match (clean, secretless_new_origins) {
+        (false, _) => Outcome::Flagged(flagged),
+        (true, true) => Outcome::SecretlessNewOrigins,
+        (true, false) => Outcome::Clean,
+    }
 }
 
 #[cfg(test)]
@@ -468,6 +498,29 @@ search:
     fn a_definition_that_no_longer_parses_is_flagged() {
         let report = compare_fixture("id: fixture\nlinks: [");
         assert!(report.flagged[0].unresolved.is_some());
+    }
+
+    #[test]
+    fn config_references_keep_hyphenated_setting_names() {
+        let names: Vec<&str> = config_references(
+            "{{ .Config.api-key }}/x?u={{.Config.user_id}}&s={{ .Config.sitelink }}",
+        )
+        .collect();
+        assert_eq!(names, ["api-key", "user_id", "sitelink"]);
+    }
+
+    #[test]
+    fn a_public_definition_adding_a_mirror_is_listed_but_not_flagged() {
+        let public = |links: &str| {
+            format!(
+                "---\nid: fixture\nname: Fixture\ndescription: Fixture\nlanguage: en-US\ntype: public\nencoding: UTF-8\nlinks:\n{links}caps:\n  categorymappings:\n    - {{id: 1, cat: Movies, desc: Movies}}\n  modes:\n    search: [q]\nsearch:\n  paths:\n    - path: browse.php\n  rows:\n    selector: tr\n  fields:\n    title:\n      selector: a\n    download:\n      selector: a\n      attribute: href\n"
+            )
+        };
+        let before = public("  - https://tracker.example/\n");
+        let after = public("  - https://tracker.example/\n  - https://mirror.example/\n");
+        let report = compare(&previous(&before), &corpus(&after)).expect("compare");
+        assert!(report.flagged.is_empty(), "{:?}", report.flagged);
+        assert_eq!(report.secretless_new_origins, ["fixture"]);
     }
 
     #[test]

@@ -9,9 +9,11 @@ name: cardigann-daily-refresh
 #
 # Definitions decide where tracker credentials are sent, so the pull request
 # only queues itself to auto-merge when the sync's risk report flags nothing:
-# no definition that was already baked gained an origin it may reach, rendered
-# a secret setting somewhere new, or stopped declaring a password setting as a
-# password. Otherwise it stays open for a maintainer, listing what was flagged.
+# no definition that was already baked and references a secret setting gained
+# an origin it may reach, none rendered a secret somewhere new, and none
+# stopped declaring a password setting as a password. Otherwise it stays open
+# for a maintainer, listing what was flagged. A definition with no secret, such
+# as a public tracker adding mirrors, may gain origins without review.
 # The baseline is the corpus on main, which the crate the sync runs was built
 # from.
 #
@@ -341,8 +343,9 @@ jobs:
               print("### Review needed")
               print()
               print("This pull request does not auto-merge. These definitions were baked before")
-              print("and now reach new origins, render a secret somewhere new, or no longer")
-              print("declare a password setting as a password. Check each before merging.")
+              print("and now reach new origins while holding a secret, render a secret somewhere")
+              print("new, or no longer declare a password setting as a password. Check each")
+              print("before merging.")
               print()
               print("| Definition | New origins | New secret placements | Weakened settings |")
               print("| --- | --- | --- | --- |")
@@ -353,10 +356,13 @@ jobs:
                       origins = f"could not resolve: {reason}"
                   print(f"| `{item['id']}` | {origins} | {capped(item['new_secret_placements'])} | {capped(item['weakened_settings'])} |")
           else:
-              print("No definition that was already baked gained an origin, rendered a secret")
-              print("somewhere new, or weakened a password setting, so this pull request merges")
-              print("itself once checks pass.")
+              print("No definition that was already baked and holds a secret gained an origin,")
+              print("rendered a secret somewhere new, or weakened a password setting, so this")
+              print("pull request merges itself once checks pass.")
           print()
+          if risk["secretless_new_origins"]:
+              print(f"New origins on definitions that hold no secret: {capped(risk['secretless_new_origins'], 50)}")
+              print()
           if risk["added"]:
               print(f"New definitions, not configured by anyone yet: {capped(risk['added'], 50)}")
               print()
