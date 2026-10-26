@@ -55,9 +55,9 @@ checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
 name = "archive-extraction-archive-extractor"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
- "aws-lc-sys 0.46.0",
+ "aws-lc-sys",
  "crc-fast",
  "crc32fast",
  "lzma-turbo",
@@ -95,19 +95,6 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
-
-[[package]]
-name = "aws-lc-sys"
-version = "0.45.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
-dependencies = [
- "cc",
- "cmake",
- "dunce",
- "fs_extra",
- "pkg-config",
-]
 
 [[package]]
 name = "aws-lc-sys"
@@ -517,6 +504,16 @@ name = "crc-fast"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
+dependencies = [
+ "digest 0.10.7",
+ "spin",
+]
+
+[[package]]
+name = "crc-turbo"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe9845f8267cd17ae1edacec5cd2bc0f8b891d1946db64d929209170fcf7e9b8"
 dependencies = [
  "digest 0.10.7",
  "spin",
@@ -1186,11 +1183,11 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lzma-turbo"
-version = "0.9.0"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b9ccc3065ff5558e94314fcf941f2508a6ace67da9b2cdc85a6f4e436ab2f0b"
+checksum = "3af35044209c991b5cafb0821392f36b3b3eb3bdd5411c21562716705139a621"
 dependencies = [
- "crc-fast",
+ "crc-turbo",
  "sha2 0.11.1",
 ]
 
@@ -1319,14 +1316,13 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "par2-rs"
-version = "0.10.8"
+version = "0.10.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7768af4cffb65248703385c0eed0f558fb8e65bcb303a636f01b4069992a9931"
+checksum = "5f79a1a5151a773c595f156d322236c3689404d622e5a85dc3188a06503529fc"
 dependencies = [
- "aws-lc-sys 0.45.0",
  "bytes",
  "cap-std",
- "crc-fast",
+ "crc-turbo",
  "libc",
  "md-5",
  "memmap2",
@@ -1397,9 +1393,9 @@ dependencies = [
 
 [[package]]
 name = "ppmd-turbo"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d772f4b18e5af5cf5186a3661d5fc451c7366b2ce59da997179ed192bf12512b"
+checksum = "6f79f9e9a62828a7cefa4885bc3223b2f3f3ac8cb4b4de2cab4835982dcb6194"
 
 [[package]]
 name = "prettyplease"
@@ -1497,9 +1493,9 @@ dependencies = [
 
 [[package]]
 name = "reedsolomon-rs"
-version = "0.4.10"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "591306d5543b5932373935e6382e567711eb383e804fb74ba333e1371a28a8a9"
+checksum = "81f4afa0094e231cfcb6b23f9f6f568db67097fa7a2a9bae0992d339e7555fc3"
 dependencies = [
  "memmap2",
  "rayon",
@@ -1712,9 +1708,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.27.0"
+version = "0.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4abe071a8b7d5f393996f6f7e1c210510ac014de56db49e0228a3a2ce8523a06"
+checksum = "47e78cf4c24e122389175a1f0570faf86fce2c786fec113f4617e3ebf97b2789"
 dependencies = [
  "aes",
  "bzip2",
@@ -2018,14 +2014,14 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unrar-rs"
-version = "0.11.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "374d56427700534ae07ae77280b6d95071ab11b02d1737493e02e425d20b00bf"
+checksum = "f2821acdbd624de10b9d9fed6a959dfe7e911087f01e4b20449ecc6ee8ddfb47"
 dependencies = [
  "aes",
  "blake2s_simd",
  "cbc",
- "crc-fast",
+ "crc-turbo",
  "filetime",
  "hmac",
  "libc",
