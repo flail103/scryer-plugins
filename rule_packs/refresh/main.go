@@ -1,5 +1,5 @@
 // Command refresh validates the bounded changes made by the scheduled rule-pack
-// refresh workflows. It deliberately has no network client: upstream
+// and Cardigann definition refresh workflows. It deliberately has no network client: upstream
 // acquisition remains the responsibility of each reviewed pack converter.
 package main
 
@@ -20,9 +20,12 @@ import (
 
 // packProfile pins one automated refresh: the rule-pack id the generated
 // manifest must carry and the exact committed paths a refresh may rewrite.
+// A profile without an ID is not a rule pack; its Verify hook holds the
+// content of the allowed paths to the refresh's contract.
 type packProfile struct {
 	ID      string
 	Allowed map[string]struct{}
+	Verify  func(base string, changed []string) error
 }
 
 var profiles = map[string]packProfile{
@@ -60,6 +63,29 @@ var profiles = map[string]packProfile{
 			"rule_packs/seadex/snapshot.json.gz",
 		),
 	},
+	"cardigann": {
+		Allowed: pathSet(
+			cardigannIndexAsset,
+			cardigannBodiesAsset,
+			cardigannRecord,
+			cardigannManifest,
+			cardigannLockfile,
+		),
+		Verify: func(base string, changed []string) error {
+			return verifyCardigannDiff(base, changed, gitShow)
+		},
+	},
+}
+
+func gitShow(rev, path string) ([]byte, error) {
+	command := exec.Command("git", "show", rev+":"+path)
+	var stderr strings.Builder
+	command.Stderr = &stderr
+	output, err := command.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git show %s:%s: %w: %s", rev, path, err, strings.TrimSpace(stderr.String()))
+	}
+	return output, nil
 }
 
 func pathSet(paths ...string) map[string]struct{} {
@@ -71,15 +97,23 @@ func pathSet(paths ...string) map[string]struct{} {
 }
 
 func profileFlag(fs *flag.FlagSet) *string {
-	return fs.String("profile", "", "refresh profile: trash or seadex")
+	return fs.String("profile", "", "refresh profile: trash, seadex or cardigann")
 }
 
 func lookupProfile(name string) (packProfile, error) {
 	profile, ok := profiles[name]
 	if !ok {
-		return packProfile{}, fmt.Errorf("unknown refresh profile %q; expected trash or seadex", name)
+		return packProfile{}, fmt.Errorf("unknown refresh profile %q; expected trash, seadex or cardigann", name)
 	}
 	return profile, nil
+}
+
+func lookupRulePackProfile(name string) (packProfile, error) {
+	profile, err := lookupProfile(name)
+	if err == nil && profile.ID == "" {
+		err = fmt.Errorf("refresh profile %q is not a rule pack", name)
+	}
+	return profile, err
 }
 
 type pack struct {
@@ -110,7 +144,7 @@ type semanticRule struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: refresh fingerprint|next-version|verify-diff --profile trash|seadex")
+		fatal("usage: refresh fingerprint|next-version --profile trash|seadex; verify-diff --profile trash|seadex|cardigann; cardigann-guard|cardigann-record")
 	}
 	var err error
 	switch os.Args[1] {
@@ -120,6 +154,10 @@ func main() {
 		err = nextVersionCommand(os.Args[2:])
 	case "verify-diff":
 		err = verifyDiffCommand(os.Args[2:])
+	case "cardigann-guard":
+		err = cardigannGuardCommand(os.Args[2:])
+	case "cardigann-record":
+		err = cardigannRecordCommand(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
@@ -156,7 +194,7 @@ func nextVersionCommand(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	profile, err := lookupProfile(*profileName)
+	profile, err := lookupRulePackProfile(*profileName)
 	if err != nil {
 		return err
 	}
@@ -189,7 +227,7 @@ func fingerprintCommand(args []string) error {
 	if *path == "" {
 		return errors.New("fingerprint requires --pack")
 	}
-	profile, err := lookupProfile(*profileName)
+	profile, err := lookupRulePackProfile(*profileName)
 	if err != nil {
 		return err
 	}
@@ -235,6 +273,9 @@ func verifyDiffCommand(args []string) error {
 		if strings.HasPrefix(entry, "?? ") {
 			return fmt.Errorf("refresh produced untracked path %q", strings.TrimPrefix(entry, "?? "))
 		}
+	}
+	if profile.Verify != nil {
+		return profile.Verify(*base, changed)
 	}
 	return nil
 }

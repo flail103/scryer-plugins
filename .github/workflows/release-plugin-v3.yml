@@ -126,6 +126,10 @@ jobs:
 
       - name: Select component release plan
         id: release-source
+        env:
+          # Bot-signed tags may only release a cardigann-engine patch; see
+          # release-plugin-v3-components.sh.
+          SCRYER_AUTOMATED_RELEASE_BOT_EMAIL: ${{ vars.RULE_PACK_REFRESH_BOT_EMAIL }}
         run: |
           set -euo pipefail
           # A `plugins-v3/release/catalog-<suffix>-from-<sha>` trigger republishes the
