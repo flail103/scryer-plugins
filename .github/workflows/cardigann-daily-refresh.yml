@@ -3,12 +3,17 @@ name: cardigann-daily-refresh
 # Refreshes the Advanced indexers plugin's (cardigann-engine) baked definition
 # corpus from upstream Prowlarr/Indexers once a day, the same way the TRaSH and
 # SeaDex rule packs refresh: a signed bot commit on a pull request held to a
-# generated-only diff. Unlike the rule packs, the pull request is never queued
-# to auto-merge: definitions decide where tracker credentials are sent, and
-# nothing here checks those destinations, so a maintainer reviews each one.
-# Once it is merged, rule-pack-publish releases the patch it bumps (gated
-# separately by CARDIGANN_AUTO_RELEASE_ENABLED). This replaces the former
-# weekly cardigann-definitions sync.
+# generated-only diff. Once it is merged, rule-pack-publish releases the patch
+# it bumps (gated separately by CARDIGANN_AUTO_RELEASE_ENABLED). This replaces
+# the former weekly cardigann-definitions sync.
+#
+# Definitions decide where tracker credentials are sent, so the pull request
+# only queues itself to auto-merge when the sync's risk report flags nothing:
+# no definition that was already baked gained an origin it may reach, rendered
+# a secret setting somewhere new, or stopped declaring a password setting as a
+# password. Otherwise it stays open for a maintainer, listing what was flagged.
+# The baseline is the corpus on main, which the crate the sync runs was built
+# from.
 #
 # Order of checks, cheapest first:
 # 1. `upstream` (no checkout, no toolchain): if the git tree of upstream
@@ -293,6 +298,7 @@ jobs:
 
       - name: Render the pull request body
         if: ${{ steps.changed.outputs.changed == 'true' }}
+        id: body
         shell: bash
         env:
           PREVIOUS_VERSION: ${{ steps.version.outputs.previous }}
@@ -304,6 +310,10 @@ jobs:
           import os
 
           report = json.load(open(os.environ["RUNNER_TEMP"] + "/cardigann-sync-report.json"))
+          risk = report["risk"]
+          flagged = risk["flagged"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"auto_merge={'false' if flagged else 'true'}\n")
           commit = os.environ["UPSTREAM_COMMIT"]
           excluded = report["excluded"]
           sources = " and ".join(f"`{version}`" for version in report["source_versions"])
@@ -320,7 +330,39 @@ jobs:
           print(f"- Candidates: {report['candidates']}")
           print(f"- Baked: {report['accepted']} ({by_version})")
           print(f"- Excluded: {len(excluded)}")
+          print(f"- Changed: {len(risk['changed'])}, added: {len(risk['added'])}, removed: {len(risk['removed'])}")
           print()
+
+          def capped(items, limit=10):
+              shown = ", ".join(f"`{item}`" for item in items[:limit])
+              return shown + (f" and {len(items) - limit} more" if len(items) > limit else "")
+
+          if flagged:
+              print("### Review needed")
+              print()
+              print("This pull request does not auto-merge. These definitions were baked before")
+              print("and now reach new origins, render a secret somewhere new, or no longer")
+              print("declare a password setting as a password. Check each before merging.")
+              print()
+              print("| Definition | New origins | New secret placements | Weakened settings |")
+              print("| --- | --- | --- | --- |")
+              for item in flagged:
+                  origins = capped(item["new_origins"])
+                  if item["unresolved"]:
+                      reason = item["unresolved"].replace("|", "\\|").replace("\n", " ")[:300]
+                      origins = f"could not resolve: {reason}"
+                  print(f"| `{item['id']}` | {origins} | {capped(item['new_secret_placements'])} | {capped(item['weakened_settings'])} |")
+          else:
+              print("No definition that was already baked gained an origin, rendered a secret")
+              print("somewhere new, or weakened a password setting, so this pull request merges")
+              print("itself once checks pass.")
+          print()
+          if risk["added"]:
+              print(f"New definitions, not configured by anyone yet: {capped(risk['added'], 50)}")
+              print()
+          if risk["removed"]:
+              print(f"Removed definitions, which stop working for anyone using them: {capped(risk['removed'], 50)}")
+              print()
           if excluded:
               print("### Excluded definitions")
               print()
@@ -344,10 +386,6 @@ jobs:
           else:
               print("Every candidate definition cleared the gate.")
           print()
-          print("This pull request does not auto-merge. Review the definition changes before")
-          print("merging, above all login, search and download URLs and any request that")
-          print("carries credentials: a definition decides where tracker credentials are sent.")
-          print()
           print("Merging releases this patch through the rule-pack-publish workflow when")
           print("CARDIGANN_AUTO_RELEASE_ENABLED is on; otherwise it waits for a normal release.")
           PY
@@ -368,7 +406,7 @@ jobs:
             indexers/cardigann-engine/known_cardigann_definitions.upstream.json
             indexers/cardigann-engine/Cargo.toml
             indexers/cardigann-engine/Cargo.lock
-          auto-merge: "false"
+          auto-merge: ${{ steps.body.outputs.auto_merge }}
           token: ${{ secrets.RULE_PACK_REFRESH_TOKEN }}
           signing-key: ${{ secrets.RULE_PACK_REFRESH_SIGNING_KEY }}
           allowed-signers: ${{ vars.RULE_PACK_REFRESH_ALLOWED_SIGNERS }}

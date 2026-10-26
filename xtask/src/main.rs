@@ -8808,6 +8808,17 @@ struct CardigannSyncReport {
     accepted: usize,
     accepted_by_version: BTreeMap<String, usize>,
     excluded: Vec<CardigannExcludedDefinition>,
+    risk: CardigannRiskReport,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardigannRiskReport {
+    flagged: Vec<CardigannFlaggedDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardigannFlaggedDefinition {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8917,6 +8928,20 @@ fn run_cardigann_sync_definitions(
         warn(format!(
             "excluded {}/{}: {}",
             excluded.source_version, excluded.file, excluded.reason
+        ));
+    }
+    if report.risk.flagged.is_empty() {
+        ok("no baked definition gained an origin or moved a secret");
+    } else {
+        warn(format!(
+            "needs review, gained an origin or moved a secret: {}",
+            report
+                .risk
+                .flagged
+                .iter()
+                .map(|flagged| flagged.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 

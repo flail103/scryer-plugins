@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::baked::{ASSET_SCHEMA_VERSION, BodyRow, CUSTOM_DEFINITION_ID, IndexRow};
-use crate::{definition, parse_definition, runtime};
+use crate::{definition, parse_definition, risk, runtime};
 
 const SOURCE_DIR_ENV: &str = "CARDIGANN_GATE_SOURCE_DIR";
 const INDEX_OUT_ENV: &str = "CARDIGANN_GATE_INDEX_OUT";
@@ -163,6 +163,9 @@ pub struct SyncReport {
     pub accepted_by_version: BTreeMap<String, usize>,
     pub baked: Vec<Baked>,
     pub excluded: Vec<Excluded>,
+    /// How the refreshed corpus differs from the one this crate was built
+    /// with, in where definitions send requests and secrets.
+    pub risk: risk::RiskReport,
 }
 
 struct Admitted {
@@ -272,6 +275,15 @@ fn sync(source_dir: &Path) -> Result<(String, String, SyncReport), String> {
             .entry(item.version.to_string())
             .or_default() += 1;
     }
+    // The crate was compiled from the corpus the sync is about to replace,
+    // so its baked bodies are the baseline the refresh is judged against.
+    let risk = risk::compare(
+        crate::baked::BODIES_ASSET,
+        &admitted
+            .iter()
+            .map(|item| (item.entry.id.clone(), item.source.clone()))
+            .collect(),
+    )?;
     let report = SyncReport {
         schema_version: ASSET_SCHEMA_VERSION,
         source_dir: source_dir.display().to_string(),
@@ -288,6 +300,7 @@ fn sync(source_dir: &Path) -> Result<(String, String, SyncReport), String> {
             })
             .collect(),
         excluded,
+        risk,
     };
     Ok((index, bodies, report))
 }

@@ -22,6 +22,8 @@ mod filters;
 #[cfg(test)]
 mod gate;
 mod info_text;
+#[cfg(test)]
+mod risk;
 mod runtime;
 mod template;
 
@@ -29,7 +31,7 @@ use baked::CUSTOM_DEFINITION_ID;
 use definition::{Definition, Setting};
 use runtime::EngineAction;
 
-const CARDIGANN_DEFINITION_VERSION: u16 = 11;
+const CARDIGANN_DEFINITION_VERSION: u16 = 12;
 const HOST_CONFIG_KEYS: [&str; 5] = [
     "base_url",
     "username",
