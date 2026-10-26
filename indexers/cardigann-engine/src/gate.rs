@@ -418,4 +418,22 @@ search:
         assert_eq!(entry.kind, "public");
         assert_eq!(entry.base_url, "https://tracker.example/");
     }
+
+    /// The refresh workflow checks out and guards the directories the upstream
+    /// record lists, while the sync reads [`SOURCE_VERSIONS`]; the two must
+    /// name the same directories.
+    #[test]
+    fn source_versions_match_the_upstream_record() {
+        let record: serde_json::Value =
+            serde_json::from_str(include_str!("../known_cardigann_definitions.upstream.json"))
+                .expect("parse the upstream record");
+        let dirs: Vec<&str> = record["source_versions"]
+            .as_array()
+            .expect("source_versions is an array")
+            .iter()
+            .map(|source| source["dir"].as_str().expect("dir is a string"))
+            .collect();
+        assert_eq!(dirs, SOURCE_VERSIONS);
+        assert_eq!(record["tracked_version"], *SOURCE_VERSIONS.last().unwrap());
+    }
 }
