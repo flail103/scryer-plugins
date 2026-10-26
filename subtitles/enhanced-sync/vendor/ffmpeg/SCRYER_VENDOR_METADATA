@@ -1,4 +1,4 @@
 repository=https://github.com/FFmpeg/FFmpeg.git
-commit=38b88335f99e76ed89ff3c93f877fdefce736c13
-revision=git-38b88335f99e76ed89ff3c93f877fdefce736c13
-source_date=2026-06-17
+commit=946fcce07b6dcd0331c8cc609192aeff5e1924f8
+revision=git-946fcce07b6dcd0331c8cc609192aeff5e1924f8
+source_date=2026-09-18
