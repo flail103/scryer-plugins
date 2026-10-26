@@ -1,4 +1,4 @@
-//! Cardigann v11 tracker definitions as a Scryer WASIp2 indexer component.
+//! Cardigann v12 tracker definitions as a Scryer WASIp2 indexer component.
 //!
 //! The engine itself (definition parsing, the Go-template renderer, the filter
 //! chain, and the search/login/grab flow machine) is host-independent: it is a
@@ -174,7 +174,7 @@ fn config_fields() -> Vec<sdk::ConfigFieldDef> {
                 sdk::ConfigFieldType::Multiline,
                 false,
                 None,
-                Some("A Cardigann v11 YAML definition."),
+                Some("A Cardigann v12 YAML definition; v11 definitions work too."),
             )
         },
         sdk::ConfigFieldDef {
@@ -579,7 +579,7 @@ fn resolve_definition_source(
             .map(str::to_string)
             .ok_or_else(|| {
                 "`definition_yaml` must be configured when `definition` is `Custom`; pick a \
-                 bundled Cardigann definition instead, or paste a Cardigann v11 YAML definition"
+                 bundled Cardigann definition instead, or paste a Cardigann v12 YAML definition"
                     .to_string()
             }),
         Some(id) => baked::definition_yaml(id)?.ok_or_else(|| {
@@ -1310,19 +1310,21 @@ search:
     }
 
     #[test]
-    fn executes_requested_v11_corpus_to_an_initial_http_step() {
-        let corpus_dir = std::env::var_os("CARDIGANN_V11_DEFINITIONS_DIR")
-            .or_else(|| std::env::var_os("CARDIGANN_V11_CORPUS_DIR"));
-        let Some(corpus_dir) = corpus_dir else {
+    fn executes_requested_corpus_to_an_initial_http_step() {
+        // An upstream Prowlarr/Indexers `definitions/` root.
+        let Some(definitions_root) = std::env::var_os("CARDIGANN_DEFINITIONS_DIR") else {
             return;
         };
 
-        // The same gate `xtask cardigann sync-definitions` applies, so a
-        // definition that ships in the baked asset and a definition that passes
-        // here can never diverge.
-        let definitions =
-            gate::candidate_files(std::path::Path::new(&corpus_dir)).expect("read the v11 corpus");
-        assert!(!definitions.is_empty(), "Cardigann v11 corpus is empty");
+        // The same selection and gate `xtask cardigann sync-definitions`
+        // applies, so a definition that ships in the baked asset and a
+        // definition that passes here can never diverge.
+        let definitions = gate::select_candidates(std::path::Path::new(&definitions_root))
+            .expect("read the definitions corpus")
+            .into_iter()
+            .map(|candidate| candidate.path)
+            .collect::<Vec<_>>();
+        assert!(!definitions.is_empty(), "Cardigann corpus is empty");
 
         let total = definitions.len();
         let mut passed = 0usize;
@@ -1342,10 +1344,10 @@ search:
         }
 
         let failed = failures.len();
-        eprintln!("Cardigann v11 corpus: total={total}, passed={passed}, failed={failed}");
+        eprintln!("Cardigann corpus: total={total}, passed={passed}, failed={failed}");
         assert!(
             failures.is_empty(),
-            "Cardigann v11 corpus: total={total}, passed={passed}, failed={failed}\n{}",
+            "Cardigann corpus: total={total}, passed={passed}, failed={failed}\n{}",
             failures.join("\n")
         );
     }

@@ -1,10 +1,10 @@
 # Advanced Indexers
 
-The Advanced Indexers plugin (plugin id `cardigann-engine`) runs Prowlarr Cardigann v11 tracker definitions as a Scryer WASI Preview 2 indexer component. It is a generic torrent indexer: supply one definition and its selected tracker origin for each configured indexer.
+The Advanced Indexers plugin (plugin id `cardigann-engine`) runs Prowlarr Cardigann v12 tracker definitions (v11 definitions work too) as a Scryer WASI Preview 2 indexer component. It is a generic torrent indexer: supply one definition and its selected tracker origin for each configured indexer.
 
 ## Configure in Scryer
 
-Pick a tracker from **definition**. The plugin ships the whole Prowlarr Cardigann v11 corpus, so choosing an entry supplies the definition and prefills **base_url** with that tracker's first declared link.
+Pick a tracker from **definition**. The plugin ships the whole Prowlarr Cardigann v12 corpus, so choosing an entry supplies the definition and prefills **base_url** with that tracker's first declared link.
 
 Choose **Custom** instead to paste a definition into **definition_yaml** — the escape hatch for a tracker that is not bundled yet, and for testing a definition before it lands upstream. `definition_yaml` is required in that mode and ignored in every other one, because a bundled selection is authoritative.
 
@@ -27,7 +27,7 @@ The definition's `requestdelay` (and a `requestDelay` extra setting, whichever i
 
 ## Behavior and limits
 
-The engine supports Prowlarr Cardigann v11 HTML, JSON, and XML searches, definition filters, login flows, request delays, tracker category mappings, and download-selector validation. It accepts Scryer's typed query, IDs, categories, limit, season, episode, aliases, and `.Query.Year` from the host's search context when the year is genuinely known.
+The engine supports Prowlarr Cardigann v12 HTML, JSON, and XML searches, definition filters (including v12's `base64decode` and `base64encode`), login flows, request delays, tracker category mappings, and download-selector validation. It accepts Scryer's typed query, IDs, categories, limit, season, episode, aliases, and `.Query.Year` from the host's search context when the year is genuinely known.
 
 Music and book search is out of Scryer's scope, so `.Query.Artist`, `.Query.Album`, `.Query.Author`, `.Query.Title`, `.Query.Publisher`, and `.Query.Genre` are simply unbound. A definition that names one behaves as Go's `text/template` does for a missing map key: falsy in a conditional, empty when expanded, never a render error.
 
@@ -36,8 +36,10 @@ Music and book search is out of Scryer's scope, so `.Query.Artist`, `.Query.Albu
 `known_cardigann_definitions.v1.jsonl` is the selector index and `known_cardigann_definitions.v1.bodies.jsonl` holds one YAML body per line. Both are generated — regenerate them from a Prowlarr Indexers checkout with:
 
 ```
-cargo xtask cardigann sync-definitions --source <indexers>/definitions/v11
+cargo xtask cardigann sync-definitions --source <indexers>/definitions
 ```
+
+Upstream keeps each definition only in the lowest schema version it validates against, so the command takes each one from the highest of `definitions/v11` and `definitions/v12` that has it, the way Prowlarr's v12 reader does. The report records which directory every definition came from.
 
 Every candidate has to parse, validate, and reach its first HTTP request under this engine before it can be baked; anything that fails is excluded and named in the command's report. `cargo xtask cardigann sync-definitions --check` fails instead of writing, and the crate's own tests re-run the same gate over everything the asset already contains.
 

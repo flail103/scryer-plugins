@@ -604,7 +604,9 @@ enum CardigannCommand {
 
 #[derive(Args)]
 struct CardigannSyncDefinitionsArgs {
-    /// A Prowlarr/Indexers checkout's `definitions/v11` directory.
+    /// A Prowlarr/Indexers checkout's `definitions/` root. Each definition is
+    /// baked from the highest of `v11` and `v12` that has it, as Prowlarr's v12
+    /// reader loads it.
     #[arg(long)]
     source: PathBuf,
     /// Where to write the machine-readable sync report.
@@ -8804,12 +8806,14 @@ fn run_catalog_validate_v2(_ctx: &TaskContext) -> Result<()> {
 struct CardigannSyncReport {
     candidates: usize,
     accepted: usize,
+    accepted_by_version: BTreeMap<String, usize>,
     excluded: Vec<CardigannExcludedDefinition>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CardigannExcludedDefinition {
     file: String,
+    source_version: String,
     reason: String,
 }
 
@@ -8898,13 +8902,22 @@ fn run_cardigann_sync_definitions(
     }
 
     println!(
-        "\n   Cardigann definitions: candidates={}, baked={}, excluded={}",
+        "\n   Cardigann definitions: candidates={}, baked={} ({}), excluded={}",
         report.candidates,
         report.accepted,
+        report
+            .accepted_by_version
+            .iter()
+            .map(|(version, count)| format!("{version}={count}"))
+            .collect::<Vec<_>>()
+            .join(", "),
         report.excluded.len()
     );
     for excluded in &report.excluded {
-        warn(format!("excluded {}: {}", excluded.file, excluded.reason));
+        warn(format!(
+            "excluded {}/{}: {}",
+            excluded.source_version, excluded.file, excluded.reason
+        ));
     }
 
     if args.check && changed {

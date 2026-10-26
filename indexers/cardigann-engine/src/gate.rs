@@ -1,8 +1,8 @@
 //! The admission gate for the baked definition corpus.
 //!
-//! One definition is admissible when it parses as Cardigann v11, validates
+//! One definition is admissible when it parses as Cardigann v12, validates
 //! against the schema this engine actually supports, and drives the search flow
-//! far enough to produce its first HTTP request. That is the same bar the v11
+//! far enough to produce its first HTTP request. That is the same bar the
 //! corpus test holds the upstream repository to, and the same bar
 //! `xtask cardigann sync-definitions` applies before writing the committed
 //! asset — one implementation, used by both, so the shipped corpus can never
@@ -66,6 +66,56 @@ pub fn gate_definition(source: &str) -> Result<GateEntry, String> {
     }
 }
 
+/// The upstream `definitions/<vN>` directories this engine reads, oldest first.
+///
+/// Prowlarr/Indexers keeps each definition only in the lowest schema version
+/// it validates against, so `v12/` holds just the definitions that need v12
+/// features. A v12 consumer (Prowlarr reads `DEFINITION_VERSION = 12`) takes
+/// each definition from the highest of these directories that has it.
+pub const SOURCE_VERSIONS: [&str; 2] = ["v11", "v12"];
+
+/// One definition file chosen from a `definitions/` root.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub path: PathBuf,
+    pub file: String,
+    /// The `definitions/<vN>` directory the file was taken from.
+    pub version: &'static str,
+}
+
+/// Every definition a v12 consumer would load from a Prowlarr `definitions/`
+/// root, sorted by file name: each file from the highest of
+/// [`SOURCE_VERSIONS`] that has it, so a newer copy always wins even when it
+/// fails the gate and the older one would not.
+pub fn select_candidates(definitions_root: &Path) -> Result<Vec<Candidate>, String> {
+    let mut selected: BTreeMap<String, Candidate> = BTreeMap::new();
+    for version in SOURCE_VERSIONS {
+        let directory = definitions_root.join(version);
+        if !directory.is_dir() {
+            return Err(format!(
+                "{} has no {version} directory; pass the upstream definitions/ root",
+                definitions_root.display()
+            ));
+        }
+        for path in candidate_files(&directory)? {
+            let file = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            selected.insert(
+                file.clone(),
+                Candidate {
+                    path,
+                    file,
+                    version,
+                },
+            );
+        }
+    }
+    Ok(selected.into_values().collect())
+}
+
 /// Every `*.yml` / `*.yaml` file in a Prowlarr definitions directory, sorted.
 pub fn candidate_files(source_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = std::fs::read_dir(source_dir)
@@ -91,26 +141,40 @@ pub fn candidate_files(source_dir: &Path) -> Result<Vec<PathBuf>, String> {
 #[derive(Debug, Serialize)]
 pub struct Excluded {
     pub file: String,
+    pub source_version: String,
     pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Baked {
+    pub id: String,
+    pub file: String,
+    pub source_version: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SyncReport {
     pub schema_version: u32,
     pub source_dir: String,
+    pub source_versions: Vec<String>,
     pub candidates: usize,
     pub accepted: usize,
+    /// How many baked definitions came from each `definitions/<vN>`.
+    pub accepted_by_version: BTreeMap<String, usize>,
+    pub baked: Vec<Baked>,
     pub excluded: Vec<Excluded>,
 }
 
 struct Admitted {
     entry: GateEntry,
+    file: String,
+    version: &'static str,
     source: String,
 }
 
-/// Gate a whole source directory and render the two asset files plus a report.
+/// Gate a whole `definitions/` root and render the two asset files plus a report.
 fn sync(source_dir: &Path) -> Result<(String, String, SyncReport), String> {
-    let candidates = candidate_files(source_dir)?;
+    let candidates = select_candidates(source_dir)?;
     if candidates.is_empty() {
         return Err(format!(
             "{} contains no Cardigann definitions",
@@ -121,19 +185,18 @@ fn sync(source_dir: &Path) -> Result<(String, String, SyncReport), String> {
     let mut admitted: Vec<Admitted> = Vec::new();
     let mut excluded = Vec::new();
     let mut seen_ids: BTreeMap<String, String> = BTreeMap::new();
-    for path in &candidates {
-        let file = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let source = match std::fs::read_to_string(path) {
+    for candidate in &candidates {
+        let file = candidate.file.clone();
+        let version = candidate.version;
+        let excluded_because = |reason: String| Excluded {
+            file: file.clone(),
+            source_version: version.to_string(),
+            reason,
+        };
+        let source = match std::fs::read_to_string(&candidate.path) {
             Ok(source) => source,
             Err(error) => {
-                excluded.push(Excluded {
-                    file,
-                    reason: format!("could not read: {error}"),
-                });
+                excluded.push(excluded_because(format!("could not read: {error}")));
                 continue;
             }
         };
@@ -143,23 +206,27 @@ fn sync(source_dir: &Path) -> Result<(String, String, SyncReport), String> {
                 // key, so a collision has to be an exclusion rather than a
                 // silent last-writer-wins.
                 if entry.id == CUSTOM_DEFINITION_ID {
-                    excluded.push(Excluded {
-                        file,
-                        reason: format!("id `{CUSTOM_DEFINITION_ID}` is reserved"),
-                    });
+                    excluded.push(excluded_because(format!(
+                        "id `{CUSTOM_DEFINITION_ID}` is reserved"
+                    )));
                     continue;
                 }
                 if let Some(previous) = seen_ids.get(&entry.id) {
-                    excluded.push(Excluded {
-                        file,
-                        reason: format!("id `{}` is already used by {previous}", entry.id),
-                    });
+                    excluded.push(excluded_because(format!(
+                        "id `{}` is already used by {previous}",
+                        entry.id
+                    )));
                     continue;
                 }
-                seen_ids.insert(entry.id.clone(), file);
-                admitted.push(Admitted { entry, source });
+                seen_ids.insert(entry.id.clone(), format!("{version}/{file}"));
+                admitted.push(Admitted {
+                    entry,
+                    file: file.clone(),
+                    version,
+                    source,
+                });
             }
-            Err(reason) => excluded.push(Excluded { file, reason }),
+            Err(reason) => excluded.push(excluded_because(reason)),
         }
     }
     if admitted.is_empty() {
@@ -196,11 +263,30 @@ fn sync(source_dir: &Path) -> Result<(String, String, SyncReport), String> {
         bodies.push('\n');
     }
 
+    let mut accepted_by_version: BTreeMap<String, usize> = SOURCE_VERSIONS
+        .iter()
+        .map(|version| (version.to_string(), 0))
+        .collect();
+    for item in &admitted {
+        *accepted_by_version
+            .entry(item.version.to_string())
+            .or_default() += 1;
+    }
     let report = SyncReport {
         schema_version: ASSET_SCHEMA_VERSION,
         source_dir: source_dir.display().to_string(),
+        source_versions: SOURCE_VERSIONS.iter().map(ToString::to_string).collect(),
         candidates: candidates.len(),
         accepted: admitted.len(),
+        accepted_by_version,
+        baked: admitted
+            .iter()
+            .map(|item| Baked {
+                id: item.entry.id.clone(),
+                file: item.file.clone(),
+                source_version: item.version.to_string(),
+            })
+            .collect(),
         excluded,
     };
     Ok((index, bodies, report))
@@ -267,6 +353,49 @@ mod tests {
             report.accepted,
             report.excluded.len()
         );
+    }
+
+    #[test]
+    fn selects_each_definition_from_the_highest_version_that_has_it() {
+        let root = std::env::temp_dir().join(format!(
+            "cardigann-gate-select-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (version, file) in [
+            ("v10", "older.yml"),
+            ("v11", "fixture.yml"),
+            ("v11", "only-v11.yml"),
+            ("v11", "schema.json"),
+            ("v12", "fixture.yml"),
+            ("v12", "schema.json"),
+            ("v13", "newer.yml"),
+        ] {
+            let directory = root.join(version);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(file), version).unwrap();
+        }
+
+        let selected = select_candidates(&root).unwrap();
+        let summary = selected
+            .iter()
+            .map(|candidate| (candidate.file.as_str(), candidate.version))
+            .collect::<Vec<_>>();
+        assert_eq!(summary, [("fixture.yml", "v12"), ("only-v11.yml", "v11")]);
+        assert_eq!(
+            std::fs::read_to_string(&selected[0].path).unwrap(),
+            "v12",
+            "the v12 copy wins"
+        );
+
+        std::fs::remove_dir_all(root.join("v12")).unwrap();
+        assert!(
+            select_candidates(&root)
+                .unwrap_err()
+                .contains("has no v12 directory")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

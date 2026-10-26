@@ -1609,7 +1609,7 @@ fn complete_grab_response(context: &Context, response: PluginHttpResponse) -> Re
 #[cfg(test)]
 pub(crate) fn parse_definition(source: &str) -> Result<Definition, String> {
     serde_yaml::from_str(source.trim_start_matches('\u{feff}'))
-        .map_err(|error| format!("invalid Cardigann v11 runtime definition: {error}"))
+        .map_err(|error| format!("invalid Cardigann v12 runtime definition: {error}"))
 }
 
 fn parse_compiled_ir(input: &str) -> Result<Definition, String> {
@@ -4593,7 +4593,7 @@ mod tests {
 
     #[test]
     fn network_endpoints_skip_result_derived_download_links() {
-        for id in ["hdforever", "nyaasi", "pwtorrents", "hdturk", "tmghub"] {
+        for id in ["hdforever-api", "nyaasi", "pwtorrents", "hdturk", "tmghub"] {
             let definition =
                 parse_definition(&crate::baked::definition_yaml(id).unwrap().unwrap()).unwrap();
             let origins = resolve_network_endpoints(&definition, &BTreeMap::new())
@@ -4611,13 +4611,13 @@ mod tests {
 
     #[test]
     fn network_endpoints_resolve_reported_definition_defaults() {
-        for (id, host) in [
-            ("abnormal-api", "api.abn.lol"),
-            ("animetosho-xyz", "feed.animetosho.xyz"),
-            ("thepiratebay", "apibay.org"),
-            ("v3x", "api.v3x.club"),
-            ("yggreborn-api", "api.yggreborn.org"),
-            ("yts", "movies-api.accel.li"),
+        for (id, host, setting) in [
+            ("abnormal-api", "api.abn.lol", "apiurl"),
+            ("animetosho-xyz", "feed.animetosho.net", "api-url"),
+            ("thepiratebay", "apibay.org", "apiurl"),
+            ("v3x", "api.v3x.club", "apiurl"),
+            ("yggreborn-api", "api.yggreborn.org", "apiurl"),
+            ("yts", "movies-api.accel.li", "apiurl"),
         ] {
             let definition =
                 parse_definition(&crate::baked::definition_yaml(id).unwrap().unwrap()).unwrap();
@@ -4627,7 +4627,7 @@ mod tests {
                 origins.contains(&format!("https://{host}")),
                 "{id}: {origins:?}"
             );
-            let config = BTreeMap::from([("apiurl".into(), "alternate.example:8443".into())]);
+            let config = BTreeMap::from([(setting.into(), "alternate.example:8443".into())]);
             let origins = resolve_network_endpoints(&definition, &config).unwrap();
             assert!(
                 origins.contains(&"https://alternate.example:8443".into()),
