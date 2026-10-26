@@ -611,15 +611,15 @@ fn download_subtitle_impl(
 
 /// The subtitle download's answer status, as the download's failure.
 ///
-/// A 404 or 410 means AnimeTosho no longer has the attachment the search
-/// offered, so it is `item_not_found` and the host stops asking for it. Every
-/// other error status keeps the classification it always had.
+/// A 404 means AnimeTosho no longer has the attachment the search offered, so
+/// it is `item_not_found` and the host stops asking for it. Every other error
+/// status, 410 included, keeps the classification it always had.
 fn check_download_status(
     status: u16,
     retry_after: Option<u64>,
     body: &str,
 ) -> Result<(), PluginError> {
-    if matches!(status, 404 | 410) {
+    if status == 404 {
         return Err(plugin_error(
             codes::ITEM_NOT_FOUND,
             "The AnimeTosho subtitle file no longer exists.",
@@ -1042,19 +1042,18 @@ mod tests {
 
     #[test]
     fn a_download_animetosho_no_longer_has_is_item_not_found() {
-        for status in [404, 410] {
-            let error = check_download_status(status, None, "fixture upstream text").unwrap_err();
-            assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
-            assert!(!error.public_message.contains("fixture upstream text"));
-            let debug = error.debug_message.as_deref().unwrap();
-            assert!(debug.contains(&format!("HTTP {status}")));
-            assert!(debug.contains("fixture upstream text"));
-        }
+        let status = 404;
+        let error = check_download_status(status, None, "fixture upstream text").unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+        assert!(!error.public_message.contains("fixture upstream text"));
+        let debug = error.debug_message.as_deref().unwrap();
+        assert!(debug.contains(&format!("HTTP {status}")));
+        assert!(debug.contains("fixture upstream text"));
     }
 
     #[test]
     fn other_download_failures_are_not_item_not_found() {
-        for status in [401, 403, 429, 500, 503] {
+        for status in [401, 403, 410, 429, 500, 503] {
             let error = check_download_status(status, None, "busy").unwrap_err();
             assert_ne!(
                 error.code,
@@ -1065,6 +1064,10 @@ mod tests {
         assert_eq!(
             check_download_status(500, None, "busy").unwrap_err().code,
             PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            check_download_status(410, None, "busy").unwrap_err().code,
+            PluginErrorCode::Temporary
         );
         assert!(check_download_status(200, None, "").is_ok());
     }

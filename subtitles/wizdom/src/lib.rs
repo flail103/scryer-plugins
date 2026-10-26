@@ -839,16 +839,16 @@ fn map_download_status(response: &HttpResponse) -> Result<(), Failure> {
     map_response_status(response, map_download_status_details)
 }
 
-/// A 404 or 410 on the file request means Wizdom no longer has the subtitle
-/// the search offered, so it is `item_not_found` and the host stops asking
-/// for it. Every other status maps exactly as any other Wizdom request does;
-/// search keeps its own 404 handling.
+/// A 404 on the file request means Wizdom no longer has the subtitle the
+/// search offered, so it is `item_not_found` and the host stops asking for
+/// it. Every other status, 410 included, maps exactly as any other Wizdom
+/// request does; search keeps its own 404 handling.
 fn map_download_status_details(
     status: u16,
     body_text: &str,
     retry_after_seconds: Option<i64>,
 ) -> Result<(), Failure> {
-    if matches!(status, 404 | 410) {
+    if status == 404 {
         return Err(Failure::new(
             FailureKind::Unsupported,
             format!("Wizdom download returned HTTP {status}: {body_text}"),
@@ -1292,16 +1292,15 @@ mod tests {
 
     #[test]
     fn a_download_wizdom_no_longer_has_is_item_not_found() {
-        for status in [404, 410] {
-            let error = map_download_status_details(status, "fixture upstream text", None)
-                .unwrap_err()
-                .into_plugin_error();
-            assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
-            assert!(!error.public_message.contains("fixture upstream text"));
-            let debug = error.debug_message.as_deref().unwrap();
-            assert!(debug.contains(&format!("HTTP {status}")));
-            assert!(debug.contains("fixture upstream text"));
-        }
+        let status = 404;
+        let error = map_download_status_details(status, "fixture upstream text", None)
+            .unwrap_err()
+            .into_plugin_error();
+        assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+        assert!(!error.public_message.contains("fixture upstream text"));
+        let debug = error.debug_message.as_deref().unwrap();
+        assert!(debug.contains(&format!("HTTP {status}")));
+        assert!(debug.contains("fixture upstream text"));
         // Search keeps its own 404 handling.
         assert_ne!(
             map_http_status_details("Wizdom releases", 404, "missing", None)
@@ -1314,7 +1313,7 @@ mod tests {
 
     #[test]
     fn other_download_failures_are_not_item_not_found() {
-        for status in [401, 403, 429, 500, 503] {
+        for status in [401, 403, 410, 429, 500, 503] {
             let error = map_download_status_details(status, "busy", None)
                 .unwrap_err()
                 .into_plugin_error();
@@ -1330,6 +1329,13 @@ mod tests {
                 .into_plugin_error()
                 .code,
             PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            map_download_status_details(410, "busy", None)
+                .unwrap_err()
+                .into_plugin_error()
+                .code,
+            PluginErrorCode::Temporary
         );
         assert!(map_download_status_details(200, "", None).is_ok());
     }

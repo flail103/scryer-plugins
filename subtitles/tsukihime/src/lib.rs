@@ -275,33 +275,76 @@ fn subtitle_search_impl(
 ) -> Result<Vec<SubtitlePluginCandidate>, TsukihimeError> {
     let config = TsukihimeConfig::from_host();
     let limit = config.limit_for_request(DEFAULT_MAX_RESULTS);
-    let mut results = Vec::new();
-    let mut detail_budget = config.max_detail_fetches;
-    let mut fetched = HashSet::new();
+    let mut details = DetailFetches::new(&config);
 
     let mut fetch = |path: &str| get_json::<Value>(&config, path);
+    let mut fetch_detail = |id: i64| get_json::<TorrentDetail>(&config, &format!("torrents/{id}"));
     let mut consume = |rung: TorrentRung| -> Result<bool, TsukihimeError> {
-        for summary in rung.summaries {
-            if !include_torrent_summary(&summary, &config, request) || !fetched.insert(summary.id) {
-                continue;
-            }
-            if detail_budget == 0 {
-                return Ok(true);
-            }
-            detail_budget -= 1;
-            let detail =
-                match get_json::<TorrentDetail>(&config, &format!("torrents/{}", summary.id)) {
-                    Ok(detail) => detail,
-                    Err(TsukihimeError::RateLimited(_)) => return Ok(true),
-                    Err(error) => return Err(detail_lookup_error(summary.id, error)),
-                };
-            append_detail_candidates(&mut results, &config, request, detail, rung.episode_page)?;
-        }
-        Ok(!results.is_empty() || detail_budget == 0)
+        details.consume(&config, request, rung, &mut fetch_detail)
     };
     run_search_ladder(request, limit, &mut fetch, &mut consume)?;
 
-    Ok(results)
+    Ok(details.results)
+}
+
+/// The detail fetches one search spends, and the candidates they produced.
+///
+/// The budget is shared by every rung of the ladder, and a torrent is fetched
+/// at most once however many rungs list it.
+struct DetailFetches {
+    results: Vec<SubtitlePluginCandidate>,
+    budget: usize,
+    fetched: HashSet<i64>,
+}
+
+impl DetailFetches {
+    fn new(config: &TsukihimeConfig) -> Self {
+        Self {
+            results: Vec::new(),
+            budget: config.max_detail_fetches,
+            fetched: HashSet::new(),
+        }
+    }
+
+    /// Fetch the details of one rung's torrents and collect their subtitles,
+    /// answering whether the search is done.
+    ///
+    /// A torrent whose detail record is gone (HTTP 404) is skipped and the
+    /// rest of the rung still counts; a rate limit ends the search with what
+    /// it has; every other failure fails the search.
+    fn consume(
+        &mut self,
+        config: &TsukihimeConfig,
+        request: &SubtitlePluginSearchRequest,
+        rung: TorrentRung,
+        fetch_detail: &mut dyn FnMut(i64) -> Result<TorrentDetail, TsukihimeError>,
+    ) -> Result<bool, TsukihimeError> {
+        for summary in rung.summaries {
+            if !include_torrent_summary(&summary, config, request)
+                || !self.fetched.insert(summary.id)
+            {
+                continue;
+            }
+            if self.budget == 0 {
+                return Ok(true);
+            }
+            self.budget -= 1;
+            let detail = match fetch_detail(summary.id) {
+                Ok(detail) => detail,
+                Err(TsukihimeError::NotFound) => continue,
+                Err(TsukihimeError::RateLimited(_)) => return Ok(true),
+                Err(error) => return Err(error),
+            };
+            append_detail_candidates(
+                &mut self.results,
+                config,
+                request,
+                detail,
+                rung.episode_page,
+            )?;
+        }
+        Ok(!self.results.is_empty() || self.budget == 0)
+    }
 }
 
 /// How many `search/torrents` queries one subtitle search may spend.
@@ -396,19 +439,6 @@ fn run_search_ladder(
         }
     }
     Ok(())
-}
-
-/// A failed `torrents/{id}` detail fetch. A 404 there means Tsukihime no
-/// longer has the torrent its own listing just named, so it is
-/// `item_not_found`; every other failure passes through unchanged.
-fn detail_lookup_error(torrent_id: i64, error: TsukihimeError) -> TsukihimeError {
-    match error {
-        TsukihimeError::NotFound => item_not_found(
-            "The Tsukihime torrent no longer exists.",
-            format!("Tsukihime torrent {torrent_id} detail returned HTTP 404"),
-        ),
-        other => other,
-    }
 }
 
 /// The provider said the requested file or torrent does not exist.
@@ -1108,19 +1138,19 @@ fn subtitle_download_impl(
 
 /// The subtitle storage's answer status, as the download's failure.
 ///
-/// A 404 or 410 means the attachment the search offered is gone from
-/// storage, so it is `item_not_found` and the host stops asking for it. Every
-/// other error status keeps the classification it always had.
+/// A 404 means the attachment the search offered is gone from storage, so it
+/// is `item_not_found` and the host stops asking for it. Every other error
+/// status, 410 included, keeps the classification it always had.
 fn check_download_status(response: &TsukihimeHttpResponse) -> Result<(), TsukihimeError> {
     match response.status {
         200..=299 => Ok(()),
         429 => Err(TsukihimeError::RateLimited(retry_after_seconds(
             &response.headers,
         ))),
-        status @ (404 | 410) => Err(item_not_found(
+        404 => Err(item_not_found(
             "The Tsukihime subtitle file no longer exists.",
             format!(
-                "Tsukihime subtitle storage returned HTTP {status}: {}",
+                "Tsukihime subtitle storage returned HTTP 404: {}",
                 compact_error_body(&response.body)
             ),
         )),
@@ -1839,22 +1869,20 @@ mod tests {
 
     #[test]
     fn a_download_storage_no_longer_has_is_item_not_found() {
-        for status in [404, 410] {
-            let error = to_plugin_error(
-                check_download_status(&storage_response(status, "fixture upstream text"))
-                    .unwrap_err(),
-            );
-            assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
-            assert!(!error.public_message.contains("fixture upstream text"));
-            let debug = error.debug_message.as_deref().unwrap();
-            assert!(debug.contains(&format!("HTTP {status}")));
-            assert!(debug.contains("fixture upstream text"));
-        }
+        let status = 404;
+        let error = to_plugin_error(
+            check_download_status(&storage_response(status, "fixture upstream text")).unwrap_err(),
+        );
+        assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+        assert!(!error.public_message.contains("fixture upstream text"));
+        let debug = error.debug_message.as_deref().unwrap();
+        assert!(debug.contains(&format!("HTTP {status}")));
+        assert!(debug.contains("fixture upstream text"));
     }
 
     #[test]
     fn other_download_failures_are_not_item_not_found() {
-        for status in [401, 403, 429, 500, 503] {
+        for status in [401, 403, 410, 429, 500, 503] {
             let error = to_plugin_error(
                 check_download_status(&storage_response(status, "busy")).unwrap_err(),
             );
@@ -1864,25 +1892,76 @@ mod tests {
                 "HTTP {status}"
             );
         }
-        let error =
-            to_plugin_error(check_download_status(&storage_response(500, "busy")).unwrap_err());
-        assert_eq!(error.code, PluginErrorCode::Temporary);
+        for status in [410, 500] {
+            let error = to_plugin_error(
+                check_download_status(&storage_response(status, "busy")).unwrap_err(),
+            );
+            assert_eq!(error.code, PluginErrorCode::Temporary, "HTTP {status}");
+        }
         assert!(check_download_status(&storage_response(200, "")).is_ok());
     }
 
-    #[test]
-    fn a_gone_torrent_detail_is_item_not_found_and_other_failures_pass_through() {
-        let gone = to_plugin_error(detail_lookup_error(7, TsukihimeError::NotFound));
-        assert_eq!(gone.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
-        assert!(gone.debug_message.as_deref().unwrap().contains("torrent 7"));
+    fn rung_of(ids: &[i64]) -> TorrentRung {
+        TorrentRung {
+            summaries: ids
+                .iter()
+                .map(|id| {
+                    serde_json::from_value(torrent_json(*id, "[Group] Show - 12", Some(12), 222))
+                        .expect("summary parses")
+                })
+                .collect(),
+            episode_page: None,
+        }
+    }
 
-        let limited = to_plugin_error(detail_lookup_error(7, TsukihimeError::RateLimited(None)));
-        assert_eq!(limited.code, PluginErrorCode::RateLimited);
-        let failed = to_plugin_error(detail_lookup_error(
-            7,
-            TsukihimeError::Message("Tsukihime API returned HTTP 500: busy".to_string()),
-        ));
-        assert_eq!(failed.code, PluginErrorCode::Temporary);
+    #[test]
+    fn a_gone_torrent_detail_is_skipped_and_the_other_torrents_still_count() {
+        let config = test_config();
+        let request = episode_request(1, 12);
+        let mut details = DetailFetches::new(&config);
+        let mut asked = Vec::new();
+        let mut fetch_detail = |id: i64| {
+            asked.push(id);
+            if id == 1 {
+                Err(TsukihimeError::NotFound)
+            } else {
+                Ok(season_pack_detail(&["Show - S01E12.mkv"], Some(12)))
+            }
+        };
+
+        let done = details
+            .consume(&config, &request, rung_of(&[1, 2]), &mut fetch_detail)
+            .expect("a gone detail does not fail the search");
+
+        assert!(done);
+        assert_eq!(asked, vec![1, 2]);
+        assert_eq!(details.results.len(), 1);
+        assert_eq!(details.results[0].language, "eng");
+    }
+
+    #[test]
+    fn other_detail_failures_still_fail_the_search() {
+        let config = test_config();
+        let request = episode_request(1, 12);
+        let mut details = DetailFetches::new(&config);
+        let mut fetch_detail = |_: i64| {
+            Err(TsukihimeError::Message(
+                "Tsukihime API returned HTTP 500: busy".to_string(),
+            ))
+        };
+        let error = details
+            .consume(&config, &request, rung_of(&[1, 2]), &mut fetch_detail)
+            .expect_err("a failing detail fails the search");
+        assert_eq!(to_plugin_error(error).code, PluginErrorCode::Temporary);
+
+        let mut details = DetailFetches::new(&config);
+        let mut limited = |_: i64| Err(TsukihimeError::RateLimited(None));
+        assert!(
+            details
+                .consume(&config, &request, rung_of(&[1]), &mut limited)
+                .expect("a rate limit ends the search with what it has")
+        );
+        assert!(details.results.is_empty());
     }
 
     fn fixture_detail() -> TorrentDetail {
