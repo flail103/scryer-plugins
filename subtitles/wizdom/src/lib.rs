@@ -220,6 +220,9 @@ fn public_message(code: &PluginErrorCode, kind: FailureKind) -> &'static str {
     if *code == PluginErrorCode::from(codes::TLS_ERROR) {
         return "A secure connection to Wizdom could not be established.";
     }
+    if *code == PluginErrorCode::from(codes::ITEM_NOT_FOUND) {
+        return "The Wizdom subtitle file no longer exists.";
+    }
     match kind {
         FailureKind::AuthFailed => "Wizdom refused the request.",
         FailureKind::RateLimited => "Wizdom is rate limiting requests.",
@@ -597,7 +600,7 @@ fn download_subtitle_impl(
         "*/*",
         reference.page_url.as_deref(),
     )?;
-    map_http_status("Wizdom download", &response)?;
+    map_download_status(&response)?;
 
     let bytes = response.body();
     if bytes.is_empty() {
@@ -825,6 +828,40 @@ fn http_get(
 }
 
 fn map_http_status(label: &str, response: &HttpResponse) -> Result<(), Failure> {
+    map_response_status(response, |status, body_text, retry_after_seconds| {
+        map_http_status_details(label, status, body_text, retry_after_seconds)
+    })
+}
+
+/// The subtitle file request's answer status; see
+/// [`map_download_status_details`].
+fn map_download_status(response: &HttpResponse) -> Result<(), Failure> {
+    map_response_status(response, map_download_status_details)
+}
+
+/// A 404 on the file request means Wizdom no longer has the subtitle the
+/// search offered, so it is `item_not_found` and the host stops asking for
+/// it. Every other status, 410 included, maps exactly as any other Wizdom
+/// request does; search keeps its own 404 handling.
+fn map_download_status_details(
+    status: u16,
+    body_text: &str,
+    retry_after_seconds: Option<i64>,
+) -> Result<(), Failure> {
+    if status == 404 {
+        return Err(Failure::new(
+            FailureKind::Unsupported,
+            format!("Wizdom download returned HTTP {status}: {body_text}"),
+        )
+        .with_code(codes::ITEM_NOT_FOUND));
+    }
+    map_http_status_details("Wizdom download", status, body_text, retry_after_seconds)
+}
+
+fn map_response_status(
+    response: &HttpResponse,
+    map: impl FnOnce(u16, &str, Option<i64>) -> Result<(), Failure>,
+) -> Result<(), Failure> {
     let status = response.status_code();
     // Only decode a body preview on the error paths; a successful download body
     // is a zip that would otherwise be read twice.
@@ -834,8 +871,7 @@ fn map_http_status(label: &str, response: &HttpResponse) -> Result<(), Failure> 
     let retry_after_seconds = response_header(response, "retry-after")
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|seconds| *seconds >= 0);
-    map_http_status_details(
-        label,
+    map(
         status,
         &response_body_preview(response),
         retry_after_seconds,
@@ -1252,6 +1288,56 @@ mod tests {
                 .kind,
             FailureKind::Unsupported
         );
+    }
+
+    #[test]
+    fn a_download_wizdom_no_longer_has_is_item_not_found() {
+        let status = 404;
+        let error = map_download_status_details(status, "fixture upstream text", None)
+            .unwrap_err()
+            .into_plugin_error();
+        assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+        assert!(!error.public_message.contains("fixture upstream text"));
+        let debug = error.debug_message.as_deref().unwrap();
+        assert!(debug.contains(&format!("HTTP {status}")));
+        assert!(debug.contains("fixture upstream text"));
+        // Search keeps its own 404 handling.
+        assert_ne!(
+            map_http_status_details("Wizdom releases", 404, "missing", None)
+                .unwrap_err()
+                .into_plugin_error()
+                .code,
+            PluginErrorCode::from(codes::ITEM_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn other_download_failures_are_not_item_not_found() {
+        for status in [401, 403, 410, 429, 500, 503] {
+            let error = map_download_status_details(status, "busy", None)
+                .unwrap_err()
+                .into_plugin_error();
+            assert_ne!(
+                error.code,
+                PluginErrorCode::from(codes::ITEM_NOT_FOUND),
+                "HTTP {status}"
+            );
+        }
+        assert_eq!(
+            map_download_status_details(500, "busy", None)
+                .unwrap_err()
+                .into_plugin_error()
+                .code,
+            PluginErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            map_download_status_details(410, "busy", None)
+                .unwrap_err()
+                .into_plugin_error()
+                .code,
+            PluginErrorCode::Temporary
+        );
+        assert!(map_download_status_details(200, "", None).is_ok());
     }
 
     #[test]
