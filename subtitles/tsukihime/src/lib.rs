@@ -293,7 +293,7 @@ fn subtitle_search_impl(
                 match get_json::<TorrentDetail>(&config, &format!("torrents/{}", summary.id)) {
                     Ok(detail) => detail,
                     Err(TsukihimeError::RateLimited(_)) => return Ok(true),
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(detail_lookup_error(summary.id, error)),
                 };
             append_detail_candidates(&mut results, &config, request, detail, rung.episode_page)?;
         }
@@ -396,6 +396,28 @@ fn run_search_ladder(
         }
     }
     Ok(())
+}
+
+/// A failed `torrents/{id}` detail fetch. A 404 there means Tsukihime no
+/// longer has the torrent its own listing just named, so it is
+/// `item_not_found`; every other failure passes through unchanged.
+fn detail_lookup_error(torrent_id: i64, error: TsukihimeError) -> TsukihimeError {
+    match error {
+        TsukihimeError::NotFound => item_not_found(
+            "The Tsukihime torrent no longer exists.",
+            format!("Tsukihime torrent {torrent_id} detail returned HTTP 404"),
+        ),
+        other => other,
+    }
+}
+
+/// The provider said the requested file or torrent does not exist.
+fn item_not_found(public_message: &str, debug: String) -> TsukihimeError {
+    TsukihimeError::Plugin(
+        plugin_error(codes::ITEM_NOT_FOUND, public_message)
+            .debug(debug)
+            .build(),
+    )
 }
 
 /// A torrent list, where a 404 is simply an empty rung of the ladder.
@@ -1068,21 +1090,7 @@ fn subtitle_download_impl(
     reference: &TsukihimeDownloadRef,
 ) -> Result<SubtitlePluginDownloadResponse, TsukihimeError> {
     let response = http_get(&reference.url, "application/x-xz")?;
-    match response.status {
-        200..=299 => {}
-        429 => {
-            return Err(TsukihimeError::RateLimited(retry_after_seconds(
-                &response.headers,
-            )));
-        }
-        404 => return Err(TsukihimeError::NotFound),
-        status => {
-            return Err(TsukihimeError::Message(format!(
-                "Tsukihime subtitle storage returned HTTP {status}: {}",
-                compact_error_body(&response.body)
-            )));
-        }
-    }
+    check_download_status(&response)?;
     if response.body.len() > MAX_COMPRESSED_SUBTITLE_BYTES {
         return Err(TsukihimeError::Message(format!(
             "Tsukihime subtitle is too large: {} compressed bytes",
@@ -1096,6 +1104,31 @@ fn subtitle_download_impl(
         filename: Some(reference.filename.clone()),
         content_type: subtitle_content_type(&reference.format).map(str::to_string),
     })
+}
+
+/// The subtitle storage's answer status, as the download's failure.
+///
+/// A 404 or 410 means the attachment the search offered is gone from
+/// storage, so it is `item_not_found` and the host stops asking for it. Every
+/// other error status keeps the classification it always had.
+fn check_download_status(response: &TsukihimeHttpResponse) -> Result<(), TsukihimeError> {
+    match response.status {
+        200..=299 => Ok(()),
+        429 => Err(TsukihimeError::RateLimited(retry_after_seconds(
+            &response.headers,
+        ))),
+        status @ (404 | 410) => Err(item_not_found(
+            "The Tsukihime subtitle file no longer exists.",
+            format!(
+                "Tsukihime subtitle storage returned HTTP {status}: {}",
+                compact_error_body(&response.body)
+            ),
+        )),
+        status => Err(TsukihimeError::Message(format!(
+            "Tsukihime subtitle storage returned HTTP {status}: {}",
+            compact_error_body(&response.body)
+        ))),
+    }
 }
 
 /// Unwrap one XZ-compressed subtitle attachment through the host.
@@ -1794,6 +1827,62 @@ mod tests {
         let validation = validation_error_response(TsukihimeError::RateLimited(Some(20)));
         assert_eq!(validation.status, SubtitleValidateConfigStatus::RateLimited);
         assert_eq!(validation.retry_after_seconds, Some(20));
+    }
+
+    fn storage_response(status: u16, body: &str) -> TsukihimeHttpResponse {
+        TsukihimeHttpResponse {
+            status,
+            headers: BTreeMap::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_download_storage_no_longer_has_is_item_not_found() {
+        for status in [404, 410] {
+            let error = to_plugin_error(
+                check_download_status(&storage_response(status, "fixture upstream text"))
+                    .unwrap_err(),
+            );
+            assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+            assert!(!error.public_message.contains("fixture upstream text"));
+            let debug = error.debug_message.as_deref().unwrap();
+            assert!(debug.contains(&format!("HTTP {status}")));
+            assert!(debug.contains("fixture upstream text"));
+        }
+    }
+
+    #[test]
+    fn other_download_failures_are_not_item_not_found() {
+        for status in [401, 403, 429, 500, 503] {
+            let error = to_plugin_error(
+                check_download_status(&storage_response(status, "busy")).unwrap_err(),
+            );
+            assert_ne!(
+                error.code,
+                PluginErrorCode::from(codes::ITEM_NOT_FOUND),
+                "HTTP {status}"
+            );
+        }
+        let error =
+            to_plugin_error(check_download_status(&storage_response(500, "busy")).unwrap_err());
+        assert_eq!(error.code, PluginErrorCode::Temporary);
+        assert!(check_download_status(&storage_response(200, "")).is_ok());
+    }
+
+    #[test]
+    fn a_gone_torrent_detail_is_item_not_found_and_other_failures_pass_through() {
+        let gone = to_plugin_error(detail_lookup_error(7, TsukihimeError::NotFound));
+        assert_eq!(gone.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+        assert!(gone.debug_message.as_deref().unwrap().contains("torrent 7"));
+
+        let limited = to_plugin_error(detail_lookup_error(7, TsukihimeError::RateLimited(None)));
+        assert_eq!(limited.code, PluginErrorCode::RateLimited);
+        let failed = to_plugin_error(detail_lookup_error(
+            7,
+            TsukihimeError::Message("Tsukihime API returned HTTP 500: busy".to_string()),
+        ));
+        assert_eq!(failed.code, PluginErrorCode::Temporary);
     }
 
     fn fixture_detail() -> TorrentDetail {

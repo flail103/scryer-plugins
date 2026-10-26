@@ -268,7 +268,7 @@ fn download(
     };
     match download_subtitle_impl(&reference) {
         Ok(response) => PluginResult::Ok(response),
-        Err(error) => PluginResult::Err(classify_error(error)),
+        Err(error) => PluginResult::Err(error),
     }
 }
 
@@ -912,17 +912,42 @@ fn entry_files(
 
 fn download_subtitle_impl(
     reference: &JimakuDownloadRef,
-) -> Result<SubtitlePluginDownloadResponse, String> {
-    let response = http_get(&reference.url, None)?;
-    if response.status_code() >= 400 {
-        return Err(format!(
-            "Jimaku subtitle download returned HTTP {}",
-            response.status_code()
-        ));
+) -> Result<SubtitlePluginDownloadResponse, PluginError> {
+    let response = http_get(&reference.url, None).map_err(classify_error)?;
+    download_response(reference, &response)
+}
+
+/// Turn the file request's answer into the download, or the failure it was.
+///
+/// A 404 or 410 means Jimaku no longer has the file the search offered, so it
+/// is `item_not_found` and the host stops asking for it. Every other error
+/// status keeps the classification it always had.
+fn download_response(
+    reference: &JimakuDownloadRef,
+    response: &JimakuHttpResponse,
+) -> Result<SubtitlePluginDownloadResponse, PluginError> {
+    let status = response.status_code();
+    if matches!(status, 404 | 410) {
+        return Err(plugin_error(
+            codes::ITEM_NOT_FOUND,
+            "The Jimaku subtitle file no longer exists.",
+        )
+        .debug(format_args!(
+            "Jimaku subtitle download returned HTTP {status}: {}",
+            String::from_utf8_lossy(&response.body).trim()
+        ))
+        .build());
+    }
+    if status >= 400 {
+        return Err(classify_error(format!(
+            "Jimaku subtitle download returned HTTP {status}"
+        )));
     }
     let bytes = response.body();
     if !is_archive(&reference.filename) && bytes.len() < MIN_SUBTITLE_BYTES {
-        return Err("Jimaku subtitle file is too small".to_string());
+        return Err(classify_error(
+            "Jimaku subtitle file is too small".to_string(),
+        ));
     }
     Ok(SubtitlePluginDownloadResponse {
         content_base64: BASE64.encode(bytes),
@@ -1274,6 +1299,46 @@ mod tests {
                 .unwrap()
                 .contains("fixture upstream text")
         );
+    }
+
+    fn download_ref() -> JimakuDownloadRef {
+        JimakuDownloadRef {
+            url: "https://jimaku.cc/entry/1/download/Synthetic.Show.E01.ass".to_string(),
+            filename: "Synthetic.Show.E01.ass".to_string(),
+            language: "ja".to_string(),
+            episode: Some(1),
+        }
+    }
+
+    #[test]
+    fn a_download_jimaku_no_longer_has_is_item_not_found() {
+        for status in [404, 410] {
+            let error = download_response(
+                &download_ref(),
+                &host_response(status, r#"{"error":"fixture upstream text"}"#),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, PluginErrorCode::from(codes::ITEM_NOT_FOUND));
+            assert!(!error.public_message.contains("fixture upstream text"));
+            let debug = error.debug_message.as_deref().unwrap();
+            assert!(debug.contains(&format!("HTTP {status}")));
+            assert!(debug.contains("fixture upstream text"));
+        }
+    }
+
+    #[test]
+    fn other_download_failures_are_not_item_not_found() {
+        for status in [401, 403, 429, 500, 503] {
+            let error =
+                download_response(&download_ref(), &host_response(status, "busy")).unwrap_err();
+            assert_ne!(
+                error.code,
+                PluginErrorCode::from(codes::ITEM_NOT_FOUND),
+                "HTTP {status}"
+            );
+        }
+        let error = download_response(&download_ref(), &host_response(500, "busy")).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::Temporary);
     }
 
     #[test]
