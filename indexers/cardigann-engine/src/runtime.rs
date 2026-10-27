@@ -4183,11 +4183,7 @@ fn json_select_rows<'a>(root: &'a Value, path: &str) -> Result<Vec<&'a Value>, S
             _ => {}
         }
     }
-    if rows.is_empty() {
-        Err(format!("JSON rows selector `{path}` did not match"))
-    } else {
-        Ok(rows)
-    }
+    Ok(rows)
 }
 
 #[derive(Debug)]
@@ -7569,6 +7565,31 @@ search:
         assert_eq!(request.method.as_deref(), Some("POST"));
         assert_eq!(request.url, "https://tracker.example/new-login");
         assert_eq!(request.body, b"user=alice");
+    }
+
+    #[test]
+    fn empty_json_search_rows_are_successful_without_missing_attribute_override() {
+        let mut definition = parse_definition(PUBLIC_DEFINITION).unwrap();
+        definition.search.rows.selector = "data".into();
+        definition.search.rows.count = None;
+        definition.search.rows.missing_attribute_equals_no_results = false;
+        let body = r#"{"data":[],"links":{},"meta":{"total":0}}"#;
+        let results = parse_json_results(&definition, body, &mut Variables::new())
+            .expect("an existing empty result array is a successful search");
+        assert!(results.is_empty());
+        for invalid in [r#"{"links":{},"meta":{"total":0}}"#, "not JSON"] {
+            assert!(parse_json_results(&definition, invalid, &mut Variables::new()).is_err());
+        }
+        for (document, selector) in [
+            (serde_json::json!([]), ""),
+            (serde_json::json!({"data": []}), "$.data"),
+            (
+                serde_json::json!({"data": [{"name": "Normal release"}]}),
+                "data:contains(Free)",
+            ),
+        ] {
+            assert!(json_select_rows(&document, selector).unwrap().is_empty());
+        }
     }
 
     #[test]
