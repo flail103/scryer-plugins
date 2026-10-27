@@ -1,5 +1,9 @@
 use std::sync::OnceLock;
 
+use base64::Engine as _;
+use base64::alphabet;
+use base64::engine::DecodePaddingMode;
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, URL_SAFE_NO_PAD};
 use chrono::{
     DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc, Weekday,
 };
@@ -46,6 +50,8 @@ pub fn apply_filters_with_encoding(
             "querystring" => {
                 query_string(&value, args.first().map(String::as_str).unwrap_or_default())
             }
+            "base64decode" => base64_decode(&value)?,
+            "base64encode" => URL_SAFE_NO_PAD.encode(value.as_bytes()),
             "urldecode" => url_decode(&value, encoding),
             "urlencode" => url_encode_with_encoding(&value, encoding),
             "htmldecode" => html_escape::decode_html_entities(&value).into_owned(),
@@ -248,6 +254,55 @@ fn trim(value: &str, args: &[String]) -> String {
         Some(cutset) => value.trim_matches(cutset).to_string(),
         None => value.trim().to_string(),
     }
+}
+
+/// The decoder behind `base64decode` once [`base64_decode`] has restored the
+/// standard alphabet and padding: what .NET's `Convert.FromBase64CharArray`
+/// accepts, which ignores the unused low bits of the final quantum.
+const DOTNET_BASE64: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_decode_padding_mode(DecodePaddingMode::RequireCanonical)
+        .with_decode_allow_trailing_bits(true),
+);
+
+/// Cardigann v12 `base64decode`, matching Prowlarr's
+/// `Encoding.UTF8.GetString(WebEncoders.Base64UrlDecode(data))`.
+///
+/// `WebEncoders.Base64UrlDecode` maps `-` to `+` and `_` to `/`, leaving the
+/// standard characters alone, so both alphabets (even mixed) decode. It then
+/// pads by the raw length: two `=` for a length of 2 mod 4, one for 3 mod 4, and
+/// none for 0 mod 4, so padded, partly padded and unpadded input all decode,
+/// while 1 mod 4 is malformed. `Convert.FromBase64CharArray` finally skips
+/// space, tab, CR and LF and decodes the rest. Bytes that are not UTF-8 become
+/// U+FFFD, as `Encoding.UTF8.GetString` does. Prowlarr raises on malformed
+/// input, so this returns an error rather than passing the value through.
+fn base64_decode(value: &str) -> Result<String, String> {
+    let length = value.chars().count();
+    let padding = match length % 4 {
+        0 => 0,
+        2 => 2,
+        3 => 1,
+        _ => {
+            return Err(format!(
+                "base64decode input is malformed: {length} is an invalid input length"
+            ));
+        }
+    };
+    let mut standard = String::with_capacity(value.len() + padding);
+    for character in value.chars() {
+        match character {
+            '-' => standard.push('+'),
+            '_' => standard.push('/'),
+            ' ' | '\t' | '\r' | '\n' => {}
+            other => standard.push(other),
+        }
+    }
+    standard.extend(std::iter::repeat_n('=', padding));
+    let bytes = DOTNET_BASE64
+        .decode(standard.as_bytes())
+        .map_err(|error| format!("base64decode input is not valid base64: {error}"))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn url_decode(value: &str, encoding: &'static Encoding) -> String {
@@ -1147,6 +1202,100 @@ mod tests {
         assert_eq!(
             parse_date_at("03:04 +02:00", Some("HH:mm zzz"), now).unwrap(),
             "2025-06-15T01:04:00+00:00"
+        );
+    }
+
+    fn filter(name: &str) -> Vec<FilterBlock> {
+        vec![FilterBlock {
+            name: name.into(),
+            args: None,
+        }]
+    }
+
+    #[test]
+    fn base64decode_matches_prowlarr_webencoders_base64_url_decode() {
+        let decode = |input: &str| apply_filters(input, &filter("base64decode"), &Variables::new());
+        for (input, expected) in [
+            // Padded, unpadded and partly padded input all decode.
+            ("aGVsbG8gd29ybGQ=", "hello world"),
+            ("aGVsbG8gd29ybGQ", "hello world"),
+            ("YQ==", "a"),
+            ("YQ=", "a"),
+            ("YQ", "a"),
+            ("YWI=", "ab"),
+            ("YWI", "ab"),
+            ("", ""),
+            // The standard and URL-safe alphabets, alone or mixed.
+            ("PDw/Pz8+Pg==", "<<???>>"),
+            ("PDw_Pz8-Pg", "<<???>>"),
+            ("PDw_Pz8+Pg", "<<???>>"),
+            ("fn5-fg", "~~~~"),
+            // Non-ASCII UTF-8.
+            ("w5xuw69jw7Zkw6kg4pyT", "Ünïcödé ✓"),
+            (
+                "U3ludGhldGljIFNob3cgUzAxRTAyIMK9",
+                "Synthetic Show S01E02 ½",
+            ),
+            // Bytes that are not UTF-8 become U+FFFD.
+            ("//5B", "\u{FFFD}\u{FFFD}A"),
+            ("wyg", "\u{FFFD}("),
+            // .NET ignores the unused low bits of the final quantum.
+            ("YR==", "a"),
+            // Whitespace is skipped after padding is chosen from the raw length.
+            ("YWJj    ", "abc"),
+        ] {
+            assert_eq!(decode(input).as_deref(), Ok(expected), "decoding {input:?}");
+        }
+    }
+
+    #[test]
+    fn base64decode_refuses_input_prowlarr_cannot_decode() {
+        for input in [
+            // A length of 1 mod 4 is malformed before decoding starts.
+            "Y", "YWJjZ", // Characters outside both alphabets.
+            "Y!==", "w5x*", // Padding that is too long or not at the end.
+            "Y===", "YQ==YQ==",
+            // Whitespace still counts toward the length padding is chosen from.
+            "YW Jj", "YQ==\n",
+        ] {
+            assert!(
+                apply_filters(input, &filter("base64decode"), &Variables::new()).is_err(),
+                "{input:?} must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn base64encode_matches_prowlarr_webencoders_base64_url_encode() {
+        for (input, expected) in [
+            ("hello world", "aGVsbG8gd29ybGQ"),
+            ("a", "YQ"),
+            ("ab", "YWI"),
+            ("abc", "YWJj"),
+            ("", ""),
+            ("<<???>>", "PDw_Pz8-Pg"),
+            ("~~~~", "fn5-fg"),
+            ("Ünïcödé ✓", "w5xuw69jw7Zkw6kg4pyT"),
+        ] {
+            assert_eq!(
+                apply_filters(input, &filter("base64encode"), &Variables::new()).as_deref(),
+                Ok(expected),
+                "encoding {input:?}"
+            );
+        }
+        let round_trip = vec![
+            FilterBlock {
+                name: "base64encode".into(),
+                args: None,
+            },
+            FilterBlock {
+                name: "base64decode".into(),
+                args: None,
+            },
+        ];
+        assert_eq!(
+            apply_filters("Synthetic Show S01E02 ½", &round_trip, &Variables::new()).unwrap(),
+            "Synthetic Show S01E02 ½"
         );
     }
 }
