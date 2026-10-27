@@ -100,6 +100,7 @@ fn descriptor_round_trips_and_passes_host_checks() {
         list.allowed_hosts,
         vec![
             "rss.plex.tv".to_string(),
+            "plex-rss-feeds.s3.us-east-1.amazonaws.com".to_string(),
             "discover.provider.plex.tv".to_string(),
             "plex.tv".to_string()
         ]
