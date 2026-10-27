@@ -1,6 +1,18 @@
-# Publishes a merged automated rule-pack refresh through the normal signed
-# release path. Only pull requests opened by the refresh bot from the two
-# refresh branches qualify; everything else is ignored.
+# Publishes a merged automated refresh through the normal signed release path:
+# the TRaSH and SeaDex rule packs (gated by RULE_PACK_REFRESH_ENABLED) and the
+# cardigann-engine definition refresh (gated by CARDIGANN_AUTO_RELEASE_ENABLED).
+# Only pull requests opened by the refresh bot from the refresh branches
+# qualify; everything else is ignored.
+#
+# Each publication runs `release-publish-tags --resume` for exactly one
+# component, so it is idempotent: tag names are derived from the component and
+# the merge commit, existing tags are reused only when they verify and target
+# that commit, and a rerun after any interruption converges on the same signed
+# objects instead of minting a second release. Runs for one branch are
+# serialised by the concurrency group. cardigann-engine publishes only when its
+# manifest version is newer than every other v3 release of it, and the release
+# workflow independently refuses a bot-signed tag for any other plugin or for
+# anything but a patch bump (release-plugin-v3-components.sh).
 
 name: rule-pack-publish
 
@@ -18,12 +30,14 @@ concurrency:
 jobs:
   publish:
     if: >-
-      ${{ vars.RULE_PACK_REFRESH_ENABLED == 'true' &&
-          github.event.pull_request.merged == true &&
+      ${{ github.event.pull_request.merged == true &&
           github.event.pull_request.head.repo.full_name == github.repository &&
           github.event.pull_request.user.login == vars.RULE_PACK_REFRESH_BOT_LOGIN &&
-          (github.event.pull_request.head.ref == 'feature/trash-daily-refresh' ||
-           github.event.pull_request.head.ref == 'feature/seadex-daily-refresh') }}
+          ((vars.RULE_PACK_REFRESH_ENABLED == 'true' &&
+            (github.event.pull_request.head.ref == 'feature/trash-daily-refresh' ||
+             github.event.pull_request.head.ref == 'feature/seadex-daily-refresh')) ||
+           (vars.CARDIGANN_AUTO_RELEASE_ENABLED == 'true' &&
+            github.event.pull_request.head.ref == 'feature/cardigann-daily-refresh')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -55,11 +69,16 @@ jobs:
           case "$HEAD_REF" in
             feature/trash-daily-refresh)
               echo "profile=trash" >> "$GITHUB_OUTPUT"
-              echo "rule_pack_id=trash-guides-scoring-pack" >> "$GITHUB_OUTPUT"
+              echo "selector=--rule-pack-id trash-guides-scoring-pack" >> "$GITHUB_OUTPUT"
               ;;
             feature/seadex-daily-refresh)
               echo "profile=seadex" >> "$GITHUB_OUTPUT"
-              echo "rule_pack_id=seadex-scoring-pack" >> "$GITHUB_OUTPUT"
+              echo "selector=--rule-pack-id seadex-scoring-pack" >> "$GITHUB_OUTPUT"
+              ;;
+            feature/cardigann-daily-refresh)
+              # The only plugin this path may release.
+              echo "profile=cardigann" >> "$GITHUB_OUTPUT"
+              echo "selector=--plugin-id cardigann-engine" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "unexpected refresh branch $HEAD_REF" >&2
@@ -114,10 +133,11 @@ jobs:
         shell: bash
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          RULE_PACK_ID: ${{ steps.profile.outputs.rule_pack_id }}
+          SELECTOR: ${{ steps.profile.outputs.selector }}
         run: |
           set -euo pipefail
-          cargo xtask release-publish-tags --resume --pr "$PR_NUMBER" --rule-pack-id "$RULE_PACK_ID"
+          read -r selector_flag selector_id <<< "$SELECTOR"
+          cargo xtask release-publish-tags --resume --pr "$PR_NUMBER" "$selector_flag" "$selector_id"
 
       - name: Remove temporary signing material
         if: ${{ always() }}

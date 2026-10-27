@@ -19,6 +19,16 @@ set -euo pipefail
 # annotated, point at the listed commit, and that commit must be an ancestor
 # of the release commit. With VERIFY=true the trigger tag and every component
 # tag must also be signature-verified by GitHub (gh api).
+#
+# Automated releases. SCRYER_AUTOMATED_RELEASE_BOT_EMAIL names the refresh
+# bot's committer email. GitHub verifies a tag only when its signing key
+# belongs to the account owning the tagger email, so with VERIFY=true a
+# verified tag whose tagger is that email was signed by the bot. Such a tag
+# may only release AUTOMATED_RELEASE_PLUGIN_IDS, and only as a stable patch
+# bump on a line a human already released; a bot-signed trigger may list
+# nothing else. Human-signed tags are not affected.
+AUTOMATED_RELEASE_PLUGIN_IDS=(cardigann-engine)
+
 release_plugin_components() {
   local trigger_tag="${1:-}"
   local release_sha="${2:?release commit is required}"
@@ -33,13 +43,19 @@ release_plugin_components() {
 
   local -a rows=()
   local tag sha
+  local bot_email="${SCRYER_AUTOMATED_RELEASE_BOT_EMAIL:-}"
+  local trigger_by_bot=false
   if [[ -n "${trigger_tag}" ]]; then
     if [[ "$(git cat-file -t "refs/tags/${trigger_tag}" 2>/dev/null || true)" != tag ]]; then
       printf 'Release trigger %s is not an annotated tag\n' "${trigger_tag}" >&2
       return 1
     fi
     if [[ "${verify}" == true ]]; then
-      _release_plugin_components_verify_tag "${repository}" "${trigger_tag}" || return 1
+      local trigger_tagger
+      trigger_tagger="$(_release_plugin_components_verify_tag "${repository}" "${trigger_tag}")" || return 1
+      if _release_plugin_components_is_bot "${trigger_tagger}" "${bot_email}"; then
+        trigger_by_bot=true
+      fi
     fi
     local declared
     declared="$(_release_plugin_components_from_trigger "${trigger_tag}")" || return 1
@@ -117,7 +133,12 @@ release_plugin_components() {
       return 1
     fi
     if [[ "${verify}" == true ]]; then
-      _release_plugin_components_verify_tag "${repository}" "${tag}" "${tag_object}" || return 1
+      local tagger
+      tagger="$(_release_plugin_components_verify_tag "${repository}" "${tag}" "${tag_object}")" || return 1
+      if [[ "${trigger_by_bot}" == true ]] || _release_plugin_components_is_bot "${tagger}" "${bot_email}"; then
+        _release_plugin_components_automated_release_allowed \
+          "${plugin_id}" "${version}" "${tag}" "${prefix}" "${repository}" "${bot_email}" || return 1
+      fi
     fi
     output+=("${plugin_id}"$'\t'"${version}"$'\t'"${sha}")
   done
@@ -176,19 +197,69 @@ _release_plugin_components_from_trigger() {
   done
 }
 
+# Prints the tagger email of a GitHub-verified signed tag.
 _release_plugin_components_verify_tag() {
-  local repository="$1" tag="$2" tag_object="${3:-}" verified
+  local repository="$1" tag="$2" tag_object="${3:-}" verification verified tagger
   if [[ -z "${tag_object}" ]]; then
     tag_object="$(git rev-parse --verify --quiet "refs/tags/${tag}^{tag}")" || {
       printf '%s is not an annotated tag\n' "${tag}" >&2
       return 1
     }
   fi
-  verified="$(gh api "repos/${repository}/git/tags/${tag_object}" --jq '.verification.verified')"
+  verification="$(gh api "repos/${repository}/git/tags/${tag_object}" --jq '[(.verification.verified | tostring), (.tagger.email // "")] | @tsv')"
+  IFS=$'\t' read -r verified tagger <<<"${verification}"
   if [[ "${verified}" != true ]]; then
     printf '%s is not a GitHub-verified signed tag\n' "${tag}" >&2
     return 1
   fi
+  printf '%s\n' "${tagger}"
+}
+
+_release_plugin_components_is_bot() {
+  local tagger="$1" bot_email="$2"
+  [[ -n "${bot_email}" && -n "${tagger}" ]] || return 1
+  [[ "$(printf '%s' "${tagger}" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "${bot_email}" | tr '[:upper:]' '[:lower:]')" ]]
+}
+
+# A bot-signed component must be an allowed plugin's stable patch release on
+# a line that already has an earlier release: never a first release, a new
+# minor or a new major. That earlier release must be a GitHub-verified tag
+# signed by someone other than the bot, with a published GitHub release, so a
+# tag the bot (or anyone) pushes without releasing it cannot open a line. Bot
+# patches still chain: each one sits above the human release that opened its
+# line. Whether it was newer than everything published is
+# checked when the tags are created (xtask release-publish-tags --resume);
+# this check stays true after later releases, so catalog-only republication
+# of an older automated patch still passes.
+_release_plugin_components_automated_release_allowed() {
+  local plugin_id="$1" version="$2" tag="$3" prefix="$4" repository="$5" bot_email="$6"
+  local allowed=false candidate
+  for candidate in "${AUTOMATED_RELEASE_PLUGIN_IDS[@]}"; do
+    [[ "${plugin_id}" == "${candidate}" ]] && allowed=true
+  done
+  if [[ "${allowed}" != true ]]; then
+    printf 'Automated release bot may not release %s (%s); only %s\n' "${plugin_id}" "${tag}" "${AUTOMATED_RELEASE_PLUGIN_IDS[*]}" >&2
+    return 1
+  fi
+  if [[ ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    printf 'Automated release %s must be a stable x.y.z version\n' "${tag}" >&2
+    return 1
+  fi
+  local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
+  local other other_version tagger draft
+  while IFS= read -r other; do
+    other_version="${other#"${prefix}/${plugin_id}/v"}"
+    [[ "${other_version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || continue
+    if [[ "${BASH_REMATCH[1]}" != "${major}" || "${BASH_REMATCH[2]}" != "${minor}" ]] || (( BASH_REMATCH[3] >= patch )); then
+      continue
+    fi
+    tagger="$(_release_plugin_components_verify_tag "${repository}" "${other}" 2>/dev/null)" || continue
+    ! _release_plugin_components_is_bot "${tagger}" "${bot_email}" || continue
+    draft="$(gh release view "${other}" --repo "${repository}" --json isDraft --jq .isDraft 2>/dev/null)" || continue
+    [[ "${draft}" == false ]] && return 0
+  done < <(git tag --list "${prefix}/${plugin_id}/v*")
+  printf 'Automated release %s must be a patch bump on a %s.%s line opened by a verified, human-signed, published release\n' "${tag}" "${major}" "${minor}" >&2
+  return 1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

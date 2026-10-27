@@ -14,8 +14,15 @@ MOCK = r'''set -euo pipefail
 gh() {
   printf 'gh %s\n' "$*" >> calls
   if [[ "$1 $2" == "api repos/example/plugins/git/tags/"* ]]; then
-    local object="${2##*/}"
-    if [[ " $UNVERIFIED " == *" $object "* ]]; then printf 'false\n'; else printf 'true\n'; fi
+    local object="${2##*/}" verified=true tagger=human@example.test
+    if [[ " $UNVERIFIED " == *" $object "* ]]; then verified=false; fi
+    if [[ " $BOT_TAGS " == *" $object "* ]]; then tagger=Bot@Example.Test; fi
+    printf '%s\t%s\n' "$verified" "$tagger"
+    return 0
+  fi
+  if [[ "$1 $2" == "release view" ]]; then
+    if [[ " $UNRELEASED " == *" $3 "* ]]; then return 1; fi
+    if [[ " $DRAFTS " == *" $3 "* ]]; then printf 'true\n'; else printf 'false\n'; fi
     return 0
   fi
   return 1
@@ -69,11 +76,14 @@ class ComponentTests(unittest.TestCase):
         git(self.repo, "tag", "-a", "-m", message, name, at or self.head)
         return name
 
-    def run_components(self, trigger, *, release_sha=None, verify="true", unverified=""):
+    def run_components(self, trigger, *, release_sha=None, verify="true", unverified="", bot_tags="",
+                       bot_email="bot@example.test", unreleased="", drafts=""):
         result = subprocess.run(
             ["bash", "-c", MOCK, "components", trigger, release_sha or self.head, "example/plugins", verify],
             cwd=self.repo, capture_output=True, text=True, timeout=30,
-            env={**os.environ, "SCRIPT": str(SCRIPT), "UNVERIFIED": unverified},
+            env={**os.environ, "SCRIPT": str(SCRIPT), "UNVERIFIED": unverified, "BOT_TAGS": bot_tags,
+                 "UNRELEASED": unreleased, "DRAFTS": drafts,
+                 "SCRYER_AUTOMATED_RELEASE_BOT_EMAIL": bot_email},
         )
         calls = (self.repo / "calls").read_text() if (self.repo / "calls").exists() else ""
         return result, calls
@@ -220,6 +230,115 @@ class ComponentTests(unittest.TestCase):
                 result, _ = self.run_components(trigger)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
+
+    def object_of(self, tag):
+        return git(self.repo, "rev-parse", f"refs/tags/{tag}")
+
+    def cardigann_release(self, version, *, at=None):
+        git(self.repo, "tag", "-a", "-m", "Release", f"plugins-v3/cardigann-engine/v{version}", at or self.head)
+        return f"plugins-v3/cardigann-engine/v{version}"
+
+    def bot_trigger(self, *components, name="plugins-v3/release/resume-bot"):
+        body = "".join(f"component {tag} {self.head}\n" for tag in components)
+        trigger = self.trigger(body, name=name)
+        return trigger, " ".join(self.object_of(tag) for tag in (trigger, *components))
+
+    def test_the_bot_may_release_a_cardigann_patch(self):
+        self.cardigann_release("0.4.1", at=self.legacy)
+        trigger, bot_tags = self.bot_trigger(self.cardigann_release("0.4.2"))
+        result, _ = self.run_components(trigger, bot_tags=bot_tags)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"cardigann-engine\t0.4.2\t{self.head}\n")
+
+    def test_a_bot_signed_trigger_may_not_release_another_plugin(self):
+        # Even when the component tag itself is human-signed.
+        trigger = self.trigger(f"component plugins-v3/newznab/v3.1.0 {self.head}\n", name="plugins-v3/release/bot")
+        result, _ = self.run_components(trigger, bot_tags=self.object_of(trigger))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("may not release newznab", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_bot_signed_component_may_not_be_another_plugin_under_a_human_trigger(self):
+        trigger = self.trigger(f"component plugins-v3/newznab/v3.1.0 {self.head}\n")
+        result, _ = self.run_components(trigger, bot_tags=self.object_of("plugins-v3/newznab/v3.1.0"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("may not release newznab", result.stderr)
+
+    def test_the_bot_may_only_patch_an_existing_cardigann_line(self):
+        self.cardigann_release("0.4.1", at=self.legacy)
+        for index, version in enumerate(["0.5.0", "1.0.0", "0.4.1-rc.1"]):
+            with self.subTest(version=version):
+                tag = self.cardigann_release(version)
+                trigger, bot_tags = self.bot_trigger(tag, name=f"plugins-v3/release/bot-{index}")
+                result, _ = self.run_components(trigger, bot_tags=bot_tags)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                git(self.repo, "tag", "-d", tag, trigger)
+
+    def test_the_bot_may_not_release_a_first_cardigann_version(self):
+        trigger, bot_tags = self.bot_trigger(self.cardigann_release("0.4.2"), name="plugins-v3/release/first")
+        result, _ = self.run_components(trigger, bot_tags=bot_tags)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("patch bump on a 0.4 line opened by a verified, human-signed, published release", result.stderr)
+
+    def test_the_bot_may_not_open_a_line_with_an_unproven_predecessor(self):
+        cases = [
+            ("lightweight", lambda tag: git(self.repo, "tag", tag, self.legacy), {}),
+            ("unverified", lambda tag: self.cardigann_release("0.4.1", at=self.legacy),
+             {"unverified": "PREDECESSOR"}),
+            ("bot-signed", lambda tag: self.cardigann_release("0.4.1", at=self.legacy), {"bot": True}),
+            ("never released", lambda tag: self.cardigann_release("0.4.1", at=self.legacy),
+             {"unreleased": "plugins-v3/cardigann-engine/v0.4.1"}),
+            ("draft release", lambda tag: self.cardigann_release("0.4.1", at=self.legacy),
+             {"drafts": "plugins-v3/cardigann-engine/v0.4.1"}),
+        ]
+        for index, (label, make, options) in enumerate(cases):
+            with self.subTest(predecessor=label):
+                predecessor = "plugins-v3/cardigann-engine/v0.4.1"
+                make(predecessor)
+                tag = self.cardigann_release("0.4.2")
+                trigger, bot_tags = self.bot_trigger(tag, name=f"plugins-v3/release/unproven-{index}")
+                kwargs = {key: value for key, value in options.items() if key in ("unreleased", "drafts")}
+                if options.get("unverified"):
+                    kwargs["unverified"] = self.object_of(predecessor)
+                if options.get("bot"):
+                    bot_tags += " " + self.object_of(predecessor)
+                result, _ = self.run_components(trigger, bot_tags=bot_tags, **kwargs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("opened by a verified, human-signed, published release", result.stderr)
+                self.assertEqual(result.stdout, "")
+                git(self.repo, "tag", "-d", tag, trigger, predecessor)
+
+    def test_bot_patches_chain_from_the_human_release_that_opened_the_line(self):
+        self.cardigann_release("0.4.1", at=self.legacy)
+        earlier = self.cardigann_release("0.4.2", at=self.legacy)
+        trigger, bot_tags = self.bot_trigger(self.cardigann_release("0.4.3"))
+        result, _ = self.run_components(trigger, bot_tags=f"{bot_tags} {self.object_of(earlier)}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"cardigann-engine\t0.4.3\t{self.head}\n")
+
+    def test_an_automated_patch_stays_valid_after_later_releases(self):
+        # Catalog-only republication re-verifies older component tags.
+        self.cardigann_release("0.4.1", at=self.legacy)
+        trigger, bot_tags = self.bot_trigger(self.cardigann_release("0.4.2"))
+        self.cardigann_release("0.5.0", at=self.legacy)
+        result, _ = self.run_components(trigger, bot_tags=bot_tags)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"cardigann-engine\t0.4.2\t{self.head}\n")
+
+    def test_a_bot_signed_rule_pack_trigger_still_lists_nothing(self):
+        trigger = self.trigger("", name="plugins-v3/release/bot-packs")
+        result, _ = self.run_components(trigger, bot_tags=self.object_of(trigger))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_human_releases_are_unaffected_by_the_bot_policy(self):
+        trigger = self.trigger(f"component plugins-v3/newznab/v3.1.0 {self.head}\n")
+        for bot_email in ["bot@example.test", ""]:
+            with self.subTest(bot_email=bot_email):
+                result, _ = self.run_components(trigger, bot_email=bot_email)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"newznab\t3.1.0\t{self.head}\n")
 
 
 if __name__ == "__main__":
