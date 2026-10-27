@@ -1,7 +1,7 @@
 //! The Cardigann definitions this plugin ships with.
 //!
 //! Operators should not have to paste 3.5 MB of third-party YAML into a text
-//! box to add a tracker, so the whole gate-passing Prowlarr v11 corpus is baked
+//! box to add a tracker, so the whole gate-passing Prowlarr v12 corpus is baked
 //! into the component and offered through a `definition` selector, exactly the
 //! way `indexers/newznab` offers its known providers. Refreshing the corpus is
 //! then a CI job that reruns `xtask cardigann sync-definitions` and opens a PR.
@@ -85,7 +85,7 @@ pub fn selector(rows: &[IndexRow]) -> sdk::ConfigFieldDef {
         host_binding: None,
         options,
         help_text: Some(
-            "A bundled Cardigann v11 tracker definition. Choose Custom to paste your own \
+            "A bundled Cardigann v12 tracker definition. Choose Custom to paste your own \
              definition into the Cardigann Definition field instead."
                 .to_string(),
         ),
@@ -188,7 +188,7 @@ mod tests {
         let rows = index().expect("bundled Cardigann definition index must be valid");
         assert!(
             rows.len() > 500,
-            "expected the full Prowlarr v11 corpus, got {}",
+            "expected the full Prowlarr v12 corpus, got {}",
             rows.len()
         );
         let bodies = BODIES_ASSET

@@ -1609,7 +1609,7 @@ fn complete_grab_response(context: &Context, response: PluginHttpResponse) -> Re
 #[cfg(test)]
 pub(crate) fn parse_definition(source: &str) -> Result<Definition, String> {
     serde_yaml::from_str(source.trim_start_matches('\u{feff}'))
-        .map_err(|error| format!("invalid Cardigann v11 runtime definition: {error}"))
+        .map_err(|error| format!("invalid Cardigann v12 runtime definition: {error}"))
 }
 
 fn parse_compiled_ir(input: &str) -> Result<Definition, String> {
@@ -1653,6 +1653,44 @@ fn resolve_url(
         .map_err(|error| format!("could not resolve `{value}` against `{base}`: {error}"))
 }
 
+/// Every endpoint template a definition declares, each with whether it is
+/// optional: an optional one is left out of the network endpoints when its
+/// authority cannot render from configuration.
+pub(crate) fn declared_endpoints(definition: &Definition) -> Vec<(&str, bool)> {
+    let mut endpoints: Vec<(&str, bool)> = definition
+        .search
+        .paths
+        .iter()
+        .map(|path| (path.path.as_str(), false))
+        .collect();
+    if let Some(login) = &definition.login {
+        endpoints.push((&login.path, false));
+        endpoints.extend(login.submit_path.as_deref().map(|path| (path, false)));
+        endpoints.extend(
+            login
+                .test
+                .as_ref()
+                .and_then(|test| test.path.as_deref())
+                .map(|path| (path, false)),
+        );
+    }
+    if let Some(before) = definition
+        .download
+        .as_ref()
+        .and_then(|download| download.before.as_ref())
+    {
+        endpoints.push((&before.path, true));
+    }
+    // A literal download template is an endpoint declaration. Extracted links
+    // and selector/filter output remain subject to the existing host policy.
+    if let Some(field) = definition.search.fields.get("download")
+        && let Some(value) = field.text.as_ref().and_then(serde_yaml::Value::as_str)
+    {
+        endpoints.push((value, true));
+    }
+    endpoints
+}
+
 pub fn resolve_network_endpoints(
     definition: &Definition,
     config: &BTreeMap<String, String>,
@@ -1663,36 +1701,15 @@ pub fn resolve_network_endpoints(
         .or_else(|| definition.links.first())
         .ok_or("Missing base URL")?;
     let base = Url::parse(base).map_err(|_| "Invalid base URL")?;
-    let mut endpoints: Vec<&str> = definition
-        .search
-        .paths
-        .iter()
-        .map(|path| path.path.as_str())
-        .collect();
-    if let Some(login) = &definition.login {
-        endpoints.push(&login.path);
-        endpoints.extend(login.submit_path.as_deref());
-        endpoints.extend(login.test.as_ref().and_then(|test| test.path.as_deref()));
-    }
-    if let Some(before) = definition
-        .download
-        .as_ref()
-        .and_then(|download| download.before.as_ref())
-    {
-        let authority = crate::template::endpoint_authority_prefix(&before.path)?;
-        if crate::template::render_endpoint_authority(authority, &variables).is_ok() {
-            endpoints.push(&before.path);
+    let mut endpoints: Vec<&str> = Vec::new();
+    for (endpoint, optional) in declared_endpoints(definition) {
+        if optional {
+            let authority = crate::template::endpoint_authority_prefix(endpoint)?;
+            if crate::template::render_endpoint_authority(authority, &variables).is_err() {
+                continue;
+            }
         }
-    }
-    // A literal download template is an endpoint declaration. Extracted links
-    // and selector/filter output remain subject to the existing host policy.
-    if let Some(field) = definition.search.fields.get("download")
-        && let Some(value) = field.text.as_ref().and_then(serde_yaml::Value::as_str)
-    {
-        let authority = crate::template::endpoint_authority_prefix(value)?;
-        if crate::template::render_endpoint_authority(authority, &variables).is_ok() {
-            endpoints.push(value);
-        }
+        endpoints.push(endpoint);
     }
     let mut origins = std::collections::BTreeSet::new();
     origins.insert(base.origin().ascii_serialization());
@@ -4593,7 +4610,7 @@ mod tests {
 
     #[test]
     fn network_endpoints_skip_result_derived_download_links() {
-        for id in ["hdforever", "nyaasi", "pwtorrents", "hdturk", "tmghub"] {
+        for id in ["hdforever-api", "nyaasi", "pwtorrents", "hdturk", "tmghub"] {
             let definition =
                 parse_definition(&crate::baked::definition_yaml(id).unwrap().unwrap()).unwrap();
             let origins = resolve_network_endpoints(&definition, &BTreeMap::new())
@@ -4611,13 +4628,13 @@ mod tests {
 
     #[test]
     fn network_endpoints_resolve_reported_definition_defaults() {
-        for (id, host) in [
-            ("abnormal-api", "api.abn.lol"),
-            ("animetosho-xyz", "feed.animetosho.xyz"),
-            ("thepiratebay", "apibay.org"),
-            ("v3x", "api.v3x.club"),
-            ("yggreborn-api", "api.yggreborn.org"),
-            ("yts", "movies-api.accel.li"),
+        for (id, host, setting) in [
+            ("abnormal-api", "api.abn.lol", "apiurl"),
+            ("animetosho-xyz", "feed.animetosho.net", "api-url"),
+            ("thepiratebay", "apibay.org", "apiurl"),
+            ("v3x", "api.v3x.club", "apiurl"),
+            ("yggreborn-api", "api.yggreborn.org", "apiurl"),
+            ("yts", "movies-api.accel.li", "apiurl"),
         ] {
             let definition =
                 parse_definition(&crate::baked::definition_yaml(id).unwrap().unwrap()).unwrap();
@@ -4627,7 +4644,7 @@ mod tests {
                 origins.contains(&format!("https://{host}")),
                 "{id}: {origins:?}"
             );
-            let config = BTreeMap::from([("apiurl".into(), "alternate.example:8443".into())]);
+            let config = BTreeMap::from([(setting.into(), "alternate.example:8443".into())]);
             let origins = resolve_network_endpoints(&definition, &config).unwrap();
             assert!(
                 origins.contains(&"https://alternate.example:8443".into()),

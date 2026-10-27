@@ -39,6 +39,8 @@ jobs:
           go test \
             .github/scripts/release_workflow_plan.go \
             .github/scripts/release_workflow_plan_test.go
+          # The automated refresh diff and Cardigann upstream guards.
+          (cd rule_packs/refresh && go test ./...)
 
   plan:
     runs-on: ubuntu-latest

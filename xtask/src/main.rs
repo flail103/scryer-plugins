@@ -238,7 +238,7 @@ struct ReleasePublishTagsArgs {
     pr: u64,
     #[arg(
         long,
-        help = "Resume signed tags for exactly one rule pack at the same merged commit"
+        help = "Resume signed tags for exactly one rule pack, or exactly one plugin, at the same merged commit"
     )]
     resume: bool,
     #[arg(
@@ -604,7 +604,9 @@ enum CardigannCommand {
 
 #[derive(Args)]
 struct CardigannSyncDefinitionsArgs {
-    /// A Prowlarr/Indexers checkout's `definitions/v11` directory.
+    /// A Prowlarr/Indexers checkout's `definitions/` root. Each definition is
+    /// baked from the highest of `v11` and `v12` that has it, as Prowlarr's v12
+    /// reader loads it.
     #[arg(long)]
     source: PathBuf,
     /// Where to write the machine-readable sync report.
@@ -3485,8 +3487,13 @@ fn publication_source_commit(
 
 fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> Result<()> {
     validate_maintenance_publication(&args)?;
-    if args.resume && (!args.plugin_ids.is_empty() || args.rule_pack_ids.len() != 1) {
-        bail!("--resume requires exactly one --rule-pack-id and no --plugin-id");
+    if args.resume
+        && !matches!(
+            (args.plugin_ids.len(), args.rule_pack_ids.len()),
+            (0, 1) | (1, 0)
+        )
+    {
+        bail!("--resume requires exactly one --rule-pack-id or exactly one --plugin-id, not both");
     }
     if args.catalog_only_from.is_some()
         && (args.resume || !args.plugin_ids.is_empty() || !args.rule_pack_ids.is_empty())
@@ -3514,6 +3521,12 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
         bail!("merged pull request commit {merge_commit} is not reachable from {remote_base}")
     }
     ok(format!("PR #{} merged at {}", args.pr, merge_commit));
+
+    if args.resume
+        && let [plugin_id] = args.plugin_ids.as_slice()
+    {
+        return resume_plugin_tags(ctx, plugin_id, &merge_commit);
+    }
 
     if let Some(source_ref) = args.catalog_only_from.as_deref() {
         step(format!(
@@ -3634,7 +3647,7 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
         bail!("no selected plugin or rule-pack versions are publishable");
     }
     if args.resume {
-        return resume_rule_pack_tags(ctx, &rule_pack_tags[0], &merge_commit);
+        return resume_signed_tags(ctx, &rule_pack_tags[0], &[], &merge_commit);
     }
     let mut component_tags = components
         .iter()
@@ -3695,17 +3708,83 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
     Ok(())
 }
 
-/// Resume the same signed objects after an interrupted automated pack update.
+/// Publish, or resume publishing, the manifest version of exactly one plugin
+/// at the merged commit with stable tag names, so an automated publisher can
+/// rerun after any interruption and converge on the same signed objects
+/// instead of minting a second release.
+///
+/// The version must be newer than every other v3 release of the plugin; its
+/// own tag may already exist only if it targets this commit and verifies.
+fn resume_plugin_tags(ctx: &TaskContext, plugin_id: &str, commit: &str) -> Result<()> {
+    step(format!("Resuming signed tags for {plugin_id} at {commit}"));
+    let component = release_component_at_commit(ctx, plugin_id, commit)?;
+    let tags = git_capture(ctx, &["tag"])?;
+    resumed_plugin_component_is_publishable(&component, &tags)?;
+    println!("   {} at {}", component.tag_name, component.commit);
+    let tag_name = component.tag_name.clone();
+    resume_signed_tags(ctx, &tag_name, &[component], commit)
+}
+
+/// A resumed plugin component is newer than every other v3 release of the
+/// plugin. Its own tag is ignored here; whether an existing one may be reused
+/// is decided by its signature and target.
+fn resumed_plugin_component_is_publishable(component: &ReleaseComponent, tags: &str) -> Result<()> {
+    let prefix = release_tag_v3_prefix(&component.plugin_id);
+    let latest_other = tags
+        .lines()
+        .map(str::trim)
+        .filter(|tag| *tag != component.tag_name)
+        .filter_map(|tag| {
+            tag.strip_prefix(&prefix)
+                .and_then(|version| Version::parse(version).ok())
+        })
+        .max();
+    if let Some(latest) = latest_other
+        && component.version <= latest
+    {
+        bail!(
+            "{} {} is not newer than its latest v3 release {latest}",
+            component.plugin_id,
+            component.version
+        );
+    }
+    Ok(())
+}
+
+/// Resume the same signed objects after an interrupted automated update.
 /// Existing refs must retain both their verified signature and target commit.
-fn resume_rule_pack_tags(ctx: &TaskContext, component_tag: &str, commit: &str) -> Result<()> {
+/// `components` are the plugin components the trigger lists (none for a rule
+/// pack); an existing trigger at the commit must list exactly those.
+fn resume_signed_tags(
+    ctx: &TaskContext,
+    component_tag: &str,
+    components: &[ReleaseComponent],
+    commit: &str,
+) -> Result<()> {
+    // The trigger is settled first so a mismatch creates no tag at all.
+    let trigger_tag = match existing_release_trigger_for_commit(ctx, commit)? {
+        Some(existing) => {
+            if !components.is_empty() {
+                let listed = release_trigger_components(ctx, &existing)?.unwrap_or_default();
+                let expected = components
+                    .iter()
+                    .map(|component| (component.tag_name.clone(), component.commit.clone()))
+                    .collect::<Vec<_>>();
+                if listed != expected {
+                    bail!(
+                        "cannot resume: signed release trigger {existing} at {commit} does not list exactly {component_tag}"
+                    );
+                }
+            }
+            existing
+        }
+        None => resumable_release_trigger(ctx, component_tag, commit)?,
+    };
     let mut tags_to_push = Vec::new();
     if ensure_resumable_signed_tag(ctx, component_tag, commit)? {
         tags_to_push.push(component_tag.to_string());
     }
-
-    let trigger_tag = existing_release_trigger_for_commit(ctx, commit)?
-        .unwrap_or(resumable_release_trigger(ctx, component_tag, commit)?);
-    if ensure_resumable_signed_tag(ctx, &trigger_tag, commit)? {
+    if ensure_resumable_signed_tag_listing(ctx, &trigger_tag, commit, components)? {
         tags_to_push.push(trigger_tag.clone());
     }
     if !tags_to_push.is_empty() {
@@ -3744,6 +3823,16 @@ fn resumable_release_trigger(
 /// tag is refused: the preceding tag fetch must have made its signed object
 /// available locally before an idempotent retry can trust it.
 fn ensure_resumable_signed_tag(ctx: &TaskContext, tag: &str, commit: &str) -> Result<bool> {
+    ensure_resumable_signed_tag_listing(ctx, tag, commit, &[])
+}
+
+/// As [`ensure_resumable_signed_tag`]; a trigger it creates lists `components`.
+fn ensure_resumable_signed_tag_listing(
+    ctx: &TaskContext,
+    tag: &str,
+    commit: &str,
+    components: &[ReleaseComponent],
+) -> Result<bool> {
     let head = git_capture(ctx, &["rev-parse", "HEAD"])?;
     if head.trim() != commit {
         bail!("cannot resume {tag}: requested commit is not HEAD");
@@ -3758,7 +3847,7 @@ fn ensure_resumable_signed_tag(ctx: &TaskContext, tag: &str, commit: &str) -> Re
         let message = if tag.starts_with(&repo_release_tag_prefix()) {
             // A resumed pack release has no plugin components, but the signed
             // trigger must still declare that explicitly to the publisher.
-            release_trigger_message(&[], &[])
+            release_trigger_message(components, &[])
         } else {
             format!("Release {tag}")
         };
@@ -8717,12 +8806,25 @@ fn run_catalog_validate_v2(_ctx: &TaskContext) -> Result<()> {
 struct CardigannSyncReport {
     candidates: usize,
     accepted: usize,
+    accepted_by_version: BTreeMap<String, usize>,
     excluded: Vec<CardigannExcludedDefinition>,
+    risk: CardigannRiskReport,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardigannRiskReport {
+    flagged: Vec<CardigannFlaggedDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardigannFlaggedDefinition {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct CardigannExcludedDefinition {
     file: String,
+    source_version: String,
     reason: String,
 }
 
@@ -8811,13 +8913,36 @@ fn run_cardigann_sync_definitions(
     }
 
     println!(
-        "\n   Cardigann definitions: candidates={}, baked={}, excluded={}",
+        "\n   Cardigann definitions: candidates={}, baked={} ({}), excluded={}",
         report.candidates,
         report.accepted,
+        report
+            .accepted_by_version
+            .iter()
+            .map(|(version, count)| format!("{version}={count}"))
+            .collect::<Vec<_>>()
+            .join(", "),
         report.excluded.len()
     );
     for excluded in &report.excluded {
-        warn(format!("excluded {}: {}", excluded.file, excluded.reason));
+        warn(format!(
+            "excluded {}/{}: {}",
+            excluded.source_version, excluded.file, excluded.reason
+        ));
+    }
+    if report.risk.flagged.is_empty() {
+        ok("no baked definition holding a secret gained an origin or moved a secret");
+    } else {
+        warn(format!(
+            "needs review, gained an origin or moved a secret: {}",
+            report
+                .risk
+                .flagged
+                .iter()
+                .map(|flagged| flagged.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     if args.check && changed {
@@ -9829,6 +9954,79 @@ mod tests {
         assert_eq!(
             existing_release_trigger_for_commit(&ctx, &commit).expect("find trigger"),
             Some(first)
+        );
+    }
+
+    #[test]
+    fn resumed_plugin_component_must_be_newer_than_its_other_releases() {
+        let component = |version: &str| ReleaseComponent {
+            plugin_id: "cardigann-engine".to_string(),
+            version: Version::parse(version).unwrap(),
+            commit: "0".repeat(40),
+            tag_name: official_plugin_release_tag("cardigann-engine", version),
+        };
+        let tags = "plugins-v3/cardigann-engine/v0.4.1\nplugins-v3/cardigann-engine/v0.4.2\nplugins-v3/newznab/v9.0.0\n";
+        // Its own tag (an interrupted earlier attempt) does not block it.
+        resumed_plugin_component_is_publishable(&component("0.4.2"), tags).expect("own tag");
+        resumed_plugin_component_is_publishable(&component("0.4.3"), tags).expect("newer");
+        for stale in ["0.4.1", "0.4.0"] {
+            let error = resumed_plugin_component_is_publishable(&component(stale), tags)
+                .expect_err("an older or already superseded version must not publish");
+            assert!(error.to_string().contains("not newer"), "{error}");
+        }
+    }
+
+    #[test]
+    fn resumed_plugin_release_converges_on_one_trigger_listing_its_component() {
+        let (_temp, ctx, commit) = signed_resume_repo();
+        let component = ReleaseComponent {
+            plugin_id: "cardigann-engine".to_string(),
+            version: Version::parse("0.4.2").unwrap(),
+            commit: commit.clone(),
+            tag_name: "plugins-v3/cardigann-engine/v0.4.2".to_string(),
+        };
+        let tag = component.tag_name.clone();
+        resume_signed_tags(&ctx, &tag, std::slice::from_ref(&component), &commit)
+            .expect("first publication");
+        let trigger = existing_release_trigger_for_commit(&ctx, &commit)
+            .expect("find trigger")
+            .expect("trigger created");
+        assert_eq!(
+            release_trigger_components(&ctx, &trigger).expect("trigger components"),
+            Some(vec![(tag.clone(), commit.clone())])
+        );
+        assert!(remote_tag_exists(&ctx, &tag).expect("component pushed"));
+        assert!(remote_tag_exists(&ctx, &trigger).expect("trigger pushed"));
+        let objects = |ctx: &TaskContext| {
+            git_capture(ctx, &["ls-remote", "--tags", "origin"]).expect("remote tags")
+        };
+        let before = objects(&ctx);
+
+        // A rerun reuses the same signed objects and creates nothing new.
+        resume_signed_tags(&ctx, &tag, std::slice::from_ref(&component), &commit)
+            .expect("idempotent rerun");
+        assert_eq!(objects(&ctx), before);
+
+        // A different component can never be published through that trigger.
+        let other = ReleaseComponent {
+            version: Version::parse("0.4.3").unwrap(),
+            tag_name: "plugins-v3/cardigann-engine/v0.4.3".to_string(),
+            ..component
+        };
+        let error = resume_signed_tags(&ctx, &other.tag_name.clone(), &[other], &commit)
+            .expect_err("trigger lists a different component");
+        assert!(
+            error.to_string().contains("does not list exactly"),
+            "{error}"
+        );
+        assert!(
+            git_capture(
+                &ctx,
+                &["tag", "--list", "plugins-v3/cardigann-engine/v0.4.3"]
+            )
+            .expect("list tags")
+            .trim()
+            .is_empty()
         );
     }
 
