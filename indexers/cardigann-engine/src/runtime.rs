@@ -1653,6 +1653,44 @@ fn resolve_url(
         .map_err(|error| format!("could not resolve `{value}` against `{base}`: {error}"))
 }
 
+/// Every endpoint template a definition declares, each with whether it is
+/// optional: an optional one is left out of the network endpoints when its
+/// authority cannot render from configuration.
+pub(crate) fn declared_endpoints(definition: &Definition) -> Vec<(&str, bool)> {
+    let mut endpoints: Vec<(&str, bool)> = definition
+        .search
+        .paths
+        .iter()
+        .map(|path| (path.path.as_str(), false))
+        .collect();
+    if let Some(login) = &definition.login {
+        endpoints.push((&login.path, false));
+        endpoints.extend(login.submit_path.as_deref().map(|path| (path, false)));
+        endpoints.extend(
+            login
+                .test
+                .as_ref()
+                .and_then(|test| test.path.as_deref())
+                .map(|path| (path, false)),
+        );
+    }
+    if let Some(before) = definition
+        .download
+        .as_ref()
+        .and_then(|download| download.before.as_ref())
+    {
+        endpoints.push((&before.path, true));
+    }
+    // A literal download template is an endpoint declaration. Extracted links
+    // and selector/filter output remain subject to the existing host policy.
+    if let Some(field) = definition.search.fields.get("download")
+        && let Some(value) = field.text.as_ref().and_then(serde_yaml::Value::as_str)
+    {
+        endpoints.push((value, true));
+    }
+    endpoints
+}
+
 pub fn resolve_network_endpoints(
     definition: &Definition,
     config: &BTreeMap<String, String>,
@@ -1663,36 +1701,15 @@ pub fn resolve_network_endpoints(
         .or_else(|| definition.links.first())
         .ok_or("Missing base URL")?;
     let base = Url::parse(base).map_err(|_| "Invalid base URL")?;
-    let mut endpoints: Vec<&str> = definition
-        .search
-        .paths
-        .iter()
-        .map(|path| path.path.as_str())
-        .collect();
-    if let Some(login) = &definition.login {
-        endpoints.push(&login.path);
-        endpoints.extend(login.submit_path.as_deref());
-        endpoints.extend(login.test.as_ref().and_then(|test| test.path.as_deref()));
-    }
-    if let Some(before) = definition
-        .download
-        .as_ref()
-        .and_then(|download| download.before.as_ref())
-    {
-        let authority = crate::template::endpoint_authority_prefix(&before.path)?;
-        if crate::template::render_endpoint_authority(authority, &variables).is_ok() {
-            endpoints.push(&before.path);
+    let mut endpoints: Vec<&str> = Vec::new();
+    for (endpoint, optional) in declared_endpoints(definition) {
+        if optional {
+            let authority = crate::template::endpoint_authority_prefix(endpoint)?;
+            if crate::template::render_endpoint_authority(authority, &variables).is_err() {
+                continue;
+            }
         }
-    }
-    // A literal download template is an endpoint declaration. Extracted links
-    // and selector/filter output remain subject to the existing host policy.
-    if let Some(field) = definition.search.fields.get("download")
-        && let Some(value) = field.text.as_ref().and_then(serde_yaml::Value::as_str)
-    {
-        let authority = crate::template::endpoint_authority_prefix(value)?;
-        if crate::template::render_endpoint_authority(authority, &variables).is_ok() {
-            endpoints.push(value);
-        }
+        endpoints.push(endpoint);
     }
     let mut origins = std::collections::BTreeSet::new();
     origins.insert(base.origin().ascii_serialization());

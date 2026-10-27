@@ -10,7 +10,9 @@ name: cardigann-daily-refresh
 # Definitions decide where tracker credentials are sent, so the pull request
 # only queues itself to auto-merge when the sync's risk report flags nothing:
 # no definition that was already baked and references a secret setting gained
-# an origin it may reach, none rendered a secret somewhere new, and none
+# an origin it may reach or changed a templated endpoint host (compared as
+# text, since only the default configuration is rendered), none rendered a
+# secret somewhere new, and none
 # stopped declaring a password setting as a password. Otherwise it stays open
 # for a maintainer, listing what was flagged. A definition with no secret, such
 # as a public tracker adding mirrors, may gain origins without review.
@@ -350,7 +352,7 @@ jobs:
               print("| Definition | New origins | New secret placements | Weakened settings |")
               print("| --- | --- | --- | --- |")
               for item in flagged:
-                  origins = capped(item["new_origins"])
+                  origins = capped(item["new_origins"] + [f"templated {authority}" for authority in item["new_templated_authorities"]])
                   if item["unresolved"]:
                       reason = item["unresolved"].replace("|", "\\|").replace("\n", " ")[:300]
                       origins = f"could not resolve: {reason}"

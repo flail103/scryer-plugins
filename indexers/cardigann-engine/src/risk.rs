@@ -43,6 +43,10 @@ pub struct RiskProfile {
     pub secret_placements: BTreeMap<String, BTreeSet<String>>,
     /// Secret settings declared with the `password` type.
     pub password_settings: BTreeSet<String>,
+    /// Endpoint authorities written as templates, as raw text. `origins`
+    /// renders them for the default configuration only, so a host behind a
+    /// branch such as `{{ if .Config.use_alt }}` is compared by its text.
+    pub templated_authorities: BTreeSet<String>,
 }
 
 /// Build the profile of one definition's YAML.
@@ -61,6 +65,12 @@ pub fn profile(source: &str) -> Result<RiskProfile, String> {
             .iter()
             .filter(|setting| setting.setting_type == "password")
             .map(|setting| setting.name.clone())
+            .collect(),
+        templated_authorities: runtime::declared_endpoints(&definition)
+            .into_iter()
+            .filter_map(|(endpoint, _)| crate::template::endpoint_authority_prefix(endpoint).ok())
+            .filter(|authority| authority.contains("{{"))
+            .map(ToString::to_string)
             .collect(),
     })
 }
@@ -187,6 +197,9 @@ pub struct Flagged {
     /// Origins the definition can now reach that it could not before, listed
     /// only when it references a secret setting.
     pub new_origins: Vec<String>,
+    /// Templated endpoint authorities that are new or changed, listed only
+    /// when the definition references a secret setting.
+    pub new_templated_authorities: Vec<String>,
     /// `setting at location` for each secret rendered somewhere new.
     pub new_secret_placements: Vec<String>,
     /// `password` settings that are no longer declared as passwords.
@@ -275,6 +288,7 @@ fn compare_one(id: &str, before: &str, after: &str) -> Outcome {
     let mut flagged = Flagged {
         id: id.to_string(),
         new_origins: Vec::new(),
+        new_templated_authorities: Vec::new(),
         new_secret_placements: Vec::new(),
         weakened_settings: Vec::new(),
         unresolved: None,
@@ -314,11 +328,19 @@ fn compare_one(id: &str, before: &str, after: &str) -> Outcome {
     // Either version referencing a secret counts: a definition that drops
     // its last secret in the same change is still reviewed.
     let holds_secret = !before.secret_placements.is_empty() || !after.secret_placements.is_empty();
-    let secretless_new_origins = !holds_secret && !flagged.new_origins.is_empty();
-    if secretless_new_origins {
+    flagged.new_templated_authorities = after
+        .templated_authorities
+        .difference(&before.templated_authorities)
+        .cloned()
+        .collect();
+    let secretless_new_origins = !holds_secret
+        && !(flagged.new_origins.is_empty() && flagged.new_templated_authorities.is_empty());
+    if !holds_secret {
         flagged.new_origins.clear();
+        flagged.new_templated_authorities.clear();
     }
     let clean = flagged.new_origins.is_empty()
+        && flagged.new_templated_authorities.is_empty()
         && flagged.new_secret_placements.is_empty()
         && flagged.weakened_settings.is_empty()
         && flagged.unresolved.is_none();
@@ -461,6 +483,34 @@ search:
         assert_eq!(
             compare_fixture(&after).flagged[0].new_origins,
             ["https://elsewhere.example"]
+        );
+    }
+
+    #[test]
+    fn a_host_behind_a_checkbox_branch_is_flagged() {
+        let login = |alternate: &str| {
+            BASE.replace(
+                "  path: login.php\n",
+                &format!(
+                    "  path: \"https://{{{{ if .Config.use_alt }}}}{alternate}{{{{ else }}}}tracker.example{{{{ end }}}}/login.php\"\n"
+                ),
+            )
+            .replace(
+                "settings:\n",
+                "settings:\n  - name: use_alt\n    type: checkbox\n    label: Alternate\n    default: false\n",
+            )
+        };
+        let report = compare(
+            &previous(&login("alternate.example")),
+            &corpus(&login("collector.example")),
+        )
+        .expect("compare");
+        assert_eq!(report.flagged.len(), 1, "{:?}", report.flagged);
+        let flagged = &report.flagged[0];
+        assert!(flagged.new_origins.is_empty(), "{:?}", flagged.new_origins);
+        assert_eq!(
+            flagged.new_templated_authorities,
+            ["https://{{ if .Config.use_alt }}collector.example{{ else }}tracker.example{{ end }}"]
         );
     }
 
