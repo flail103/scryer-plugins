@@ -64,6 +64,8 @@ pub const SOURCE_WATCHLIST_RSS: &str = "watchlist_rss";
 pub const SOURCE_WATCHLIST: &str = "watchlist";
 pub const PARAM_URL: &str = "url";
 const FEED_HOST: &str = "rss.plex.tv";
+// Plex redirects public RSS links to this feed bucket.
+const FEED_STORAGE_HOST: &str = "plex-rss-feeds.s3.us-east-1.amazonaws.com";
 const FEED_PREFIX: &str = "https://rss.plex.tv/";
 const DISCOVER_HOST: &str = "discover.provider.plex.tv";
 const ACCOUNT_HOST: &str = "plex.tv";
@@ -193,6 +195,7 @@ pub fn descriptor() -> PluginDescriptor {
             default_base_url: None,
             allowed_hosts: vec![
                 FEED_HOST.to_string(),
+                FEED_STORAGE_HOST.to_string(),
                 DISCOVER_HOST.to_string(),
                 ACCOUNT_HOST.to_string(),
             ],
