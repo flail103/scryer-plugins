@@ -93,6 +93,7 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Generic,
             capabilities: Capabilities {
+                raw_nab_search: false,
                 resolve_network_endpoints: false,
                 http: None,
                 dynamic_config_fields: None,

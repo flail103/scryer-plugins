@@ -45,6 +45,7 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Usenet,
             capabilities: Capabilities {
+                raw_nab_search: false,
                 resolve_network_endpoints: false,
                 http: None,
                 dynamic_config_fields: None,
@@ -455,6 +456,7 @@ mod tests {
             context: None,
             rss_catch_up: None,
             page_cursor: None,
+            ..SearchRequest::default()
         }
     }
 

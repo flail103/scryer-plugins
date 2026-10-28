@@ -30,6 +30,7 @@ fn build_descriptor() -> PluginDescriptor {
             }),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
+                raw_nab_search: true,
                 resolve_network_endpoints: false,
                 http: None,
                 dynamic_config_fields: None,
