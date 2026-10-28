@@ -358,18 +358,12 @@ fn handle_download_add(
                     .and_then(seconds_to_minutes)
                     .map(|value| value.to_string()),
             );
-            if request_auto_tmm(&config, &request, auto_tmm) {
-                form_fields.push(("autoTMM".to_string(), "true".to_string()));
-            }
-            if request_paused(&config, &request) {
-                form_fields.push(("paused".to_string(), "true".to_string()));
-            }
-            if request_skip_checking(&config, &request) {
-                form_fields.push(("skip_checking".to_string(), "true".to_string()));
-            }
-            if request_force_start(&config, &request) {
-                form_fields.push(("forceStart".to_string(), "true".to_string()));
-            }
+            form_fields.extend(add_boolean_fields(
+                request_auto_tmm(&config, &request, auto_tmm),
+                request_paused(&config, &request),
+                request_skip_checking(&config, &request),
+                request_force_start(&config, &request),
+            ));
             maybe_push_field(
                 &mut form_fields,
                 "contentLayout",
@@ -1928,6 +1922,30 @@ fn seconds_to_minutes(seconds: i64) -> Option<i64> {
     }
 }
 
+/// qBittorrent ignores unknown add parameters. Send both names for renamed
+/// fields so 4.x, 5.0–5.2 and 5.3+ receive the same options without a version
+/// probe: 5.0 renamed `paused` to `stopped`, and 5.3 renamed `skip_checking`
+/// to `seedMode`. `forced` is the add parameter; `forceStart` is not.
+/// Explicit false values override the server's add defaults too.
+fn add_boolean_fields(
+    auto_tmm: bool,
+    paused: bool,
+    skip_checking: bool,
+    force_start: bool,
+) -> Vec<(String, String)> {
+    [
+        ("autoTMM", auto_tmm),
+        ("paused", paused),
+        ("stopped", paused),
+        ("skip_checking", skip_checking),
+        ("seedMode", skip_checking),
+        ("forced", force_start),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect()
+}
+
 fn build_add_multipart_body(file_name: &str, bytes: &[u8], options: AddOptions) -> MultipartBody {
     let boundary = "----scryer-qbittorrent-boundary";
     let mut body = Vec::new();
@@ -1946,17 +1964,13 @@ fn build_add_multipart_body(file_name: &str, bytes: &[u8], options: AddOptions) 
         "seedingTimeLimit",
         seeding_time_limit_minutes.as_deref(),
     );
-    if options.auto_tmm {
-        append_multipart_text(&mut body, boundary, "autoTMM", Some("true"));
-    }
-    if options.paused {
-        append_multipart_text(&mut body, boundary, "paused", Some("true"));
-    }
-    if options.skip_checking {
-        append_multipart_text(&mut body, boundary, "skip_checking", Some("true"));
-    }
-    if options.force_start {
-        append_multipart_text(&mut body, boundary, "forceStart", Some("true"));
+    for (key, value) in add_boolean_fields(
+        options.auto_tmm,
+        options.paused,
+        options.skip_checking,
+        options.force_start,
+    ) {
+        append_multipart_text(&mut body, boundary, &key, Some(&value));
     }
     append_multipart_text(
         &mut body,
