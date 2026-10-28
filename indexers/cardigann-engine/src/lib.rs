@@ -69,6 +69,7 @@ fn build_descriptor() -> sdk::PluginDescriptor {
             strategy_plan: None,
             source_kind: sdk::IndexerSourceKind::Torrent,
             capabilities: sdk::IndexerCapabilities {
+                raw_nab_search: true,
                 rss: true,
                 search: true,
                 imdb_search: true,

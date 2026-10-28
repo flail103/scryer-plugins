@@ -535,6 +535,7 @@ fn base_search_request(
         context: None,
         rss_catch_up: None,
         page_cursor: None,
+        ..Default::default()
     }
 }
 

@@ -56,3 +56,65 @@ fn exact_nab_query_keeps_ampersands_and_spacing() {
     req.nab = None;
     assert_eq!(raw_query_for_request(&req), "A and B");
 }
+
+#[test]
+fn exact_nab_values_survive_the_final_url_builder() {
+    let req = SearchRequest {
+        query: "  A & B  ".into(),
+        nab: Some(scryer_plugin_sdk::PluginNabSearch {
+            operation: scryer_plugin_sdk::PluginNabOperation::Book,
+            parameters: [
+                ("author".into(), "  Author & Guest  ".into()),
+                ("title".into(), "  001.00  ".into()),
+            ]
+            .into(),
+        }),
+        ..Default::default()
+    };
+    let additional = raw_nab_additional_params(&req, "extended=1").unwrap();
+    for query in [req.query.as_str(), "   "] {
+        let exact = build_exact_search_url(
+            "https://indexer.example/api",
+            "book",
+            Some(query),
+            "fixture-key",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            100,
+            None,
+            None,
+            &additional,
+        )
+        .unwrap();
+        let parsed = Url::parse(&exact).unwrap();
+        let pairs: BTreeMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(pairs["q"], query);
+        assert_eq!(pairs["author"], "  Author & Guest  ");
+        assert_eq!(pairs["title"], "  001.00  ");
+    }
+    let normal = build_search_url(
+        "https://indexer.example/api",
+        "book",
+        Some(&req.query),
+        "fixture-key",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        100,
+        None,
+        None,
+        &additional,
+    )
+    .unwrap();
+    let parsed = Url::parse(&normal).unwrap();
+    let pairs: BTreeMap<_, _> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs["q"], "A & B");
+    assert_eq!(pairs["author"], "Author & Guest");
+}

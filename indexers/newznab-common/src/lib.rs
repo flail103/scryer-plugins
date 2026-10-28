@@ -1303,6 +1303,7 @@ async fn raw_search_with_paging(
             None,
             &page_params,
             &config.http_behavior,
+            req.nab.is_some() || req.recent_paging,
         )
         .await;
         let (status, body) = match search_result {
@@ -1582,6 +1583,7 @@ async fn execute_rss_search(
                 None, // no episode
                 &page_params,
                 &config.http_behavior,
+                false,
             )
             .await;
             let (status, body) = match search_result {
@@ -2609,6 +2611,7 @@ async fn execute_exact_anime_search(
             id_plan.episode,
             additional_params,
             behavior,
+            false,
         )
         .await;
     }
@@ -2653,6 +2656,7 @@ async fn execute_exact_anime_search(
             text_plan.episode,
             additional_params,
             behavior,
+            false,
         )
         .await?;
         let looks_empty = is_empty_response(body.trim_start());
@@ -2737,6 +2741,7 @@ async fn execute_tiered_search(
             plan.episode,
             additional_params,
             behavior,
+            false,
         )
         .await?;
 
@@ -2773,6 +2778,7 @@ async fn execute_tiered_search(
                 text_plan.episode,
                 additional_params,
                 behavior,
+                false,
             )
             .await?;
 
@@ -2893,8 +2899,14 @@ async fn execute_search(
     episode: Option<u32>,
     additional_params: &str,
     behavior: &NewznabHttpBehavior,
+    exact_values: bool,
 ) -> Result<(u16, String), Error> {
-    let url = build_search_url(
+    let build = if exact_values {
+        build_exact_search_url
+    } else {
+        build_search_url
+    };
+    let url = build(
         endpoint,
         search_type,
         query,
@@ -3480,6 +3492,79 @@ fn build_search_url(
     episode: Option<u32>,
     additional_params: &str,
 ) -> Result<String, Error> {
+    build_search_url_with_values(
+        endpoint,
+        search_type,
+        query,
+        api_key,
+        imdb_id,
+        tmdb_id,
+        tvdb_id,
+        tvrage_id,
+        tvmaze_id,
+        cat,
+        limit,
+        season,
+        episode,
+        additional_params,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_exact_search_url(
+    endpoint: &str,
+    search_type: &str,
+    query: Option<&str>,
+    api_key: &str,
+    imdb_id: Option<&str>,
+    tmdb_id: Option<&str>,
+    tvdb_id: Option<&str>,
+    tvrage_id: Option<&str>,
+    tvmaze_id: Option<&str>,
+    cat: Option<&str>,
+    limit: usize,
+    season: Option<u32>,
+    episode: Option<u32>,
+    additional_params: &str,
+) -> Result<String, Error> {
+    build_search_url_with_values(
+        endpoint,
+        search_type,
+        query,
+        api_key,
+        imdb_id,
+        tmdb_id,
+        tvdb_id,
+        tvrage_id,
+        tvmaze_id,
+        cat,
+        limit,
+        season,
+        episode,
+        additional_params,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_search_url_with_values(
+    endpoint: &str,
+    search_type: &str,
+    query: Option<&str>,
+    api_key: &str,
+    imdb_id: Option<&str>,
+    tmdb_id: Option<&str>,
+    tvdb_id: Option<&str>,
+    tvrage_id: Option<&str>,
+    tvmaze_id: Option<&str>,
+    cat: Option<&str>,
+    limit: usize,
+    season: Option<u32>,
+    episode: Option<u32>,
+    additional_params: &str,
+    exact_values: bool,
+) -> Result<String, Error> {
     let imdb_id = imdb_id.map(normalize_imdbid_param);
     let mut url =
         Url::parse(endpoint).map_err(|error| Error::msg(format!("invalid endpoint: {error}")))?;
@@ -3493,7 +3578,12 @@ fn build_search_url(
         pairs.append_pair("extended", "1");
         pairs.append_pair("limit", &limit.to_string());
 
-        if let Some(q) = query.map(str::trim).filter(|value| !value.is_empty()) {
+        let query = if exact_values {
+            query
+        } else {
+            query.map(str::trim)
+        };
+        if let Some(q) = query.filter(|value| !value.is_empty()) {
             pairs.append_pair("q", q);
         }
         if let Some(id) = imdb_id.as_deref() {
@@ -3522,7 +3612,11 @@ fn build_search_url(
         }
     }
 
-    append_additional_query_pairs(&mut url, additional_params);
+    if exact_values {
+        append_additional_query_pairs_with_values(&mut url, additional_params, true);
+    } else {
+        append_additional_query_pairs(&mut url, additional_params);
+    }
 
     Ok(url.to_string())
 }
@@ -3556,6 +3650,14 @@ fn build_raw_search_url(
 }
 
 fn append_additional_query_pairs(url: &mut Url, additional_params: &str) {
+    append_additional_query_pairs_with_values(url, additional_params, false);
+}
+
+fn append_additional_query_pairs_with_values(
+    url: &mut Url,
+    additional_params: &str,
+    exact_values: bool,
+) {
     let normalized = additional_params
         .trim()
         .trim_start_matches('?')
@@ -3571,7 +3673,12 @@ fn append_additional_query_pairs(url: &mut Url, additional_params: &str) {
             continue;
         }
 
-        merged.insert(key.to_string(), raw_value.trim().to_string());
+        let value = if exact_values {
+            raw_value.into_owned()
+        } else {
+            raw_value.trim().to_string()
+        };
+        merged.insert(key.to_string(), value);
     }
 
     let query = url::form_urlencoded::Serializer::new(String::new())
@@ -4632,6 +4739,14 @@ fn parse_newznab_xml(
                 if is_attr {
                     push_attr_element(e, &mut attrs);
                     push_original_attr_element(e, reader.resolver(), &mut attributes);
+                } else if qname.as_ref() == "category" {
+                    attributes.push(PluginReleaseAttribute {
+                        origin: PluginReleaseAttributeOrigin::Element,
+                        namespace: None,
+                        namespace_uri: None,
+                        name: "category".to_owned(),
+                        value: String::new(),
+                    });
                 } else if qname.as_ref() == "enclosure" {
                     parse_enclosure_attrs(
                         e,
@@ -4653,6 +4768,15 @@ fn parse_newznab_xml(
             Ok(Event::End(ref e)) => {
                 let tag_name = e.name().as_ref().to_string();
                 if in_item && current_tag.as_deref() == Some(tag_name.as_str()) {
+                    if tag_name == "category" {
+                        attributes.push(PluginReleaseAttribute {
+                            origin: PluginReleaseAttributeOrigin::Element,
+                            namespace: None,
+                            namespace_uri: None,
+                            name: "category".to_owned(),
+                            value: text.clone(),
+                        });
+                    }
                     let value = text.trim().to_string();
                     text.clear();
                     if !value.is_empty() {
@@ -4662,16 +4786,7 @@ fn parse_newznab_xml(
                             "link" => link = Some(value),
                             "comments" => comments = Some(value),
                             "pubDate" => pub_date = Some(value),
-                            "category" => {
-                                push_category_element(&value, &mut attrs);
-                                attributes.push(PluginReleaseAttribute {
-                                    origin: PluginReleaseAttributeOrigin::Element,
-                                    namespace: None,
-                                    namespace_uri: None,
-                                    name: "category".to_owned(),
-                                    value,
-                                });
-                            }
+                            "category" => push_category_element(&value, &mut attrs),
                             _ => {}
                         }
                     }
@@ -4976,6 +5091,7 @@ pub async fn newznab_connection_test(config: &NewznabConfig) -> Result<serde_jso
         None,
         &connection_test_additional_params(&config.additional_params),
         &config.http_behavior,
+        false,
     )
     .await?;
     validate_newznab_connection_feed(status, &body, 1)?;

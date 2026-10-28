@@ -1,8 +1,8 @@
 [package]
 name = "scryer-plugin-conformance"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
-rust-version = "1.97.1"
+rust-version = "1.99.1"
 license = "GPL-3.0-only"
 description = "Host-conformance harness for Scryer plugin components. Dev-dependency only."
 repository = "https://github.com/scryer-media/scryer-plugins"
@@ -34,7 +34,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
 # wasmtime's defaults minus `cache`: nothing here uses the on-disk compile
 # cache, and it pulls in zstd 0.13, which RustSec flags.
-wasmtime = { version = "48.0.7", default-features = false, features = [
+wasmtime = { version = "~50.0.0", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
@@ -61,4 +61,4 @@ wasmtime = { version = "48.0.7", default-features = false, features = [
     "compile-time-builtins",
     "wit-parser",
 ] }
-wasmtime-wasi = "48.0.7"
+wasmtime-wasi = "~50.0.0"

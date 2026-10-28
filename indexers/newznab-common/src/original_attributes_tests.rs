@@ -62,3 +62,18 @@ fn json_originals_accept_plain_and_namespaced_groups_without_losing_duplicates()
     assert_eq!(attrs[5].value, "Custom");
     assert!(attrs.iter().all(|attr| attr.namespace_uri.is_none()));
 }
+
+#[test]
+fn xml_category_originals_keep_spaces_and_empty_elements() {
+    let body = r#"<rss><channel><item><title>Fixture</title><category> Custom </category><category></category><category> </category><category/></item></channel></rss>"#;
+    let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
+    let values: Vec<_> = results[0]
+        .attributes
+        .iter()
+        .filter(|attr| {
+            attr.origin == PluginReleaseAttributeOrigin::Element && attr.name == "category"
+        })
+        .map(|attr| attr.value.as_str())
+        .collect();
+    assert_eq!(values, [" Custom ", "", " ", ""]);
+}
