@@ -19,9 +19,9 @@ dependencies = [
 
 [[package]]
 name = "base64"
-version = "0.22.1"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bitflags"
@@ -342,7 +342,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "newznab-common"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "httpdate",
  "quick-xml",
@@ -502,9 +502,9 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-sdk"
-version = "3.18.0"
+version = "3.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a045c679044705d66fa330cc0e59ba1d12dcab84e354c6f37705efdf7444b3f2"
+checksum = "9ecff99d3595deebadb6a66bb74f1a8a65b4eb3382dfefec96d9139b743ce240"
 dependencies = [
  "base64",
  "schemars",
@@ -681,7 +681,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "torznab-indexer"
-version = "3.1.1"
+version = "3.2.0"
 dependencies = [
  "newznab-common",
  "scryer-plugin-pdk",

@@ -52,7 +52,7 @@ sevenz-turbo = { version = "0.29.3", default-features = false, features = ["comp
 tempfile = "3"
 # wasmtime's defaults minus `cache`: nothing here uses the on-disk compile
 # cache, and it pulls in zstd 0.13, which RustSec flags.
-wasmtime = { version = "48.0.6", default-features = false, features = [
+wasmtime = { version = "~50.0.0", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
@@ -79,7 +79,7 @@ wasmtime = { version = "48.0.6", default-features = false, features = [
     "compile-time-builtins",
     "wit-parser",
 ] }
-wasmtime-wasi = "48.0.6"
+wasmtime-wasi = "~50.0.0"
 
 # zip 9 depends on typed-path, whose 0.12.3 release enables
 # `#![feature(wasip2)]` unconditionally on wasm32-wasip2 and so fails on the

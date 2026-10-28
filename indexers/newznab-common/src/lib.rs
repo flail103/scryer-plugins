@@ -26,10 +26,11 @@ pub use scryer_plugin_sdk::{
     IndexerResponseFeatures, IndexerSearchIncompleteReason, IndexerSearchInput,
     IndexerSearchInvalidResponseKind, IndexerSearchPluginError, IndexerSourceKind,
     IndexerTorrentCapabilities, PluginDescriptor, PluginError, PluginErrorCode, PluginErrorDetails,
-    PluginResult, PluginRssCatchUp, PluginScoringPolicy as ScoringPolicy, PluginSearchOrigin,
-    PluginSearchQueryKind, PluginSearchRequest as SearchRequest,
-    PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult,
-    PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION, current_sdk_constraint,
+    PluginReleaseAttribute, PluginReleaseAttributeOrigin, PluginResult, PluginRssCatchUp,
+    PluginScoringPolicy as ScoringPolicy, PluginSearchOrigin, PluginSearchQueryKind,
+    PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
+    PluginSearchResult as SearchResult, PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION,
+    current_sdk_constraint,
 };
 use serde::{Deserialize, Serialize};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
@@ -935,7 +936,7 @@ async fn search_with_paging(
     // A search the user typed goes to the indexer as typed, the way Prowlarr's
     // manual search sends it; title cleaning and typed search modes belong to
     // searches the host derived from a title.
-    if is_interactive_text_search(req) {
+    if req.nab.is_some() || req.recent_paging || is_interactive_text_search(req) {
         return raw_search_with_paging(config, req, extract_fn, paging).await;
     }
 
@@ -1216,6 +1217,42 @@ pub async fn execute_raw_search(
     raw_search_with_paging(config, req, extract_fn, SearchPaging::Accumulate).await
 }
 
+fn raw_query_for_request(req: &SearchRequest) -> String {
+    if req.nab.is_some() || req.recent_paging {
+        req.query.clone()
+    } else {
+        raw_search_query(&req.query)
+    }
+}
+
+fn raw_nab_additional_params(req: &SearchRequest, configured: &str) -> Result<String, Error> {
+    let Some(nab) = &req.nab else {
+        return Ok(configured.to_owned());
+    };
+    const OWNED: &[&str] = &["t", "q", "cat", "limit", "offset", "apikey", "api_key", "o"];
+    if nab
+        .parameters
+        .keys()
+        .any(|key| OWNED.iter().any(|owned| key.eq_ignore_ascii_case(owned)))
+    {
+        return Err(plugin_error(
+            PluginErrorCode::Permanent,
+            "Nab operation parameters cannot override transport or credentials",
+        )
+        .into_error());
+    }
+    let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in url::form_urlencoded::parse(configured.as_bytes()) {
+        if !nab.parameters.contains_key(key.as_ref())
+            && !OWNED.iter().any(|owned| key.eq_ignore_ascii_case(owned))
+        {
+            encoded.append_pair(&key, &value);
+        }
+    }
+    encoded.extend_pairs(&nab.parameters);
+    Ok(encoded.finish())
+}
+
 async fn raw_search_with_paging(
     config: &NewznabConfig,
     req: &SearchRequest,
@@ -1223,8 +1260,19 @@ async fn raw_search_with_paging(
     paging: SearchPaging,
 ) -> Result<SearchResponse, Error> {
     let endpoint = build_endpoint(&config.base_url, &config.api_path)?;
-    let query = raw_search_query(&req.query);
+    let query = raw_query_for_request(req);
     let newznab_cat = build_category_param(&req.categories);
+    let search_type = req
+        .nab
+        .as_ref()
+        .map_or("search", |nab| match nab.operation {
+            scryer_plugin_sdk::PluginNabOperation::Search => "search",
+            scryer_plugin_sdk::PluginNabOperation::Tv => "tvsearch",
+            scryer_plugin_sdk::PluginNabOperation::Movie => "movie",
+            scryer_plugin_sdk::PluginNabOperation::Music => "music",
+            scryer_plugin_sdk::PluginNabOperation::Book => "book",
+        });
+    let additional_params = raw_nab_additional_params(req, &config.additional_params)?;
     let page_size = config.page_size;
     let max_pages = paging.max_pages(config);
     let first_offset = paging.first_offset();
@@ -1236,12 +1284,12 @@ async fn raw_search_with_paging(
 
     let mut offset = first_offset;
     for page in 0..max_pages {
-        let page_params = offset_page_params(&config.additional_params, offset);
+        let page_params = offset_page_params(&additional_params, offset);
         let page_limit = page_size.min(wanted - all_results.len());
 
         let search_result = execute_search(
             &endpoint,
-            "search",
+            search_type,
             (!query.is_empty()).then_some(query.as_str()),
             &config.api_key,
             None,
@@ -1255,6 +1303,7 @@ async fn raw_search_with_paging(
             None,
             &page_params,
             &config.http_behavior,
+            req.nab.is_some() || req.recent_paging,
         )
         .await;
         let (status, body) = match search_result {
@@ -1534,6 +1583,7 @@ async fn execute_rss_search(
                 None, // no episode
                 &page_params,
                 &config.http_behavior,
+                false,
             )
             .await;
             let (status, body) = match search_result {
@@ -2561,6 +2611,7 @@ async fn execute_exact_anime_search(
             id_plan.episode,
             additional_params,
             behavior,
+            false,
         )
         .await;
     }
@@ -2605,6 +2656,7 @@ async fn execute_exact_anime_search(
             text_plan.episode,
             additional_params,
             behavior,
+            false,
         )
         .await?;
         let looks_empty = is_empty_response(body.trim_start());
@@ -2689,6 +2741,7 @@ async fn execute_tiered_search(
             plan.episode,
             additional_params,
             behavior,
+            false,
         )
         .await?;
 
@@ -2725,6 +2778,7 @@ async fn execute_tiered_search(
                 text_plan.episode,
                 additional_params,
                 behavior,
+                false,
             )
             .await?;
 
@@ -2845,8 +2899,14 @@ async fn execute_search(
     episode: Option<u32>,
     additional_params: &str,
     behavior: &NewznabHttpBehavior,
+    exact_values: bool,
 ) -> Result<(u16, String), Error> {
-    let url = build_search_url(
+    let build = if exact_values {
+        build_exact_search_url
+    } else {
+        build_search_url
+    };
+    let url = build(
         endpoint,
         search_type,
         query,
@@ -3432,6 +3492,79 @@ fn build_search_url(
     episode: Option<u32>,
     additional_params: &str,
 ) -> Result<String, Error> {
+    build_search_url_with_values(
+        endpoint,
+        search_type,
+        query,
+        api_key,
+        imdb_id,
+        tmdb_id,
+        tvdb_id,
+        tvrage_id,
+        tvmaze_id,
+        cat,
+        limit,
+        season,
+        episode,
+        additional_params,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_exact_search_url(
+    endpoint: &str,
+    search_type: &str,
+    query: Option<&str>,
+    api_key: &str,
+    imdb_id: Option<&str>,
+    tmdb_id: Option<&str>,
+    tvdb_id: Option<&str>,
+    tvrage_id: Option<&str>,
+    tvmaze_id: Option<&str>,
+    cat: Option<&str>,
+    limit: usize,
+    season: Option<u32>,
+    episode: Option<u32>,
+    additional_params: &str,
+) -> Result<String, Error> {
+    build_search_url_with_values(
+        endpoint,
+        search_type,
+        query,
+        api_key,
+        imdb_id,
+        tmdb_id,
+        tvdb_id,
+        tvrage_id,
+        tvmaze_id,
+        cat,
+        limit,
+        season,
+        episode,
+        additional_params,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_search_url_with_values(
+    endpoint: &str,
+    search_type: &str,
+    query: Option<&str>,
+    api_key: &str,
+    imdb_id: Option<&str>,
+    tmdb_id: Option<&str>,
+    tvdb_id: Option<&str>,
+    tvrage_id: Option<&str>,
+    tvmaze_id: Option<&str>,
+    cat: Option<&str>,
+    limit: usize,
+    season: Option<u32>,
+    episode: Option<u32>,
+    additional_params: &str,
+    exact_values: bool,
+) -> Result<String, Error> {
     let imdb_id = imdb_id.map(normalize_imdbid_param);
     let mut url =
         Url::parse(endpoint).map_err(|error| Error::msg(format!("invalid endpoint: {error}")))?;
@@ -3445,7 +3578,12 @@ fn build_search_url(
         pairs.append_pair("extended", "1");
         pairs.append_pair("limit", &limit.to_string());
 
-        if let Some(q) = query.map(str::trim).filter(|value| !value.is_empty()) {
+        let query = if exact_values {
+            query
+        } else {
+            query.map(str::trim)
+        };
+        if let Some(q) = query.filter(|value| !value.is_empty()) {
             pairs.append_pair("q", q);
         }
         if let Some(id) = imdb_id.as_deref() {
@@ -3474,7 +3612,11 @@ fn build_search_url(
         }
     }
 
-    append_additional_query_pairs(&mut url, additional_params);
+    if exact_values {
+        append_additional_query_pairs_with_values(&mut url, additional_params, true);
+    } else {
+        append_additional_query_pairs(&mut url, additional_params);
+    }
 
     Ok(url.to_string())
 }
@@ -3508,6 +3650,14 @@ fn build_raw_search_url(
 }
 
 fn append_additional_query_pairs(url: &mut Url, additional_params: &str) {
+    append_additional_query_pairs_with_values(url, additional_params, false);
+}
+
+fn append_additional_query_pairs_with_values(
+    url: &mut Url,
+    additional_params: &str,
+    exact_values: bool,
+) {
     let normalized = additional_params
         .trim()
         .trim_start_matches('?')
@@ -3523,7 +3673,12 @@ fn append_additional_query_pairs(url: &mut Url, additional_params: &str) {
             continue;
         }
 
-        merged.insert(key.to_string(), raw_value.trim().to_string());
+        let value = if exact_values {
+            raw_value.into_owned()
+        } else {
+            raw_value.trim().to_string()
+        };
+        merged.insert(key.to_string(), value);
     }
 
     let query = url::form_urlencoded::Serializer::new(String::new())
@@ -4020,6 +4175,10 @@ struct NewznabJsonItem {
     pub_date: Option<String>,
     enclosure: Option<NewznabJsonEnclosure>,
     attr: Option<NewznabJsonAttributes>,
+    #[serde(rename = "newznab:attr")]
+    newznab_attr: Option<NewznabJsonAttributes>,
+    #[serde(rename = "torznab:attr")]
+    torznab_attr: Option<NewznabJsonAttributes>,
     #[serde(default)]
     category: Option<NewznabJsonCategories>,
 }
@@ -4176,25 +4335,44 @@ fn parse_newznab_json(
             // Check enclosure MIME type
             let enclosure_type = enclosure_attrs.as_ref().and_then(|a| a.mime_type.clone());
 
-            // Extract attr pairs
-            let mut pairs: Vec<(String, String)> = item
-                .attr
-                .map(|a| {
-                    a.into_vec()
-                        .into_iter()
-                        .filter_map(|node| {
-                            let attrs = node.attributes?;
-                            Some((attrs.name?, attrs.value?))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Keep originals separate from the normalized provider facts.
+            let mut attributes = Vec::new();
+            for (namespace, group) in [
+                (None, item.attr),
+                (Some("newznab"), item.newznab_attr),
+                (Some("torznab"), item.torznab_attr),
+            ] {
+                for node in group.into_iter().flat_map(NewznabJsonAttributes::into_vec) {
+                    if let Some(attrs) = node.attributes {
+                        if let (Some(name), Some(value)) = (attrs.name, attrs.value) {
+                            attributes.push(PluginReleaseAttribute {
+                                origin: PluginReleaseAttributeOrigin::Attribute,
+                                namespace: namespace.map(str::to_owned),
+                                namespace_uri: None,
+                                name,
+                                value,
+                            });
+                        }
+                    }
+                }
+            }
+            let mut pairs: Vec<(String, String)> = attributes
+                .iter()
+                .map(|attr| (attr.name.clone(), attr.value.clone()))
+                .collect();
             for category in item
                 .category
                 .map(NewznabJsonCategories::into_vec)
                 .unwrap_or_default()
             {
                 push_category_element(&category, &mut pairs);
+                attributes.push(PluginReleaseAttribute {
+                    origin: PluginReleaseAttributeOrigin::Element,
+                    namespace: None,
+                    namespace_uri: None,
+                    name: "category".to_owned(),
+                    value: category,
+                });
             }
 
             // Run provider-specific extractor
@@ -4202,6 +4380,7 @@ fn parse_newznab_json(
 
             let mut result = SearchResult {
                 title,
+                attributes,
                 link: item.link,
                 download_url,
                 size_bytes,
@@ -4467,7 +4646,7 @@ fn parse_newznab_xml(
     // Text is not trimmed per event: an element's content arrives as several
     // events split at every entity, so the whitespace around `&amp;` belongs
     // to the value. It is trimmed once, when the element closes.
-    let mut reader = Reader::from_str(body);
+    let mut reader = quick_xml::NsReader::from_str(body);
 
     let mut buf = Vec::new();
     let mut results = Vec::new();
@@ -4486,6 +4665,7 @@ fn parse_newznab_xml(
     let mut size_bytes: Option<i64> = None;
     let mut enclosure_type: Option<String> = None;
     let mut attrs: Vec<(String, String)> = Vec::new();
+    let mut attributes: Vec<PluginReleaseAttribute> = Vec::new();
     let mut current_tag: Option<String> = None;
     let mut saw_rss_root = false;
     let mut saw_channel = false;
@@ -4516,6 +4696,7 @@ fn parse_newznab_xml(
                     size_bytes = None;
                     enclosure_type = None;
                     attrs.clear();
+                    attributes.clear();
                     current_tag = None;
                 } else if in_item {
                     text.clear();
@@ -4533,6 +4714,7 @@ fn parse_newznab_xml(
                         }
                         name if name == "attr" || name.ends_with(":attr") => {
                             push_attr_element(e, &mut attrs);
+                            push_original_attr_element(e, reader.resolver(), &mut attributes);
                             current_tag = None;
                         }
                         _ => {
@@ -4556,6 +4738,15 @@ fn parse_newznab_xml(
                 let is_attr = local_name == "attr" || local_name.ends_with(":attr");
                 if is_attr {
                     push_attr_element(e, &mut attrs);
+                    push_original_attr_element(e, reader.resolver(), &mut attributes);
+                } else if qname.as_ref() == "category" {
+                    attributes.push(PluginReleaseAttribute {
+                        origin: PluginReleaseAttributeOrigin::Element,
+                        namespace: None,
+                        namespace_uri: None,
+                        name: "category".to_owned(),
+                        value: String::new(),
+                    });
                 } else if qname.as_ref() == "enclosure" {
                     parse_enclosure_attrs(
                         e,
@@ -4577,6 +4768,15 @@ fn parse_newznab_xml(
             Ok(Event::End(ref e)) => {
                 let tag_name = e.name().as_ref().to_string();
                 if in_item && current_tag.as_deref() == Some(tag_name.as_str()) {
+                    if tag_name == "category" {
+                        attributes.push(PluginReleaseAttribute {
+                            origin: PluginReleaseAttributeOrigin::Element,
+                            namespace: None,
+                            namespace_uri: None,
+                            name: "category".to_owned(),
+                            value: text.clone(),
+                        });
+                    }
                     let value = text.trim().to_string();
                     text.clear();
                     if !value.is_empty() {
@@ -4620,6 +4820,7 @@ fn parse_newznab_xml(
 
                             let mut result = SearchResult {
                                 title: t.clone(),
+                                attributes: std::mem::take(&mut attributes),
                                 link: link.clone(),
                                 download_url: download_url.clone(),
                                 size_bytes,
@@ -4757,6 +4958,33 @@ fn unescaped_attr_value(attr: &Attribute<'_>) -> String {
     normalized_attr_value(attr).unwrap_or_else(|| attr.value.to_string())
 }
 
+fn push_original_attr_element(
+    element: &quick_xml::events::BytesStart<'_>,
+    resolver: &quick_xml::name::NamespaceResolver,
+    original: &mut Vec<PluginReleaseAttribute>,
+) {
+    let mut pairs = Vec::new();
+    push_attr_element(element, &mut pairs);
+    let qualified = element.name();
+    let namespace = qualified
+        .as_ref()
+        .split_once(':')
+        .map(|(prefix, _)| prefix.to_owned());
+    let namespace_uri = match resolver.resolve_element(qualified).0 {
+        quick_xml::name::ResolveResult::Bound(uri) => Some(uri.as_ref().to_owned()),
+        _ => None,
+    };
+    for (name, value) in pairs {
+        original.push(PluginReleaseAttribute {
+            origin: PluginReleaseAttributeOrigin::Attribute,
+            namespace: namespace.clone(),
+            namespace_uri: namespace_uri.clone(),
+            name,
+            value,
+        });
+    }
+}
+
 fn push_attr_element(e: &quick_xml::events::BytesStart<'_>, attrs: &mut Vec<(String, String)>) {
     let mut attr_name = None;
     let mut attr_value = None;
@@ -4863,6 +5091,7 @@ pub async fn newznab_connection_test(config: &NewznabConfig) -> Result<serde_jso
         None,
         &connection_test_additional_params(&config.additional_params),
         &config.http_behavior,
+        false,
     )
     .await?;
     validate_newznab_connection_feed(status, &body, 1)?;
@@ -10024,8 +10253,10 @@ mod search_identity_regressions {
 
     #[test]
     fn movie_results_with_conflicting_ids_are_not_returned() {
-        let mut req = SearchRequest::default();
-        req.facet = Some("movie".into());
+        let mut req = SearchRequest {
+            facet: Some("movie".into()),
+            ..SearchRequest::default()
+        };
         req.ids.insert("imdb_id".into(), "tt8579674".into());
         let mut response = SearchResponse::default();
         for id in [Some("8579674"), Some("tt8579674"), Some("0000001"), None] {
@@ -10165,3 +10396,9 @@ mod review_regressions {
         }
     }
 }
+
+#[cfg(test)]
+mod original_attributes_tests;
+
+#[cfg(test)]
+mod raw_nab_tests;

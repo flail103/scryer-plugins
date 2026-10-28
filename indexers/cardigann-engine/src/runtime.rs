@@ -24,6 +24,10 @@ use crate::definition::{
 use crate::filters::{apply_filters_with_encoding, normalize_unknown_date};
 use crate::template::{Variables, render, render_search_path};
 
+mod nab;
+#[cfg(test)]
+mod nab_tests;
+
 #[derive(Debug)]
 pub enum Operation {
     TestConnection,
@@ -240,7 +244,8 @@ pub fn begin(
     // strategy renders an empty keyword search on every definition that cannot
     // read the id, and the tracker's front page comes back as results.
     if let StoredOperation::Search(request) = &stored_operation
-        && !id_search_is_supported(&definition, request)
+        && (!nab::request_is_supported(&definition, request)?
+            || !id_search_is_supported(&definition, request))
     {
         return Ok(Step::Complete {
             output: serde_json::to_value(PluginSearchResponse::default())
@@ -1865,7 +1870,7 @@ fn search_variables(
     };
     let imdb = id(&["imdb_id", "imdb", "imdbid"]);
     let query_values = [
-        ("Type", cardigann_search_type(request.facet.as_deref())),
+        ("Type", nab::query_type(request)),
         ("Q", request.query.clone()),
         ("Keywords", request.query.clone()),
         ("Limit", request.limit.to_string()),
@@ -1901,16 +1906,8 @@ fn search_variables(
         ("TVMazeID", id(&["tvmaze_id", "tvmaze", "tvmazeid"])),
         ("TraktID", id(&["trakt_id", "trakt", "traktid"])),
         ("DoubanID", id(&["douban_id", "douban", "doubanid"])),
-        // The host reports a genuinely known release year on the typed search
-        // context, which survives every search strategy it derives from one
-        // request. Everything else Cardigann can name — `.Query.Artist`,
-        // `.Query.Album`, `.Query.Author`, `.Query.Title`, `.Query.Publisher`,
-        // `.Query.Genre` — belongs to music and book search, which Scryer does
-        // not do. Those names are deliberately absent rather than bound to an
-        // empty value: the template engine resolves an unknown `.`-prefixed
-        // name to null exactly as a Go template resolves a missing map key, so
-        // `{{ if .Query.Artist }}` is false and `{{ .Query.Artist }}` renders
-        // empty either way.
+        // Ordinary title searches use the host's known release year. Exact
+        // Nab requests bind their operation-specific fields below.
         (
             "Year",
             request
@@ -1940,9 +1937,10 @@ fn search_variables(
         ".Query.Categories".to_string(),
         Value::Array(categories.into_iter().map(Value::String).collect()),
     );
+    let query = nab::bind_query_variables(request, &mut variables);
     let keywords = apply_definition_filters(
         definition,
-        &request.query,
+        &query,
         &definition.search.keyword_filters,
         &variables,
     )?;
@@ -1952,9 +1950,8 @@ fn search_variables(
 
 /// The Cardigann mode name for a Scryer search facet.
 ///
-/// Definitions expand `{{ .Query.Type }}` straight into a `t=` parameter, so it
-/// has to carry Cardigann's own vocabulary (`search`, `tv-search`,
-/// `movie-search`) rather than the host's facet names.
+/// These are definition `caps.modes` keys. The template's `.Query.Type` uses
+/// the incoming protocol operation instead; see [`nab::query_type`].
 fn cardigann_search_type(facet: Option<&str>) -> String {
     // Scryer's media facets are `movie`, `series`, and `anime`. A `collection`
     // subject is a movie collection and a `special` is a series special;
@@ -2019,8 +2016,7 @@ fn id_search_is_supported(definition: &Definition, request: &PluginSearchRequest
     if supplied.is_empty() {
         return true;
     }
-    let parameters =
-        caps_mode_parameters(definition, &cardigann_search_type(request.facet.as_deref()));
+    let parameters = caps_mode_parameters(definition, &nab::search_type(request));
     supplied.into_iter().any(|key| {
         cardigann_id_parameter(key).is_some_and(|parameter| {
             parameters
@@ -5076,7 +5072,7 @@ search:
         assert_eq!(value(".Query.TVDBID"), "81189");
         assert_eq!(value(".Query.TVRageID"), "18164");
         assert_eq!(value(".Query.TVMazeID"), "169");
-        assert_eq!(value(".Query.Type"), "tv-search");
+        assert_eq!(value(".Query.Type"), "tvsearch");
 
         // The bare spellings a pasted definition may still carry keep working,
         // and a bare id is promoted to the `tt` form the template binds.
@@ -5094,7 +5090,7 @@ search:
         );
         assert_eq!(
             variables.get(".Query.Type").and_then(Value::as_str),
-            Some("movie-search")
+            Some("movie")
         );
 
         for (facet, expected) in [

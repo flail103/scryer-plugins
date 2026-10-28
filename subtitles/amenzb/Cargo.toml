@@ -1,6 +1,6 @@
 [package]
 name = "amenzb-subtitles"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "ameNZB anime subtitle provider using public release subtitle attachments"
@@ -14,7 +14,7 @@ catalog_versions = ["v3"]
 # `scryer:subtitle/subtitle-provider@1.1.0`, and 0.21.21 the first that can
 # decode the open error codes this plugin now reports, so the floor is
 # load-bearing, not advisory.
-min_scryer_version = "0.21.21"
+min_scryer_version = "0.21.22"
 docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/subtitles/amenzb"
 source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/subtitles/amenzb"
 
@@ -36,7 +36,7 @@ base64 = "0.23"
 # reaches ameNZB with everything else.
 newznab-common = { path = "../../indexers/newznab-common" }
 scryer-plugin-pdk = "0.8.0"
-scryer-plugin-sdk = "3.18.0"
+scryer-plugin-sdk = "3.20.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
