@@ -52,6 +52,7 @@ fn qbittorrent_release_wasm_conforms_to_the_download_client_host_contract() {
     assert_a_refused_host_service_stays_in_band(&suite);
     assert_an_unsupported_control_action_is_in_band(&suite);
     assert_a_rejected_login_names_the_credentials(&suite);
+    assert_add_options_across_qbittorrent_versions(&suite);
     suite.assert_another_family_is_an_invocation_error();
 }
 
@@ -60,6 +61,10 @@ fn suite() -> DownloadClientConformance {
         .expects_descriptor(
             &["provider", "capabilities", "mark_imported_non_destructive"],
             serde_json::json!(true),
+        )
+        .expects_descriptor(
+            &["provider", "accepted_inputs"],
+            serde_json::json!(["magnet_uri", "torrent_url", "torrent_bytes", "torrent_file"]),
         )
         // Both are subsumed by this client's own, sharper session checks below.
         .without(Check::ProcessReachesHostServices)
@@ -297,6 +302,128 @@ fn assert_a_rejected_login_names_the_credentials(suite: &DownloadClientConforman
         !error.public_message.contains("secret"),
         "the public message never carries the password: {error:?}"
     );
+}
+
+/// Exercise both encodings through the shipping component, then read the
+/// options using each released server's parameter names. Unknown parameters
+/// are ignored by TorrentsController::addAction in all three versions.
+fn assert_add_options_across_qbittorrent_versions(suite: &DownloadClientConformance) {
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+    for (version, paused_key, checking_key, cookie) in [
+        ("4.6.7", "paused", "skip_checking", "SID=session"),
+        ("5.2.4", "stopped", "skip_checking", "QBT_SID_8080=session"),
+        ("5.3.0", "stopped", "seedMode", "QBT_SID_8080=session"),
+    ] {
+        for multipart in [false, true] {
+            for enabled in [false, true] {
+                let mut script = authenticated_script();
+                let HttpScript::Routed(routes) = &mut script.http else {
+                    unreachable!("the authenticated script is routed");
+                };
+                routes[0] = HttpRoute::exact(
+                    &format!("{API_ROOT}/auth/login"),
+                    HttpReply::new(
+                        if version.starts_with('4') { 200 } else { 204 },
+                        if version.starts_with('4') {
+                            b"Ok.".to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                    )
+                    .with_header("Set-Cookie", &format!("{cookie}; HttpOnly; path=/")),
+                );
+                routes[1] = HttpRoute::exact(
+                    &format!("{API_ROOT}/torrents/info?sort=added_on&reverse=true&filter=all"),
+                    HttpReply::ok(&format!(
+                        r#"[{{"hash":"{HASH}","name":"Example","state":"downloading"}}]"#
+                    )),
+                );
+                routes.push(HttpRoute::exact(
+                    &format!("{API_ROOT}/torrents/add"),
+                    HttpReply::ok(&if version.starts_with('4') {
+                        "Ok.".to_string()
+                    } else {
+                        format!(r#"{{"success_count":1,"failure_count":0,"pending_count":0,"added_torrent_ids":["{HASH}"]}}"#)
+                    }),
+                ));
+                let source = if multipart {
+                    serde_json::json!({
+                        "kind": "torrent_bytes",
+                        "torrent_bytes_base64": "ZDQ6aW5mb2Q0Om5hbWU0OnRlc3RlZQ=="
+                    })
+                } else {
+                    serde_json::json!({"kind":"magnet_uri", "magnet_uri":format!("magnet:?xt=urn:btih:{HASH}")})
+                };
+                let request = serde_json::from_value(serde_json::json!({
+                    "source": source,
+                    "release": {"info_hash_hint": HASH},
+                    "title": {"title_name":"Example", "media_facet":"movie", "tags":[]},
+                    "routing": {"isolation":[], "post_import_isolation":[]},
+                    "torrent": {
+                        "auto_management": enabled,
+                        "initial_state": if enabled { "stopped" } else { "started" },
+                        "skip_checking": enabled,
+                        "force_start": enabled
+                    }
+                }))
+                .expect("valid add request");
+                let (mut store, plugin) = instantiate(&suite.wasm_path(), script);
+                let result = call_download_client(
+                    &mut store,
+                    &plugin,
+                    PluginDownloadClientCommand::Add(request),
+                );
+                let PluginDownloadClientCommandResult::Add(PluginResult::Ok(added)) = result else {
+                    panic!("{version}, multipart={multipart}, enabled={enabled}: {result:?}");
+                };
+                assert_eq!(added.client_item_id, HASH);
+                let sent = store
+                    .data()
+                    .script
+                    .requests
+                    .iter()
+                    .find(|request| request.url == format!("{API_ROOT}/torrents/add"))
+                    .expect("add reached HTTP host");
+                assert_eq!(sent.method.as_deref(), Some("POST"));
+                assert_eq!(sent.header("cookie"), Some(cookie));
+                let body = String::from_utf8_lossy(&sent.body);
+                let fields: BTreeMap<&str, &str> = if multipart {
+                    assert!(
+                        sent.header("content-type")
+                            .unwrap()
+                            .starts_with("multipart/form-data;")
+                    );
+                    body.split("\r\n")
+                        .collect::<Vec<_>>()
+                        .windows(3)
+                        .filter_map(|lines| {
+                            Some((
+                                lines[0]
+                                    .strip_prefix("Content-Disposition: form-data; name=\"")?
+                                    .strip_suffix('"')?,
+                                lines[2],
+                            ))
+                        })
+                        .collect()
+                } else {
+                    assert_eq!(
+                        sent.header("content-type"),
+                        Some("application/x-www-form-urlencoded")
+                    );
+                    body.split('&')
+                        .filter_map(|field| field.split_once('='))
+                        .collect()
+                };
+                for key in ["autoTMM", paused_key, checking_key, "forced"] {
+                    assert_eq!(
+                        fields.get(key).copied(),
+                        Some(if enabled { "true" } else { "false" }),
+                        "{version}, multipart={multipart}, key={key}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn sent_session_cookie(script: &Script) -> bool {
