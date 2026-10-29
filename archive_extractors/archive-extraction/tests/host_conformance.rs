@@ -77,6 +77,7 @@ fn archive_extraction_release_wasm_conforms_to_host_contract() {
     assert_zip_extracts(&wasm_path);
     assert_encrypted_zip_password_states(&wasm_path);
     assert_zip_path_escape_is_rejected(&wasm_path);
+    assert_zip_header_inconsistency_is_rejected_before_writes(&wasm_path);
     assert_split_archives_are_joined(&wasm_path);
     assert_par2_repairs_a_damaged_archive_before_extracting(&wasm_path);
     assert_par2_emits_repaired_plain_files(&wasm_path);
@@ -521,6 +522,49 @@ fn assert_encrypted_zip_password_states(wasm_path: &Path) {
         );
         assert_response_contains_file_bytes(&response, output.path(), payload, label);
     }
+}
+
+fn assert_zip_header_inconsistency_is_rejected_before_writes(wasm_path: &Path) {
+    let source = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for name in ["existing.mkv", "blocked.exe"] {
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"untrusted fixture bytes").unwrap();
+    }
+    let mut bytes = writer.finish().unwrap().into_inner();
+    let header = bytes
+        .windows(4)
+        .rposition(|signature| signature == b"PK\x01\x02")
+        .unwrap();
+    bytes[header + 46..header + 57].copy_from_slice(b"allowed.mkv");
+    fs::write(source.path().join("cloaked.zip"), bytes).unwrap();
+    fs::write(
+        output.path().join("existing.mkv"),
+        b"preserve existing bytes",
+    )
+    .unwrap();
+
+    let response = extract_archive(
+        wasm_path,
+        source.path(),
+        output.path(),
+        "cloaked.zip",
+        ArchivePluginFormat::Zip,
+        None,
+    );
+
+    assert_eq!(response.status, ArchivePluginStatus::Failed, "{response:?}");
+    assert_eq!(response.error_code.as_deref(), Some("read_zip"));
+    assert!(response.files.is_empty());
+    assert_eq!(
+        fs::read(output.path().join("existing.mkv")).unwrap(),
+        b"preserve existing bytes"
+    );
+    assert!(!output.path().join("allowed.mkv").exists());
+    assert!(!output.path().join("blocked.exe").exists());
 }
 
 fn assert_zip_path_escape_is_rejected(wasm_path: &Path) {

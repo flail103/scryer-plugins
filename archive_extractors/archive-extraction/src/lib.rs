@@ -669,6 +669,15 @@ fn extract_zip<R: Read + Seek>(
         Err(error) => return failed_response("read_zip", "failed to read ZIP archive", error),
     };
 
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return failed_message("too_many_entries", "ZIP archive contains too many entries");
+    }
+    // Validate the whole archive before creating output: a later cloaked
+    // entry must not let earlier entries overwrite files first.
+    if let Err(error) = archive.validate_header_consistency() {
+        return failed_response("read_zip", "inconsistent ZIP archive headers", error);
+    }
+
     let output_root = output_dir;
     if let Err(error) = fs::create_dir_all(output_root) {
         return failed_response(
@@ -681,10 +690,6 @@ fn extract_zip<R: Read + Seek>(
     let mut files = Vec::new();
     let mut expanded_bytes = 0_u64;
     let mut output_paths = HashSet::new();
-
-    if archive.len() > MAX_ARCHIVE_ENTRIES {
-        return failed_message("too_many_entries", "ZIP archive contains too many entries");
-    }
 
     for index in 0..archive.len() {
         let entry = match password {
@@ -1336,6 +1341,60 @@ pub(crate) fn empty_response() -> ArchivePluginProcessResponse {
         staged_bytes: None,
         error_code: None,
         message: None,
+    }
+}
+
+#[cfg(test)]
+mod zip_header_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn cloaked_zip() -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for name in ["existing.mkv", "blocked.exe"] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"untrusted fixture bytes").unwrap();
+        }
+        let mut bytes = writer.finish().unwrap().into_inner();
+        let central_header = bytes
+            .windows(4)
+            .rposition(|signature| signature == b"PK\x01\x02")
+            .unwrap();
+        bytes[central_header + 46..central_header + 57].copy_from_slice(b"allowed.mkv");
+        bytes
+    }
+
+    #[test]
+    fn zip_header_inconsistency_is_rejected_before_any_output() {
+        for existing_output in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let output = fixture.path().join("output");
+            let outside = fixture.path().join("unrelated.mkv");
+            fs::write(&outside, b"preserve unrelated bytes").unwrap();
+            if existing_output {
+                fs::create_dir(&output).unwrap();
+                fs::write(output.join("existing.mkv"), b"preserve existing bytes").unwrap();
+            }
+
+            let response = extract_zip(Cursor::new(cloaked_zip()), &output, None);
+
+            assert_eq!(response.status, ArchivePluginStatus::Failed, "{response:?}");
+            assert_eq!(response.error_code.as_deref(), Some("read_zip"));
+            assert!(response.files.is_empty());
+            assert_eq!(fs::read(&outside).unwrap(), b"preserve unrelated bytes");
+            assert!(!output.join("allowed.mkv").exists());
+            assert!(!output.join("blocked.exe").exists());
+            if existing_output {
+                assert_eq!(
+                    fs::read(output.join("existing.mkv")).unwrap(),
+                    b"preserve existing bytes"
+                );
+            } else {
+                assert!(!output.exists());
+            }
+        }
     }
 }
 
