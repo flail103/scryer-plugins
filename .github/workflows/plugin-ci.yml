@@ -212,6 +212,15 @@ jobs:
       - name: Validate official plugins through the release Wasm path
         run: ./xtask/target/debug/xtask plugin validate-all --plugin-id "${{ matrix.plugin_id }}"
 
+      - name: Upload MediathekViewWeb installable plugin
+        if: ${{ matrix.plugin_id == 'mediathekviewweb' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mediathekviewweb-plugin-${{ github.run_id }}
+          path: indexers/mediathekviewweb/target/validated-package/plugin-v3.wasm
+          if-no-files-found: error
+          retention-days: 7
+
   gate:
     if: ${{ always() }}
     needs: [plan, quality, wasm-validate, release-identity-policy]

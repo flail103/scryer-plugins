@@ -4,6 +4,8 @@
 //! The HTTP transport is a trait so the whole flow runs against fixtures in
 //! native tests.
 
+use unicode_normalization::UnicodeNormalization;
+
 use scryer_plugin_sdk::{
     PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
 };
@@ -64,6 +66,268 @@ fn is_numbering_word(word: &str) -> bool {
     digits(season) && episode.is_none_or(digits)
 }
 
+/// The host resolves IDs to titles; MVW itself never receives an ID.
+pub fn has_external_id(request: &SearchRequest) -> bool {
+    ["tvdb_id", "tmdb_id"].iter().any(|key| {
+        request.ids.get(*key).is_some_and(|id| {
+            let id = id.trim();
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && id.bytes().any(|b| b != b'0')
+        })
+    })
+}
+
+pub const MAX_CANDIDATES: usize = 5;
+
+pub fn words(text: &str) -> Vec<String> {
+    let clean: String = text
+        .nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect();
+    clean
+        .split_whitespace()
+        .filter(|word| !is_numbering_word(word))
+        .filter(|word| !word.chars().all(|ch| ch.is_numeric()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn distinct(words: &[String]) -> Vec<String> {
+    let mut unique = Vec::new();
+    for word in words {
+        if word.chars().count() >= 2 && !unique.contains(word) {
+            unique.push(word.clone());
+        }
+    }
+    unique
+}
+
+pub fn search_titles(request: &SearchRequest) -> (Vec<String>, Vec<String>) {
+    let series = request
+        .context
+        .as_ref()
+        .and_then(|context| {
+            context
+                .scene_titles
+                .iter()
+                .find(|title| !distinct(&words(title)).is_empty())
+        })
+        .map(String::as_str)
+        .or_else(|| {
+            (!distinct(&words(&request.query)).is_empty()).then_some(request.query.as_str())
+        })
+        .or_else(|| {
+            request
+                .tagged_aliases
+                .iter()
+                .map(|alias| alias.name.as_str())
+                .find(|title| !distinct(&words(title)).is_empty())
+        })
+        .unwrap_or("");
+    let episode = request
+        .context
+        .as_ref()
+        .and_then(|context| context.episode_title.as_deref())
+        .unwrap_or("");
+    (words(series), words(episode))
+}
+
+/// Document-frequency weights from the first (series) query, frozen for the
+/// entire search so narrower replies cannot inflate their own confidence.
+/// Weights range from 100 to 300. Unseen words receive only 150; fewer than
+/// three documents give uniform weights because rarity is not meaningful yet.
+struct Keyword {
+    word: String,
+    weight: usize,
+}
+
+pub struct Relevance {
+    series: Vec<String>,
+    episode: Vec<Keyword>,
+    has_episode: bool,
+}
+
+impl Relevance {
+    pub fn new(series: &[String], episode: &[String], sample: &[Entry]) -> Self {
+        let series = distinct(series);
+        let documents = sample
+            .iter()
+            .take(MAX_RESULTS)
+            .map(|entry| words(&format!("{} {}", entry.topic, entry.title)))
+            .collect::<Vec<_>>();
+        let mut keys = distinct(episode)
+            .into_iter()
+            // A word already required by the series cannot establish episode identity.
+            .filter(|word| !series.contains(word))
+            .map(|word| {
+                let frequency = documents.iter().filter(|doc| doc.contains(&word)).count();
+                let weight = if documents.len() < 3 {
+                    100
+                } else if frequency == 0 {
+                    150
+                } else {
+                    (100 * (documents.len() + 1) / (frequency + 1)).min(300)
+                };
+                Keyword { word, weight }
+            })
+            .collect::<Vec<_>>();
+        // Stable sorting keeps source order for equal weights; length is not a proxy.
+        keys.sort_by_key(|key| std::cmp::Reverse(key.weight));
+        Self {
+            series,
+            episode: keys,
+            has_episode: !episode.is_empty(),
+        }
+    }
+
+    pub fn keywords(&self) -> Vec<String> {
+        self.episode.iter().map(|key| key.word.clone()).collect()
+    }
+
+    pub fn score(&self, entry: &Entry) -> Option<usize> {
+        let result = words(&format!("{} {}", entry.topic, entry.title));
+        let series_hits = self
+            .series
+            .iter()
+            .filter(|word| result.contains(word))
+            .count();
+        if !self.series.is_empty() && series_hits * 4 < self.series.len() * 3 {
+            return None;
+        }
+        let hits = self
+            .episode
+            .iter()
+            .filter(|key| result.contains(&key.word))
+            .collect::<Vec<_>>();
+        let matched: usize = hits.iter().map(|key| key.weight).sum();
+        let total: usize = self.episode.iter().map(|key| key.weight).sum();
+        if self.has_episode {
+            // Require 70% weighted coverage and two independent words when
+            // available. A one-word title also needs series evidence.
+            if total == 0
+                || matched * 10 < total * 7
+                || hits.len() < self.episode.len().min(2)
+                || (self.series.is_empty() && hits.len() < 2)
+            {
+                return None;
+            }
+        } else if self.series.is_empty() {
+            return None;
+        }
+        Some(
+            50 * usize::from(!self.series.is_empty())
+                + (50 * matched).checked_div(total).unwrap_or(0),
+        )
+    }
+}
+
+/// The broad sample is followed by at most four distinct narrower queries.
+/// The caller skips candidates equal to the sample query.
+pub fn candidate_queries(series: &[String], episode: &[String], keys: &[String]) -> Vec<String> {
+    let series = series.join(" ");
+    let mut queries = Vec::new();
+    let mut add = |query: String| {
+        let query = query.trim().to_string();
+        if !query.is_empty() && !queries.contains(&query) {
+            queries.push(query);
+        }
+    };
+    if !series.is_empty() && !episode.is_empty() {
+        add(format!("{series} {}", episode.join(" ")));
+        if !keys.is_empty() {
+            add(format!(
+                "{series} {}",
+                keys.iter().take(3).cloned().collect::<Vec<_>>().join(" ")
+            ));
+            add(format!("{series} {}", keys[0]));
+        }
+    }
+    add(episode.join(" "));
+    queries.truncate(MAX_CANDIDATES - 1);
+    queries
+}
+
+async fn run_fallback<F: Fetch>(
+    config: &MvwConfig,
+    request: &SearchRequest,
+    fetch: &F,
+) -> Result<PageOutcome, MvwError> {
+    // Fallback is a bounded, terminal batch, never a paged fan-out.
+    if request.page_cursor.is_some() {
+        return Err(MvwError::InvalidCursor);
+    }
+    let (series, episode) = search_titles(request);
+    let series = distinct(&series);
+    let episode = distinct(&episode);
+    let initial = if series.is_empty() {
+        episode.join(" ")
+    } else {
+        series.join(" ")
+    };
+    if initial.is_empty() {
+        return Ok(PageOutcome {
+            response: SearchResponse::default(),
+            ceiling_reached: false,
+        });
+    }
+    let mut queries = vec![initial];
+    let mut relevance = None;
+    let mut index = 0;
+    while index < queries.len() && index < MAX_CANDIDATES {
+        let call = QueryCall {
+            query: queries[index].clone(),
+            channel: match config.channels.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            },
+            offset: 0,
+            size: MAX_RESULTS,
+        };
+        let reply = fetch.post(&call).await?;
+        let page = api::parse_reply(reply.status, reply.retry_after.as_deref(), &reply.body)?;
+        if relevance.is_none() {
+            let model = Relevance::new(&series, &episode, &page.results);
+            for query in candidate_queries(&series, &episode, &model.keywords()) {
+                if !queries.contains(&query) {
+                    queries.push(query);
+                }
+            }
+            relevance = Some(model);
+        }
+        let model = relevance.as_ref().expect("first reply builds relevance");
+        let mut ranked = page
+            .results
+            .iter()
+            .take(MAX_RESULTS)
+            .filter(|entry| keep(config, entry))
+            .filter_map(|entry| Some((model.score(entry)?, build_result(entry)?)))
+            .collect::<Vec<_>>();
+        ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        if !ranked.is_empty() {
+            return Ok(PageOutcome {
+                response: SearchResponse {
+                    results: ranked
+                        .into_iter()
+                        .take(page_size(request))
+                        .map(|(_, result)| result)
+                        .collect(),
+                    ..SearchResponse::default()
+                },
+                ceiling_reached: false,
+            });
+        }
+        index += 1;
+    }
+    Ok(PageOutcome {
+        response: SearchResponse::default(),
+        ceiling_reached: false,
+    })
+}
+
 pub fn page_size(request: &SearchRequest) -> usize {
     if request.limit == 0 {
         MAX_RESULTS
@@ -98,6 +362,9 @@ pub async fn run_page<F: Fetch>(
     request: &SearchRequest,
     fetch: &F,
 ) -> Result<PageOutcome, MvwError> {
+    if has_external_id(request) {
+        return run_fallback(config, request, fetch).await;
+    }
     let query = build_query(request);
     if query.is_empty() {
         // No query: a recent-releases or id-only request this indexer does

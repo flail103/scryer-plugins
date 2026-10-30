@@ -19,7 +19,9 @@ Calls go straight from your Scryer to `mediathekviewweb.de`. No Scryer service s
 
 - The search text is matched against each entry's title and topic, newest first. Season and episode numbers are not added to it, because the film list does not number episodes; Scryer's release parser reads whatever markers the broadcaster put in the title.
 - A page holds up to 50 results. Scryer may load further pages until it has as many results as it asked for, but one search reads at most two pages and then reports that it stopped at its page limit.
-- A search without text makes no call. External ids (TVDB, TMDB, IMDb) are not used.
+- TVDB/TMDB requests use host-provided scene titles (or query/alias text) and episode titles. IDs are never sent to MVW or resolved by this plugin. The first query samples up to 50 series results. Episode words are weighted by their document frequency in that sample: common words contribute less, rare words more. Weights are capped; unseen words have reduced weight and samples smaller than three entries use equal weights. There is no language-specific filler-word list or word-length ranking. Unicode is normalized to NFC, case and punctuation are normalized, apostrophes split words, accents are preserved, and numeric/season-episode tokens are omitted.
+- The initial sample counts toward a maximum of five sequential queries. If it has no confident match, the plugin tries the combined series/episode title, series plus the top three weighted words, series plus the strongest word, then episode title alone (skipping duplicates). A match requires at least three quarters of the series words and 70% of the episode-word weight, with at least two distinct episode words when available. A single-word episode title also requires series evidence. Single-letter fragments and words already present in the series name do not establish episode identity. The first confident batch ends the search, ranked by weighted overlap, with no further paging. Errors stop the search immediately.
+- An ID without usable title text makes no call. IMDb IDs are not supported. Plain text searches retain the paging behavior above.
 
 ## What results contain
 

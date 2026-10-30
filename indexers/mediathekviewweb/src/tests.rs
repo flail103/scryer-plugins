@@ -171,7 +171,7 @@ fn descriptor_declares_an_interactive_http_indexer() {
     let descriptor = crate::build_descriptor();
     assert_eq!(descriptor.id, "mediathekviewweb");
     assert_eq!(descriptor.name, "MediathekViewWeb");
-    assert_eq!(descriptor.version, "0.1.1");
+    assert_eq!(descriptor.version, "0.2.0");
     let ProviderDescriptor::Indexer(indexer) = descriptor.provider else {
         panic!("not an indexer");
     };
@@ -195,6 +195,7 @@ fn descriptor_declares_an_interactive_http_indexer() {
         vec![
             IndexerSearchInput::TextQuery,
             IndexerSearchInput::TitleQuery,
+            IndexerSearchInput::IdQuery,
             IndexerSearchInput::Season,
             IndexerSearchInput::Episode,
             IndexerSearchInput::Limit,
@@ -204,7 +205,10 @@ fn descriptor_declares_an_interactive_http_indexer() {
         capabilities.supported_query_facets,
         vec!["series".to_string(), "movie".to_string()]
     );
-    assert!(capabilities.supported_external_ids.is_empty());
+    assert_eq!(
+        capabilities.supported_external_ids,
+        vec!["tvdb_id", "tmdb_id"]
+    );
     let limits = capabilities.limits.expect("limits");
     assert!(limits.paged_search);
     assert_eq!(limits.max_page_size, Some(50));
@@ -1381,4 +1385,245 @@ fn live_search_maps_releases() {
         "no direct_file resource"
     );
     eprintln!("next_cursor: {:?}", outcome.response.next_cursor);
+}
+
+fn relevance_entry(topic: &str, title: &str) -> crate::api::Entry {
+    crate::api::Entry {
+        topic: topic.into(),
+        title: title.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn fallback_queries_use_frequency_not_length_or_stop_words() {
+    assert_eq!(
+        engine::words("The, Mystery! of S02E03: Der Wald (2026)"),
+        vec!["the", "mystery", "of", "der", "wald"]
+    );
+    let sample = vec![
+        relevance_entry("Show", "the extraordinarily long introduction"),
+        relevance_entry("Show", "the extraordinarily long conclusion"),
+        relevance_entry("Show", "the extraordinarily long fox"),
+        relevance_entry("Show", "the extraordinarily long credits"),
+    ];
+    let series = engine::words("Show");
+    let episode = engine::words("the extraordinarily long fox");
+    let model = engine::Relevance::new(&series, &episode, &sample);
+    assert_eq!(
+        model.keywords(),
+        vec!["fox", "the", "extraordinarily", "long"]
+    );
+    let queries = engine::candidate_queries(&series, &episode, &model.keywords());
+    assert_eq!(queries[0], "show the extraordinarily long fox");
+    assert_eq!(queries[1], "show fox the extraordinarily");
+    assert_eq!(queries[2], "show fox");
+    assert_eq!(queries[3], "the extraordinarily long fox");
+    assert!(queries.len() < engine::MAX_CANDIDATES);
+    assert!(engine::candidate_queries(&[], &[], &[]).is_empty());
+}
+
+#[test]
+fn fallback_scores_series_and_episode_word_overlap() {
+    let series = engine::words("Mystery Show");
+    let episode = engine::words("Ancient Forest");
+    let model = engine::Relevance::new(&series, &episode, &[]);
+    assert_eq!(
+        model.score(&relevance_entry("Mystery: Show", "Ancient Forest!")),
+        Some(100)
+    );
+    assert_eq!(
+        model.score(&relevance_entry("Mystery Show", "Other episode")),
+        None
+    );
+    assert_eq!(
+        model.score(&relevance_entry("Other show", "Ancient Forest")),
+        None
+    );
+    assert_eq!(
+        model.score(&relevance_entry("Mystery Show", "Ancient")),
+        None
+    );
+    assert_eq!(
+        engine::Relevance::new(&engine::words("Art"), &[], &[])
+            .score(&relevance_entry("Party", "")),
+        None
+    );
+}
+
+#[test]
+fn french_unicode_apostrophes_and_frequency_are_consistent() {
+    assert_eq!(
+        engine::words("L’aventure de l'été S01E02"),
+        vec!["l", "aventure", "de", "l", "été"]
+    );
+    assert_eq!(
+        engine::words("ÉTÉ forêt"),
+        engine::words("E\u{301}TE\u{301} fore\u{302}t")
+    );
+    let sample = vec![
+        relevance_entry("Émissions", "Dans la forêt enchantée"),
+        relevance_entry("Émissions", "Dans la grande maison"),
+        relevance_entry("Émissions", "Dans la vieille ville"),
+        relevance_entry("Émissions", "Dans la petite école"),
+    ];
+    let series = engine::words("Émissions");
+    let episode = engine::words("Dans la forêt enchantée");
+    let model = engine::Relevance::new(&series, &episode, &sample);
+    assert_eq!(model.keywords()[..2], ["forêt", "enchantée"]);
+    assert_eq!(model.score(&sample[0]), Some(100));
+    assert_eq!(model.score(&sample[1]), None);
+    assert!(
+        model
+            .score(&relevance_entry("Émissions", "Forêt enchantée"))
+            .is_some()
+    );
+}
+
+#[test]
+fn sparse_samples_unseen_words_and_duplicates_cannot_inflate_confidence() {
+    let series = engine::words("Show");
+    let episode = engine::words("Hidden hidden rare forest");
+    let sample = vec![relevance_entry("Show", "common title"); 4];
+    let model = engine::Relevance::new(&series, &episode, &sample);
+    assert_eq!(model.keywords(), vec!["hidden", "rare", "forest"]);
+    assert_eq!(
+        model.score(&relevance_entry("Show", "hidden hidden hidden")),
+        None
+    );
+    assert_eq!(model.score(&relevance_entry("Show", "hidden rare")), None);
+    assert_eq!(
+        model.score(&relevance_entry("Show", "hidden rare forest")),
+        Some(100)
+    );
+    let sparse = engine::Relevance::new(&series, &episode, &sample[..1]);
+    assert_eq!(sparse.keywords(), model.keywords());
+    assert_eq!(sparse.score(&relevance_entry("Show", "hidden")), None);
+    assert_eq!(
+        engine::Relevance::new(&series, &engine::words("Show Show"), &[])
+            .score(&relevance_entry("Show", "")),
+        None
+    );
+    assert_eq!(
+        engine::Relevance::new(&[], &engine::words("forest"), &[])
+            .score(&relevance_entry("", "forest")),
+        None
+    );
+}
+
+fn id_request(query: &str) -> SearchRequest {
+    let mut req = request(query);
+    req.ids.insert("tvdb_id".into(), "123".into());
+    req
+}
+
+#[test]
+fn fallback_advances_and_stops_at_first_confident_batch() {
+    // Construct through JSON to exercise the SDK's request context contract.
+    let mut req = id_request("Synthetic Show");
+    req.context = Some(
+        serde_json::from_value(json!({
+            "episode_title": "Testfall", "scene_titles": ["Synthetic Show"]
+        }))
+        .unwrap(),
+    );
+    let queries = ["synthetic show", "synthetic show testfall"];
+    let fetch = FixtureFetch::new(vec![
+        Ok(reply(200, r#"{"result":{"results":[]}}"#)),
+        Ok(reply(200, QUERY_CRID_VARIANTS)),
+    ]);
+    let outcome = run(&config_with(&[]), &req, &fetch).unwrap();
+    assert!(!outcome.response.results.is_empty());
+    assert!(outcome.response.next_cursor.is_none());
+    assert_eq!(fetch.calls().len(), 2);
+    assert_eq!(fetch.calls()[0].query, queries[0]);
+    assert_eq!(fetch.calls()[1].query, queries[1]);
+}
+
+#[test]
+fn fallback_empty_id_only_and_errors_are_bounded() {
+    let fetch = FixtureFetch::new(vec![]);
+    assert!(
+        run(&config_with(&[]), &id_request(""), &fetch)
+            .unwrap()
+            .response
+            .results
+            .is_empty()
+    );
+    assert!(fetch.calls().is_empty());
+    let req = id_request("Synthetic Show");
+    let fetch = FixtureFetch::ok(r#"{"result":{"results":[]}}"#);
+    assert!(
+        run(&config_with(&[]), &req, &fetch)
+            .unwrap()
+            .response
+            .results
+            .is_empty()
+    );
+    assert_eq!(fetch.calls().len(), 1);
+    let fetch = FixtureFetch::new(vec![Ok(reply(429, ""))]);
+    assert!(matches!(
+        run(&config_with(&[]), &req, &fetch),
+        Err(MvwError::RateLimited { .. })
+    ));
+    assert_eq!(fetch.calls().len(), 1);
+    for key in ["tvdb_id", "tmdb_id"] {
+        let mut req = request("");
+        req.ids.insert(key.into(), "321".into());
+        assert!(engine::has_external_id(&req));
+        req.ids.insert(key.into(), "0".into());
+        assert!(!engine::has_external_id(&req));
+    }
+}
+
+#[test]
+fn fallback_exhaustion_never_exceeds_candidate_budget() {
+    let mut req = id_request("");
+    req.context = Some(
+        serde_json::from_value(json!({
+            "scene_titles": ["Mystery Show S02E03"],
+            "episode_title": "Ancient forests conceal mysterious hidden creatures"
+        }))
+        .unwrap(),
+    );
+    let (series, episode) = engine::search_titles(&req);
+    let sample = parse_reply(200, None, QUERY_CRID_VARIANTS.as_bytes()).unwrap();
+    let model = engine::Relevance::new(&series, &episode, &sample.results);
+    let mut queries = vec![series.join(" ")];
+    queries.extend(engine::candidate_queries(
+        &series,
+        &episode,
+        &model.keywords(),
+    ));
+    assert_eq!(queries.len(), engine::MAX_CANDIDATES);
+    let fetch = FixtureFetch::new(
+        queries
+            .iter()
+            .map(|_| Ok(reply(200, QUERY_CRID_VARIANTS)))
+            .collect(),
+    );
+    let outcome = run(&config_with(&[]), &req, &fetch).unwrap();
+    assert!(outcome.response.results.is_empty());
+    assert!(outcome.response.next_cursor.is_none());
+    assert_eq!(
+        fetch
+            .calls()
+            .iter()
+            .map(|call| call.query.clone())
+            .collect::<Vec<_>>(),
+        queries
+    );
+    assert!(
+        fetch
+            .calls()
+            .iter()
+            .all(|call| call.offset == 0 && call.size <= 50)
+    );
+    req.page_cursor = Some("mvw1.1.50".into());
+    let fetch = FixtureFetch::new(vec![]);
+    assert!(matches!(
+        run(&config_with(&[]), &req, &fetch),
+        Err(MvwError::InvalidCursor)
+    ));
+    assert!(fetch.calls().is_empty());
 }

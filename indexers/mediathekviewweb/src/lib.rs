@@ -72,11 +72,12 @@ fn build_descriptor() -> PluginDescriptor {
                 search_inputs: vec![
                     IndexerSearchInput::TextQuery,
                     IndexerSearchInput::TitleQuery,
+                    IndexerSearchInput::IdQuery,
                     IndexerSearchInput::Season,
                     IndexerSearchInput::Episode,
                     IndexerSearchInput::Limit,
                 ],
-                supported_external_ids: vec![],
+                supported_external_ids: vec!["tvdb_id".to_string(), "tmdb_id".to_string()],
                 limits: Some(IndexerLimitCapabilities {
                     page_size: Some(MAX_RESULTS as u32),
                     max_page_size: Some(MAX_RESULTS as u32),
