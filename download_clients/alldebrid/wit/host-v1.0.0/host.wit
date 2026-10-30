@@ -1,0 +1,10 @@
+package scryer:host@1.0.0;
+
+interface services {
+  enum host-error {
+    invalid-request,
+    failed,
+  }
+
+  host-call: func(request: list<u8>) -> result<list<u8>, host-error>;
+}

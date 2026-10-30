@@ -1,0 +1,14 @@
+package scryer:download-client@1.0.0;
+
+world download-client {
+  import scryer:host/services@1.0.0;
+
+  enum invocation-error {
+    failed,
+    cancelled,
+    invalid-response,
+  }
+
+  export describe: func() -> list<u8>;
+  export process: func(request: list<u8>) -> result<list<u8>, invocation-error>;
+}
