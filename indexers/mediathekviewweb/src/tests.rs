@@ -171,7 +171,7 @@ fn descriptor_declares_an_interactive_http_indexer() {
     let descriptor = crate::build_descriptor();
     assert_eq!(descriptor.id, "mediathekviewweb");
     assert_eq!(descriptor.name, "MediathekViewWeb");
-    assert_eq!(descriptor.version, "0.2.0");
+    assert_eq!(descriptor.version, "0.2.1");
     let ProviderDescriptor::Indexer(indexer) = descriptor.provider else {
         panic!("not an indexer");
     };
@@ -182,6 +182,14 @@ fn descriptor_declares_an_interactive_http_indexer() {
         vec!["mediathekviewweb.de".to_string()]
     );
     let capabilities = indexer.capabilities;
+    assert_eq!(
+        capabilities.supported_ids.get("series").unwrap(),
+        &vec!["tvdb_id", "tmdb_id"]
+    );
+    assert_eq!(
+        capabilities.supported_ids.get("movie").unwrap(),
+        &vec!["tmdb_id"]
+    );
     assert!(capabilities.search);
     assert!(!capabilities.rss);
     assert_eq!(capabilities.query_param.as_deref(), Some("q"));

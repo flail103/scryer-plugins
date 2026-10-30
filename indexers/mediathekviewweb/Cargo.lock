@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "mediathekviewweb-indexer"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "scryer-plugin-pdk",
  "scryer-plugin-sdk",

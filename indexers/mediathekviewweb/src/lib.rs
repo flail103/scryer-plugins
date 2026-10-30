@@ -61,7 +61,14 @@ fn build_descriptor() -> PluginDescriptor {
             source_kind: IndexerSourceKind::Http,
             capabilities: IndexerCapabilities {
                 rss: false,
-                supported_ids: HashMap::new(),
+                // The host dispatches ID searches from this facet-scoped map.
+                supported_ids: HashMap::from([
+                    (
+                        "series".to_string(),
+                        vec!["tvdb_id".to_string(), "tmdb_id".to_string()],
+                    ),
+                    ("movie".to_string(), vec!["tmdb_id".to_string()]),
+                ]),
                 supported_query_facets: vec!["series".to_string(), "movie".to_string()],
                 search: true,
                 // The host offers text search only to indexers that name a
