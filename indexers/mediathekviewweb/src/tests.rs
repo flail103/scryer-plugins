@@ -171,7 +171,7 @@ fn descriptor_declares_an_interactive_http_indexer() {
     let descriptor = crate::build_descriptor();
     assert_eq!(descriptor.id, "mediathekviewweb");
     assert_eq!(descriptor.name, "MediathekViewWeb");
-    assert_eq!(descriptor.version, "0.2.1");
+    assert_eq!(descriptor.version, "0.2.2");
     let ProviderDescriptor::Indexer(indexer) = descriptor.provider else {
         panic!("not an indexer");
     };
@@ -193,6 +193,8 @@ fn descriptor_declares_an_interactive_http_indexer() {
     assert!(capabilities.search);
     assert!(!capabilities.rss);
     assert_eq!(capabilities.query_param.as_deref(), Some("q"));
+    assert_eq!(capabilities.season_param.as_deref(), Some("season"));
+    assert_eq!(capabilities.episode_param.as_deref(), Some("episode"));
     assert_eq!(capabilities.protocols, vec![IndexerProtocol::Http]);
     assert_eq!(
         capabilities.feed_modes,
@@ -1546,6 +1548,45 @@ fn fallback_advances_and_stops_at_first_confident_batch() {
     assert_eq!(fetch.calls().len(), 2);
     assert_eq!(fetch.calls()[0].query, queries[0]);
     assert_eq!(fetch.calls()[1].query, queries[1]);
+}
+
+#[test]
+fn matched_episode_identity_is_carried_only_by_scoped_id_results() {
+    for (season, episode, scoped) in [(Some(2), Some(3), true), (Some(2), None, false)] {
+        let mut req = id_request("Synthetic Show");
+        req.season = season;
+        req.episode = episode;
+        req.context = Some(
+            serde_json::from_value(json!({
+                "episode_title": "Testfall", "scene_titles": ["Synthetic Show"]
+            }))
+            .unwrap(),
+        );
+        let fetch = FixtureFetch::new(vec![
+            Ok(reply(200, r#"{"result":{"results":[]}}"#)),
+            Ok(reply(200, QUERY_CRID_VARIANTS)),
+        ]);
+        let outcome = run(&config_with(&[]), &req, &fetch).unwrap();
+        assert!(!outcome.response.results.is_empty());
+        for result in outcome.response.results {
+            assert_eq!(result.title.starts_with("synthetic show S02E03 - "), scoped);
+            assert_eq!(result.provider_extra.contains_key("original_title"), scoped);
+            if scoped {
+                assert!(
+                    result.provider_extra["original_title"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Testfall")
+                );
+            }
+        }
+        assert!(
+            fetch
+                .calls()
+                .iter()
+                .all(|call| !call.query.contains("S02E03"))
+        );
+    }
 }
 
 #[test]

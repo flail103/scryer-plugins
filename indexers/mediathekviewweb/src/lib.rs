@@ -74,6 +74,8 @@ fn build_descriptor() -> PluginDescriptor {
                 // The host offers text search only to indexers that name a
                 // query parameter.
                 query_param: Some("q".to_string()),
+                season_param: Some("season".into()),
+                episode_param: Some("episode".into()),
                 protocols: vec![IndexerProtocol::Http],
                 feed_modes: vec![IndexerFeedMode::InteractiveSearch],
                 search_inputs: vec![

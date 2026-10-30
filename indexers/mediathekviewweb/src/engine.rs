@@ -313,7 +313,27 @@ async fn run_fallback<F: Fetch>(
                     results: ranked
                         .into_iter()
                         .take(page_size(request))
-                        .map(|(_, result)| result)
+                        .map(|(_, mut result)| {
+                            // Only the ID fallback has verified both the series
+                            // and episode title. Carry that resolved identity in
+                            // the release name so the host can assign coverage.
+                            if !series.is_empty()
+                                && !episode.is_empty()
+                                && let (Some(season), Some(episode_number)) =
+                                    (request.season, request.episode)
+                            {
+                                result.provider_extra.insert(
+                                    "original_title".into(),
+                                    serde_json::json!(result.title),
+                                );
+                                result.title = format!(
+                                    "{} S{season:02}E{episode_number:02} - {}",
+                                    series.join(" "),
+                                    result.title,
+                                );
+                            }
+                            result
+                        })
                         .collect(),
                     ..SearchResponse::default()
                 },
