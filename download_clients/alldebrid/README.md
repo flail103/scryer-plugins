@@ -4,6 +4,8 @@ AllDebrid download-client plugin for Scryer. AllDebrid performs the torrent
 retrieval; a configured local download backend then transfers the ready file
 links to storage accessible to Scryer. The first backend is pyLoad-ng.
 
+Requires Scryer 0.21.21 or newer.
+
 ## Configuration
 
 - `alldebrid_api_key`: AllDebrid API bearer key.

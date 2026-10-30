@@ -19,7 +19,7 @@ const USER_AGENT: &str = "scryer-alldebrid-plugin/0.1";
 
 wit_bindgen::generate!({
     world: "scryer:download-client/download-client@1.0.0",
-    path: ["wit/host-v1.0.0", "wit/download-client-v1.0.0"],
+    path: ["../../pdk/scryer-plugin-pdk/wit/host-v1.0.0", "../../pdk/scryer-plugin-pdk/wit/download-client-v1.0.0"],
     generate_all,
 });
 
@@ -127,6 +127,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.into(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "alldebrid".into(),
             provider_aliases: vec!["alldebrid-pyload".into()],
@@ -475,6 +476,8 @@ fn list_queue(_input: String) -> FnResult<String> {
             message,
             category: None,
             remote_output_path: Some(output_dir(&config, &job.title)),
+            added_at: None,
+            http: None,
             torrent: Some(PluginTorrentItem {
                 client_native_id: Some(job.id.clone()),
                 raw_status: magnet["status"].as_str().map(str::to_string),
@@ -618,6 +621,7 @@ fn completed_download(
         // package directory is stable; Scryer should scan it rather than
         // trusting backend-reported relative path strings.
         content_paths: vec![],
+        subtitle_paths: vec![],
         size_bytes: package["sizetotal"].as_i64(),
         completed_at: None,
         parameters: vec![],

@@ -161,6 +161,7 @@ fn build_descriptor_json() -> Result<String, Error> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "decypharr".to_string(),
             provider_aliases: vec!["decypharr-decypharr".to_string()],
@@ -179,6 +180,7 @@ fn build_descriptor_json() -> Result<String, Error> {
                 DownloadIsolationMode::Directory,
             ],
             capabilities: DownloadClientCapabilities {
+                http: None,
                 category_scoped_feedback: true,
                 pause: true,
                 resume: true,
@@ -310,6 +312,12 @@ fn handle_download_add(
             PreparedAddRequest::Multipart(body)
         } else {
             let Some(source_value) = (match request.source.kind {
+                DownloadInputKind::HttpResource => {
+                    return Ok(plugin_error(
+                        PluginErrorCode::Unsupported,
+                        "HTTP resources are not supported",
+                    ));
+                }
                 DownloadInputKind::MagnetUri => request
                     .source
                     .magnet_uri
@@ -2285,6 +2293,8 @@ fn torrent_to_item_with_preferences(
         message: state_message(&torrent.state),
         category,
         remote_output_path,
+        added_at: None,
+        http: None,
         torrent: Some(PluginTorrentItem {
             info_hash_v1: Some(normalize_hash(&torrent.hash)),
             info_hash_v2: None,
@@ -2345,6 +2355,7 @@ fn torrent_to_completed_download(torrent: QbTorrent) -> Option<PluginCompletedDo
         category: normalize_non_empty(torrent.category.clone()),
         output_kind: Some(output_kind),
         content_paths,
+        subtitle_paths: vec![],
         size_bytes: torrent.total_size.or(torrent.size),
         completed_at: unix_to_rfc3339(torrent.completion_on),
         parameters: parameters_from_tags(torrent.tags.as_deref()),
@@ -4005,7 +4016,7 @@ wit_bindgen::generate!({
     world: "scryer:download-client/download-client@1.0.0",
     // The shared `scryer:host` package is listed first so the family package's
     // `import scryer:host/services@1.0.0` resolves against it.
-    path: ["wit/host-v1.0.0", "wit/download-client-v1.0.0"],
+    path: ["../../pdk/scryer-plugin-pdk/wit/host-v1.0.0", "../../pdk/scryer-plugin-pdk/wit/download-client-v1.0.0"],
     // The host package is its own WIT package, so wit-bindgen asks explicitly
     // whether to generate for it. Yes: the PDK holds only a `fn` pointer and
     // the entry macro binds it to this module's

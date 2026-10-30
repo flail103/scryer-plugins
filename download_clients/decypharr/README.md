@@ -5,6 +5,8 @@ Official Scryer download-client adapter for
 qBittorrent-compatible API so Scryer can submit torrents, poll their state,
 discover completed content, and remove jobs.
 
+Requires Scryer 0.21.21 or newer.
+
 ## Configuration
 
 - **base_url**: Decypharr's externally reachable URL, commonly
