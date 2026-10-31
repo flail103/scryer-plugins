@@ -61,22 +61,32 @@ fn build_descriptor() -> PluginDescriptor {
             source_kind: IndexerSourceKind::Http,
             capabilities: IndexerCapabilities {
                 rss: false,
-                supported_ids: HashMap::new(),
+                // The host dispatches ID searches from this facet-scoped map.
+                supported_ids: HashMap::from([
+                    (
+                        "series".to_string(),
+                        vec!["tvdb_id".to_string(), "tmdb_id".to_string()],
+                    ),
+                    ("movie".to_string(), vec!["tmdb_id".to_string()]),
+                ]),
                 supported_query_facets: vec!["series".to_string(), "movie".to_string()],
                 search: true,
                 // The host offers text search only to indexers that name a
                 // query parameter.
                 query_param: Some("q".to_string()),
+                season_param: Some("season".into()),
+                episode_param: Some("episode".into()),
                 protocols: vec![IndexerProtocol::Http],
                 feed_modes: vec![IndexerFeedMode::InteractiveSearch],
                 search_inputs: vec![
                     IndexerSearchInput::TextQuery,
                     IndexerSearchInput::TitleQuery,
+                    IndexerSearchInput::IdQuery,
                     IndexerSearchInput::Season,
                     IndexerSearchInput::Episode,
                     IndexerSearchInput::Limit,
                 ],
-                supported_external_ids: vec![],
+                supported_external_ids: vec!["tvdb_id".to_string(), "tmdb_id".to_string()],
                 limits: Some(IndexerLimitCapabilities {
                     page_size: Some(MAX_RESULTS as u32),
                     max_page_size: Some(MAX_RESULTS as u32),

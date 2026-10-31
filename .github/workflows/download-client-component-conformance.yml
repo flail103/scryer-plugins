@@ -26,6 +26,8 @@ on:
   pull_request:
     paths:
       - download_clients/aria2/**
+      - download_clients/alldebrid/**
+      - download_clients/decypharr/**
       - download_clients/deluge/**
       - download_clients/downloadstation/**
       - download_clients/flood/**
@@ -60,6 +62,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - plugin: alldebrid
+            manifest: download_clients/alldebrid/Cargo.toml
+          - plugin: decypharr
+            manifest: download_clients/decypharr/Cargo.toml
           # qbittorrent leads deliberately: it is the highest-traffic client
           # here and the one whose suite covers the session contract.
           - plugin: qbittorrent
@@ -96,6 +102,9 @@ jobs:
           targets: wasm32-wasip2
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            download_clients/${{ matrix.plugin }} -> target
 
       # No WASI SDK step: no download-client component compiles C sources. Add
       # one here if a matrix row ever does.
